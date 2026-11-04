@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>L-Tech Waypoint</title>
+  <meta name="theme-color" content="#00243c">
+  <meta name="description" content="Delivery-run planner for L-Tech Automation">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icon-192.png">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar"><img src="icon-192.png" alt="" width="28" height="28"><h1>L-Tech Waypoint</h1></header>
+  <div id="banner" class="banner" hidden></div>
+  <main id="view"></main>
+  <nav class="tabs" id="tabs">
+    <button data-tab="plan" class="active">Plan</button>
+    <button data-tab="route">Route</button>
+    <button data-tab="places">Places</button>
+    <button data-tab="settings">Settings</button>
+  </nav>
+  <div id="toast" class="toast" hidden></div>
+  <script src="storage.js"></script>
+  <script src="solver.js"></script>
+  <script src="messages.js"></script>
+  <script src="providers.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
