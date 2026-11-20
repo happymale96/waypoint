@@ -208,5 +208,124 @@ console.log('status filter');
   ok(r.plans[0].order.join() === 'X', 'only pending jobs planned');
 }
 
+const okN = (name, cond, extra) => ok(!!cond, name, extra); // new tests are written name-first
+// ---------- helpers for the closed-window / retime tests (explicit departure date, per-slice multipliers) ----------
+function inputAt(depDate, startXY, endXY, placeList, jobs, extra, mults) {
+  const places = {};
+  placeList.forEach((p) => { places[p.id] = p; });
+  const input = Object.assign({
+    start: { lat: startXY[0], lng: startXY[1] }, end: { id: 'END', lat: endXY[0], lng: endXY[1] },
+    jobs, places, departAtISO: depDate.toISOString(), noDetour: false,
+  }, extra || {});
+  const pts = Solver.pointsFor(Object.assign({}, input, { matrices: [] }));
+  input.matrices = [0, 2, 4].map((h, s) => ({
+    departAt: new Date(depDate.getTime() + h * 3600e3).toISOString(),
+    fetchedAt: depDate.toISOString(),
+    m: pts.map((a, i) => pts.map((b, j) => (i === j ? 0 : Math.round(Math.hypot(a.lat - b.lat, a.lng - b.lng) * 60 * ((mults || [1, 1, 1])[s]))))),
+  }));
+  return input;
+}
+function nextWeekday(isoDay, hour) { // 2030-01-01 onwards, local time; ISO weekday Mon=1..Sun=7
+  const d = new Date(2030, 0, 1, hour == null ? 9 : hour, 0, 0);
+  while ((d.getDay() || 7) !== isoDay) d.setDate(d.getDate() + 1);
+  return d;
+}
+const FRI = nextWeekday(5), MON = nextWeekday(1);
+const winFri = [{ days: [5], from: '09:00', to: '09:20' }];
+const hm = (ms) => { const d = new Date(ms); return d.getHours() + ':' + (d.getMinutes() < 10 ? '0' : '') + d.getMinutes(); };
+
+// 12. closed windows by weekday (advisory) + respectClosedWindows
+console.log('closed windows by weekday');
+{
+  okN('test dates are the weekdays I think', (FRI.getDay() || 7) === 5 && (MON.getDay() || 7) === 1);
+  const geo1 = (dep) => inputAt(dep, [0, 0], [0, 0], [mkPlace('A', 10, 0, { closedWindows: winFri }), mkPlace('B', 0, 10)],
+    [mkJob('a', { deliveryPlaceId: 'A' }), mkJob('b', { deliveryPlaceId: 'B' })]);
+  const fri = geo1(FRI), mon = geo1(MON);
+  const ab = Solver.evaluate(fri, ['A', 'B']);
+  okN('advisory (default): Friday arrival (09:10) inside the Friday window shows CLOSED and does not wait', ab.stops[0].closedWarning === true && ab.stops[0].waitSec === 0, ab.stops[0]);
+  okN('same arrival on a Monday: no CLOSED (window is Friday-only)', Solver.evaluate(mon, ['A', 'B']).stops[0].closedWarning === false);
+  okN('legacy window without days applies every day', Solver.isClosedAt([{ from: '09:00', to: '09:20' }], MON.getTime() + 10 * 60000) === true);
+  okN('window boundaries: start inclusive, end exclusive', Solver.isClosedAt(winFri, FRI.getTime()) === true && Solver.isClosedAt(winFri, FRI.getTime() + 20 * 60000) === false);
+
+  const rFri = Object.assign({}, fri, { respectClosedWindows: true });
+  const abWait = Solver.evaluate(rFri, ['A', 'B']);
+  okN('respect: an arrival inside the Friday window waits until it ends (600 s)', abWait.stops[0].waitSec === 600 && abWait.stops[0].closedWarning === false, abWait.stops[0]);
+  okN('respect: waits until exactly 09:20', hm(abWait.stops[0].arriveAt) === '9:20');
+  okN('respect: wait time counts toward the total', abWait.totalSec === ab.totalSec + 600, [abWait.totalSec, ab.totalSec]);
+  const rMon = Object.assign({}, mon, { respectClosedWindows: true });
+  okN('respect on a Monday: same stop does not wait', Solver.evaluate(rMon, ['A', 'B']).stops.every((s) => s.waitSec === 0));
+  const best = Solver.solve(rFri).plans[0];
+  okN('respect: solver REORDERS (B then A) when that beats waiting', best.order.join() === 'B,A' && best.stops.every((s) => s.waitSec === 0), best.order.join());
+  okN('respect: the reordered plan beats the wait-at-A order', best.totalSec < abWait.totalSec, [best.totalSec, abWait.totalSec]);
+  okN('respect on Monday: no change to the optimum', Solver.solve(rMon).plans[0].totalSec === Solver.solve(mon).plans[0].totalSec);
+  okN('without the option the solver ignores windows when optimising', Solver.solve(fri).plans[0].totalSec === best.totalSec);
+}
+{
+  const geo2 = (dep, extra) => inputAt(dep, [0, 0], [0, 10], [mkPlace('A', 10, 0, { dwellMin: 5, closedWindows: winFri }), mkPlace('B', 0, 10)],
+    [mkJob('a', { deliveryPlaceId: 'A' }), mkJob('b', { deliveryPlaceId: 'B' })], extra);
+  const adv = Solver.solve(geo2(FRI)).plans[0];
+  const res = Solver.solve(geo2(FRI, { respectClosedWindows: true })).plans[0];
+  okN('advisory: best is A,B and A is flagged CLOSED', adv.order.join() === 'A,B' && adv.stops[0].closedWarning === true, adv.order.join());
+  okN('respect: waiting (10 min) is cheaper than reordering, so it WAITS at A', res.order.join() === 'A,B' && res.stops[0].waitSec === 600, [res.order.join(), res.stops[0].waitSec]);
+  okN('respect: dwell starts after the wait (arrive 09:20, 5 min dwell)', hm(res.stops[0].arriveAt) === '9:20' && res.stops[0].departAt - res.stops[0].arriveAt === 300000);
+  okN('respect: total = advisory total + wait', res.totalSec === adv.totalSec + 600, [res.totalSec, adv.totalSec]);
+}
+
+// 13. retime
+console.log('retime');
+{
+  const coords = { A: [10, 0], B: [10, 10], C: [0, 10] };
+  const pl = ['A', 'B', 'C'].map((id) => mkPlace(id, coords[id][0], coords[id][1], { dwellMin: 5 }));
+  const jobs = ['A', 'B', 'C'].map((id) => mkJob('j' + id, { deliveryPlaceId: id }));
+  const input = inputAt(DEP, [0, 0], [0, 0], pl, jobs);
+  const plan = Solver.solve(input).plans[0];
+  const legMs = (p, q) => Math.round(Math.hypot(p[0] - q[0], p[1] - q[1]) * 60) * 1000;
+  const at = (min) => new Date(DEP.getTime() + min * 60000).toISOString();
+  const orig = JSON.stringify(plan.stops);
+  const [c0, c1, c2] = plan.order.map((id) => coords[id]);
+
+  const r1 = Solver.retime(plan, -1, at(20));
+  okN('retime: order unchanged', r1.order.join() === plan.order.join() && r1.stops.map((s) => s.placeId).join() === plan.stops.map((s) => s.placeId).join());
+  okN('retime from start 20 min later: every ETA shifts by exactly 20 min', r1.stops.every((s, i) => s.arriveAt - plan.stops[i].arriveAt === 1200000 && s.departAt - plan.stops[i].departAt === 1200000));
+  okN('retime: end arrival and total follow', r1.endArrival - plan.endArrival === 1200000 && r1.totalSec - plan.totalSec === 1200);
+  okN('retime is pure (input plan not modified)', JSON.stringify(plan.stops) === orig);
+
+  const p2 = structuredClone(plan); p2.stops[0].status = 'done'; p2.stops[0].doneAt = at(35);
+  const r2 = Solver.retime(p2, 0, at(40));
+  okN('done stop is untouched', r2.stops[0].arriveAt === plan.stops[0].arriveAt && r2.stops[0].departAt === plan.stops[0].departAt && r2.stops[0].status === 'done');
+  okN('next stop arrives at now + leg from the done stop', r2.stops[1].arriveAt === DEP.getTime() + 40 * 60000 + legMs(c0, c1), [r2.stops[1].arriveAt, DEP.getTime() + 40 * 60000 + legMs(c0, c1)]);
+  okN('dwell applied (5 min) after arrival', r2.stops[1].departAt - r2.stops[1].arriveAt === 300000);
+  okN('following stop continues from the previous departure', r2.stops[2].arriveAt === r2.stops[1].departAt + legMs(c1, c2));
+  okN('end arrival = last departure + leg to the end', r2.endArrival === r2.stops[2].departAt + legMs(c2, [0, 0]));
+  okN('order unchanged when retiming from a done stop', r2.order.join() === plan.order.join());
+
+  const p3 = structuredClone(plan); p3.stops[1].status = 'skipped';
+  const r3 = Solver.retime(p3, -1, at(0));
+  okN('skipped stop untouched and bypassed (next stop timed from the stop before it)', r3.stops[1].arriveAt === plan.stops[1].arriveAt && r3.stops[2].arriveAt === r3.stops[0].departAt + legMs(c0, c2), r3.stops.map((s) => hm(s.arriveAt)));
+
+  const input2 = inputAt(DEP, [0, 0], [0, 0], pl, jobs, null, [1, 1.5, 2]);
+  const plan2 = Solver.solve(input2).plans[0];
+  const first = coords[plan2.order[0]];
+  const r4 = Solver.retime(plan2, -1, at(120));
+  okN('nearest-slice rule: at +2 h the +2 h matrix (x1.5) is used', r4.stops[0].arriveAt === DEP.getTime() + 120 * 60000 + Math.round(Math.hypot(first[0], first[1]) * 60 * 1.5) * 1000);
+  const r5 = Solver.retime(plan2, -1, at(0));
+  okN('nearest-slice rule: at +0 h the first matrix (x1) is used', r5.stops[0].arriveAt === DEP.getTime() + Math.round(Math.hypot(first[0], first[1]) * 60) * 1000);
+
+  const jobsAf = [mkJob('jA', { deliveryPlaceId: 'A', arriveAfter: '12:00' }), mkJob('jB', { deliveryPlaceId: 'B' }), mkJob('jC', { deliveryPlaceId: 'C' })];
+  const planAf = Solver.solve(inputAt(DEP, [0, 0], [0, 0], pl, jobsAf)).plans[0];
+  const sA = Solver.retime(planAf, -1, at(30)).stops.find((s) => s.placeId === 'A');
+  okN('arriveAfter still applies after retime (waits for 12:00)', new Date(sA.arriveAt).getHours() >= 12 && sA.waitSec > 0, hm(sA.arriveAt));
+
+  const winAll = [{ days: [5], from: '00:00', to: '23:59' }];
+  const planW = Solver.solve(inputAt(MON, [0, 0], [0, 0], pl.map((p) => Object.assign({}, p, { closedWindows: winAll })), jobs)).plans[0];
+  okN('Monday plan: no CLOSED for a Friday-only window', planW.stops.every((s) => !s.closedWarning));
+  okN('retime on a Friday: CLOSED recomputed from the weekday of the new arrival', Solver.retime(planW, -1, FRI.toISOString()).stops.every((s) => s.closedWarning));
+
+  const sub = Solver.reindexMatrices(input.matrices, [0, 2, 4]);
+  okN('reindexMatrices keeps the right cells (start, stop 2, end)', sub.length === 3 && sub[0].m.length === 3 && sub[0].m[0][1] === input.matrices[0].m[0][2] && sub[0].m[1][2] === input.matrices[0].m[2][4] && sub[0].m[1][1] === 0 && sub[1].departAt === input.matrices[1].departAt && sub[0].fetchedAt === input.matrices[0].fetchedAt);
+  let threw = false; try { Solver.retime({ stops: [] }, -1, at(0)); } catch (e) { threw = true; }
+  okN('retime refuses a plan without a model', threw);
+}
+
 console.log('\n' + passes + ' passed, ' + failures + ' failed');
 process.exit(failures ? 1 : 0);

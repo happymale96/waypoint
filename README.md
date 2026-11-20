@@ -37,7 +37,9 @@ TomTom's current docs list `routeSummary.travelTimeInSeconds` (and `trafficDelay
 ## Solver rules (solver.js)
 - One visit per distinct place (merging all pickups, deliveries, errands there). Max 12 places.
 - Hard: pickups before their delivery; urgent deliveries before every non-urgent delivery, in `urgentRank` order (a merged stop uses the lowest rank delivered there); with *No detour*, stops that contain no urgent-job action wait until every urgent delivery is done; `arriveBefore` is hard (if nothing fits, the 5 least-late plans are returned with violations named). `arriveAfter` makes you wait at the stop (shown as a wait), it is not a violation.
-- Closed windows are annotations only (CLOSED badge).
+- Closed windows are `{days:[1..7] (ISO, Mon=1), from, to}` per place, matched against the weekday of the predicted arrival. By default they are advisory (CLOSED badge only). With `respectClosedWindows` an arrival inside a window waits until it ends (the wait counts toward the total; dwell starts after) — the solver reorders when that beats waiting. The Route tab's **Avoid lunch** button runs exactly that on the not-done stops from the cached matrices (no API call) and shows it as an alternative card with the time delta; *Use this* adopts it.
+- `Solver.retime(plan, fromStopIndex, nowISO)` re-times the not-done stops of a stored plan (order unchanged, nearest-slice matrices, dwell, waits). The app calls it on DONE/SKIP, on launch and when the app returns to the foreground. Travel times older than 30 min are re-fetched at a DONE.
+- The current plan (order, ETAs, done/skipped state, matrices with `fetchedAt`) is stored, so the Route tab survives closing the app and the service-worker reload. *Clear plan* forgets it.
 - Objective: minimum elapsed time start → end (drive + dwell + waits). Each leg uses the matrix slice whose `departAt` is nearest the leg's predicted departure.
 - Search: DFS with constraint pruning, an admissible lower bound, and a top-5 dominance table; hard time-limit of 1.8 s (returns best found).
 

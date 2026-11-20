@@ -206,9 +206,14 @@
     let minInEnd = Infinity;
     for (let a = 0; a <= k; a++) for (let s = 0; s < slices.length; s++) minInEnd = Math.min(minInEnd, slices[s].f[a * N + (k + 1)]);
 
+    // closed windows per stop (weekday-aware); only enforced (arrival waits) when input.respectClosedWindows
+    const closedWin = bs.stopIds.map((pid) => normWindows(places[pid].closedWindows));
+    const respect = !!input.respectClosedWindows;
+
     const ctx = {
       input, places, bs, k, N, idx, t0ms, dayStart, slices, jobById,
       dwell, before, after, targets, urgentDel, urgentAction, pre, minIn, minInEnd, urgentDelMask,
+      closedWin, respect,
     };
     ctx.leg = function (a, b, t) {
       let best = 0, bd = Infinity;
@@ -264,6 +269,7 @@
         const i = ci[n];
         let arrive = t + cl[n];
         if (after[i] > arrive) arrive = after[i];
+        if (c.respect && c.closedWin[i].length) arrive = pushPastClosedRel(c, i, arrive);
         let nl = late;
         if (arrive > before[i] + 0.0001) {
           if (!soft) continue;
@@ -304,6 +310,7 @@
       const arrive0 = t + c.leg(last, i + 1, t);
       let arrive = arrive0;
       if (c.after[i] > arrive) arrive = c.after[i];
+      if (c.respect && c.closedWin[i].length) arrive = pushPastClosedRel(c, i, arrive);
       c.targets[i].forEach((tg) => {
         if (tg.before != null && arrive > tg.before + 0.0001) {
           late += arrive - tg.before;
@@ -315,11 +322,7 @@
       const dep = arrive + c.dwell[i];
       const pl = places[pid];
       const arriveAt = t0ms + Math.round(arrive * 1000);
-      const sod = secOfDay(arriveAt);
-      const closed = (pl.closedWindows || []).some((w) => {
-        const f = hmToSec(w.from), to = hmToSec(w.to);
-        return f != null && to != null && sod >= f && sod < to;
-      });
+      const closed = !!windowAt(c.closedWin[i], arriveAt); // weekday of the predicted arrival date
       stops.push({
         placeId: pid,
         arriveAt,
@@ -332,6 +335,21 @@
       t = dep; last = i + 1;
     });
     const e = t + c.leg(last, k + 1, t);
+    // everything retime() needs to re-time this plan later without re-solving (matrices are shared by reference)
+    const model = {
+      t0ms,
+      start: { lat: c.input.start.lat, lng: c.input.start.lng },
+      end: { lat: c.input.end.lat, lng: c.input.end.lng },
+      stopIds: bs.stopIds.slice(),
+      matrices: c.input.matrices,
+      dwellSec: {}, afterMs: {}, closed: {},
+      respectClosed: c.respect,
+    };
+    bs.stopIds.forEach((pid, i) => {
+      model.dwellSec[pid] = c.dwell[i];
+      model.afterMs[pid] = c.after[i] > -Infinity ? Math.round(t0ms + c.after[i] * 1000) : null;
+      model.closed[pid] = places[pid].closedWindows || [];
+    });
     return {
       order: order.map((i) => bs.stopIds[i]),
       stops,
@@ -339,13 +357,103 @@
       endArrival: t0ms + Math.round(e * 1000),
       violations,
       lateSec: Math.round(late),
+      model,
     };
   }
   function secOfDay(ms) {
     const d = new Date(ms);
     return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
   }
+
+  // ---------- closed windows: {days:[1..7] ISO Mon=1, from:"HH:MM", to:"HH:MM"}; legacy entries (no days) = every day ----------
+  function normWindows(list) {
+    return (list || []).map((w) => ({
+      days: Array.isArray(w.days) ? w.days.map(Number) : [1, 2, 3, 4, 5, 6, 7],
+      from: hmToSec(w.from), to: hmToSec(w.to),
+    })).filter((w) => w.from != null && w.to != null);
+  }
+  const isoWeekday = (ms) => { const d = new Date(ms).getDay(); return d === 0 ? 7 : d; };
+  // the (normalised) window containing this instant on that instant's weekday, or null
+  function windowAt(wins, ms) {
+    const wd = isoWeekday(ms), sod = secOfDay(ms);
+    for (let i = 0; i < wins.length; i++) {
+      if (wins[i].days.indexOf(wd) >= 0 && sod >= wins[i].from && sod < wins[i].to) return wins[i];
+    }
+    return null;
+  }
+  // an arrival inside a window waits until it ends (windows can chain); ms in, ms out
+  function pushPastClosed(wins, ms) {
+    for (let g = 0; g < 12; g++) {
+      const w = windowAt(wins, ms);
+      if (!w) return ms;
+      ms += (w.to - secOfDay(ms)) * 1000;
+    }
+    return ms;
+  }
+  function pushPastClosedRel(c, i, relSec) { // relSec = seconds after the plan's departure
+    const ms = c.t0ms + relSec * 1000;
+    const pm = pushPastClosed(c.closedWin[i], ms);
+    return pm > ms ? relSec + (pm - ms) / 1000 : relSec;
+  }
+  const isClosedAt = (windows, ms) => !!windowAt(normWindows(windows), ms);
   function formatETAfromRel(c, rel) { return formatETA(c.t0ms + rel * 1000); }
+
+  // ---------- live re-timing ----------
+  // Recompute arrive/depart for every stop that is not done/skipped, WITHOUT changing the order, starting at the
+  // location of stop `fromStopIndex` (-1 = the plan's start point) at time `nowISO`. Uses the plan's own model
+  // (stored matrices with the nearest-slice rule, dwell, arriveAfter waits, closed windows). Pure: returns a new plan;
+  // done/skipped stops (stop.status) are copied untouched.
+  function retime(plan, fromStopIndex, nowISO) {
+    const m = plan && plan.model;
+    if (!m || !m.matrices || !m.matrices.length) throw new Error('retime: plan has no model/matrices');
+    const nowMs = Date.parse(nowISO);
+    const k = m.stopIds.length;
+    const slices = m.matrices.map((s) => ({ at: Date.parse(s.departAt), m: s.m }));
+    const pidx = (pid) => { const i = m.stopIds.indexOf(pid); return i < 0 ? null : i + 1; };
+    const leg = (a, b, ms) => {
+      if (a === b) return 0;
+      let best = slices[0], bd = Infinity;
+      slices.forEach((s) => { const d = Math.abs(s.at - ms); if (d < bd) { bd = d; best = s; } });
+      const v = best.m[a][b];
+      return (v == null || !isFinite(v) || v < 0) ? BIG : v;
+    };
+    let pos = 0; // point index 0 = start. A stop that is not in the model (e.g. done before a re-solve) = the model's start.
+    if (fromStopIndex >= 0 && plan.stops[fromStopIndex]) {
+      const p = pidx(plan.stops[fromStopIndex].placeId);
+      pos = p == null ? 0 : p;
+    }
+    let t = nowMs;
+    const stops = plan.stops.map((s) => {
+      if (s.status === 'done' || s.status === 'skipped') return Object.assign({}, s);
+      const pi = pidx(s.placeId);
+      if (pi == null) return Object.assign({}, s);
+      const arrive0 = t + leg(pos, pi, t) * 1000;
+      let arrive = arrive0;
+      const af = m.afterMs ? m.afterMs[s.placeId] : null;
+      if (af != null && af > arrive) arrive = af;
+      const wins = normWindows((m.closed || {})[s.placeId]);
+      if (m.respectClosed && wins.length) arrive = pushPastClosed(wins, arrive);
+      const dep = arrive + ((m.dwellSec || {})[s.placeId] || 0) * 1000;
+      const out = Object.assign({}, s, {
+        arriveAt: Math.round(arrive), departAt: Math.round(dep),
+        waitSec: Math.round((arrive - arrive0) / 1000),
+        closedWarning: !!windowAt(wins, Math.round(arrive)),
+      });
+      t = dep; pos = pi;
+      return out;
+    });
+    const endMs = t + leg(pos, k + 1, t) * 1000;
+    return Object.assign({}, plan, { stops, endArrival: Math.round(endMs), totalSec: Math.round((endMs - m.t0ms) / 1000) });
+  }
+
+  // Sub-matrices for a smaller problem: keep only the listed point indices, in that order (used to re-solve the
+  // remaining stops from a cached matrix without calling the API). Diagonal stays 0.
+  function reindexMatrices(matrices, idxList) {
+    return matrices.map((s) => ({
+      departAt: s.departAt, fetchedAt: s.fetchedAt,
+      m: idxList.map((a, i) => idxList.map((b, j) => (i === j ? 0 : s.m[a][b]))),
+    }));
+  }
 
   // ---------- public ----------
   function solve(input, opts) {
@@ -391,5 +499,5 @@
     return buildPlan(c, orderPlaceIds.map((p) => c.idx[p]));
   }
 
-  return { solve, evaluate, buildStops, pointsFor, formatETA, formatDuration, hmToSec, MAX_STOPS, DEFAULT_DWELL };
+  return { solve, evaluate, retime, reindexMatrices, isClosedAt, buildStops, pointsFor, formatETA, formatDuration, hmToSec, MAX_STOPS, DEFAULT_DWELL };
 });

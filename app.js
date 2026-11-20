@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = 'e1ca7b65'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = 'd165a299'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -63,6 +63,51 @@
     await saveSettings();
     S.jobs = (await WPStore.list('jobs')).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
     if (!S.places[S.endSel]) S.endSel = Object.keys(S.places)[0] || '';
+    await runMigrations();
+    await restorePlan(); // the Route tab comes back exactly as it was left
+  }
+
+  // ---------- closed windows: {days:[1..7] (ISO, Mon=1), from, to} ----------
+  const ALL_DAYS = [1, 2, 3, 4, 5, 6, 7];
+  const DAY_CHIPS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+  const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+  const DAY3 = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  function daysLabel(days) { // [] / all seven -> '' ; [1,2,3,4] -> "Mon–Thu" ; [5] -> "Fri"
+    const d = Array.from(new Set(days || [])).sort((a, b) => a - b);
+    if (d.length === 7 || !d.length) return d.length ? '' : 'never';
+    const out = [];
+    for (let i = 0; i < d.length;) {
+      let j = i;
+      while (j + 1 < d.length && d[j + 1] === d[j] + 1) j++;
+      out.push(j === i ? DAY3[d[i] - 1] : (j === i + 1 ? DAY3[d[i] - 1] + ', ' + DAY3[d[j] - 1] : DAY3[d[i] - 1] + '–' + DAY3[d[j] - 1]));
+      i = j + 1;
+    }
+    return out.join(', ');
+  }
+  function normalizeWindows(p) { // legacy entries (no days) -> every day. Returns true if anything changed.
+    let changed = false;
+    p.closedWindows = (p.closedWindows || []).map((w) => {
+      if (Array.isArray(w.days)) return w;
+      changed = true;
+      return { days: ALL_DAYS.slice(), from: w.from, to: w.to };
+    });
+    return changed;
+  }
+
+  // One-off seed migrations, recorded in storage (meta/migrations) so each runs once.
+  const SEED_JEMARAMAS = 'seed-jemaramas-lunch-2026-11';
+  async function runMigrations() {
+    for (const p of Object.values(S.places)) if (normalizeWindows(p)) await savePlace(p);
+    const rec = (await WPStore.get('meta', 'migrations')) || { done: [] };
+    if (rec.done.includes(SEED_JEMARAMAS)) return;
+    const p = Object.values(S.places).find((x) => /^Jemaramas Jaya/i.test(x.name || ''));
+    if (!p) return; // not saved yet: stays pending until the place exists
+    if (!(p.closedWindows || []).length) {
+      p.closedWindows = [{ days: [1, 2, 3, 4], from: '12:30', to: '13:30' }, { days: [5], from: '13:00', to: '14:30' }];
+      await savePlace(p);
+    }
+    rec.done.push(SEED_JEMARAMAS);
+    await WPStore.set('meta', 'migrations', rec);
   }
 
   function newPlace(o) {
@@ -472,10 +517,15 @@
       banner('Asking TomTom for travel times (live traffic, 3 time slices)…', 'busy');
       const got = await Providers.getMatrices(points, input.departAtISO, s.tomtomKey, { force: replan });
       const prevNoDetour = S.plan ? S.plan.noDetour : false;
-      S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices }, noDetour: replan ? prevNoDetour : false, idx: 0, status: {}, prompt: null, shiftMs: 0, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial } };
-      solveCurrent();
+      const prevPlan = replan ? curPlan() : null; // a replan keeps the stops already done on top
+      const fetchedAt = new Date().toISOString();
+      got.matrices.forEach((x) => { if (!x.fetchedAt) x.fetchedAt = fetchedAt; });
+      S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial } };
+      solveFresh();
+      if (prevPlan) S.plan.result.plans = S.plan.result.plans.map((p) => compose(prevPlan, p));
       banner('Travel times: TomTom live traffic — ' + (got.fromCache ? 'from session cache (0 calls)' : got.calls + ' calls') + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
       S.tab = 'route';
+      await savePlan(); // after the tab switch, so a restore reopens the Route tab
     } catch (e) {
       banner(e.message || String(e), 'error');
     } finally {
@@ -484,11 +534,162 @@
     }
   }
 
-  function solveCurrent() {
-    const p = S.plan;
-    const c = p.ctx;
-    p.result = Solver.solve({ start: c.start, end: c.end, jobs: c.jobs, places: c.places, matrices: c.matrices, departAtISO: c.departAtISO, noDetour: p.noDetour });
-    p.idx = 0;
+  // ---------- plan state: persistence, live re-timing, re-solving from the cached matrices ----------
+  // S.plan = { ctx:{start,end,jobs,places,departAtISO,matrices}, noDetour, idx, prompt, alt, provider,
+  //            result:{plans:[plan,...]} }.  plan = solver plan + per-stop status ('done'|'skipped') / doneAt + plan.model.
+  // Invariant: plan.model.matrices === ctx.matrices (the matrices the current problem was solved with).
+  const curPlan = () => (S.plan && S.plan.result && !S.plan.result.error && S.plan.result.plans[S.plan.idx]) || null;
+  const iso = (ms) => new Date(ms).toISOString();
+  const STALE_MS = 30 * 60000; // travel times older than this are re-fetched at a DONE
+
+  function lastDoneIdx(plan) { // stop most recently marked done; -1 = none yet (= the start point)
+    let best = -1, bt = -1;
+    plan.stops.forEach((s, i) => { if (s.status === 'done') { const t = Date.parse(s.doneAt) || 0; if (t >= bt) { bt = t; best = i; } } });
+    return best;
+  }
+
+  // done/skipped stops stay at the top (old order); the freshly solved stops follow
+  function compose(oldPlan, plan) {
+    const hist = oldPlan ? oldPlan.stops.filter((s) => s.status) : [];
+    if (!hist.length) return plan;
+    const t0 = oldPlan.model.t0ms;
+    return Object.assign({}, plan, {
+      order: hist.map((s) => s.placeId).concat(plan.order),
+      stops: hist.map((s) => Object.assign({}, s)).concat(plan.stops),
+      model: Object.assign({}, plan.model, { t0ms: t0 }),
+      totalSec: Math.round((plan.endArrival - t0) / 1000),
+    });
+  }
+
+  function solveFresh() { // PLAN: solve the whole problem held in ctx
+    const P = S.plan, c = P.ctx;
+    P.result = Solver.solve({ start: c.start, end: c.end, jobs: c.jobs, places: c.places, matrices: c.matrices, departAtISO: c.departAtISO, noDetour: P.noDetour });
+    P.idx = 0; P.alt = null;
+  }
+
+  // Re-solve what is left (not done / skipped) from where we are, using the plan's OWN matrices — no API call.
+  function resolveRemaining(opts) {
+    opts = opts || {};
+    const P = S.plan, plan = curPlan(), m = plan.model;
+    const from = lastDoneIdx(plan);
+    const live = new Set(plan.stops.filter((s) => !s.status).map((s) => s.placeId));
+    const inModel = new Set(m.stopIds);
+    let aIdx = 0, anchor = { lat: m.start.lat, lng: m.start.lng }; // where we are: last done stop, else the start
+    if (from >= 0) {
+      const pid = plan.stops[from].placeId, ix = m.stopIds.indexOf(pid), pl = S.places[pid] || P.ctx.places[pid];
+      if (ix >= 0 && pl) { aIdx = ix + 1; anchor = { lat: pl.lat, lng: pl.lng }; }
+    }
+    const placesOf = (j) => (j.errandPlaceId ? [j.errandPlaceId]
+      : (j.pickups || []).filter((p) => !p.done).map((p) => p.placeId).concat(j.deliveryPlaceId ? [j.deliveryPlaceId] : []));
+    const jobs = S.jobs.filter((j) => !j.status || j.status === 'pending').filter((j) => {
+      const ps = placesOf(j); // only jobs the cached matrices cover, with something still to do at a live stop
+      return ps.length && ps.every((p) => inModel.has(p)) && ps.some((p) => live.has(p));
+    });
+    const stopIds = Solver.buildStops(jobs, S.places).stopIds;
+    const idxList = [aIdx].concat(stopIds.map((pid) => m.stopIds.indexOf(pid) + 1), [m.stopIds.length + 1]);
+    const matrices = Solver.reindexMatrices(m.matrices, idxList);
+    const now = Date.now();
+    const at = from >= 0 ? now : Math.max(now, Date.parse(P.ctx.departAtISO));
+    const respect = opts.respect != null ? opts.respect : !!m.respectClosed;
+    const res = Solver.solve({ start: anchor, end: { lat: m.end.lat, lng: m.end.lng }, jobs, places: S.places, matrices, departAtISO: iso(at), noDetour: P.noDetour, respectClosedWindows: respect });
+    return { res, jobs: JSON.parse(JSON.stringify(jobs)), anchor, matrices, departAtISO: iso(at), from };
+  }
+
+  function adoptResult(r) { // make a resolveRemaining() result the current plan (done stops stay on top)
+    const P = S.plan, old = curPlan();
+    P.result = { plans: r.res.plans.map((p) => compose(old, p)), error: null, stats: r.res.stats, stopIds: r.res.stopIds };
+    P.idx = 0; P.alt = null; P.shiftMs = 0;
+    P.ctx = Object.assign({}, P.ctx, { start: r.anchor, jobs: r.jobs, matrices: r.matrices, departAtISO: r.departAtISO });
+  }
+
+  async function reSolveFromCache() { // No-detour toggle
+    const r = resolveRemaining({});
+    if (r.res.error) banner(r.res.error, 'error');
+    else { adoptResult(r); banner('Re-solved from cached travel times — 0 API calls.', 'info'); }
+    await savePlan();
+    render();
+  }
+
+  // Live re-timing from the last done stop (or the start) at the current time. Order never changes.
+  function retimeNow() {
+    const P = S.plan, plan = curPlan();
+    if (!plan || !plan.stops.some((s) => !s.status)) return false;
+    const from = lastDoneIdx(plan), now = Date.now();
+    const at = from < 0 ? Math.max(now, Date.parse(P.ctx.departAtISO)) : now; // before the planned departure: keep the planned times
+    P.result.plans[P.idx] = Solver.retime(plan, from, iso(at));
+    P.alt = null; P.shiftMs = 0;
+    return true;
+  }
+
+  // travel times older than 30 min are re-fetched (3 slices, like PLAN) before re-timing at a DONE
+  async function refreshIfStale(plan) {
+    const P = S.plan, m = plan.model;
+    const oldest = Math.min.apply(null, m.matrices.map((x) => Date.parse(x.fetchedAt) || 0));
+    if (Date.now() - oldest <= STALE_MS) return;
+    if (!S.settings.tomtomKey) { banner('Travel times are older than 30 min but the TomTom key is missing — keeping them.', 'error'); return; }
+    try {
+      banner('Travel times are older than 30 min — refreshing from TomTom (live traffic, 3 time slices)…', 'busy');
+      const pt = (pid) => { const pl = S.places[pid] || P.ctx.places[pid]; return { lat: pl.lat, lng: pl.lng }; };
+      const points = [m.start].concat(m.stopIds.map(pt), [m.end]);
+      const got = await Providers.getMatrices(points, new Date().toISOString(), S.settings.tomtomKey, { force: true });
+      const stamp = new Date().toISOString();
+      got.matrices.forEach((x) => { x.fetchedAt = stamp; });
+      m.matrices = got.matrices; P.ctx.matrices = got.matrices; // keep plan.model.matrices === ctx.matrices
+      P.provider = { calls: got.calls, fromCache: false, partial: !!got.partial };
+      banner('Travel times: TomTom live traffic — ' + got.calls + ' calls (refreshed)' + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
+    } catch (e) {
+      banner(e.message || String(e), 'error'); // keep going with the older matrices
+    }
+  }
+
+  // "Avoid lunch": re-solve what is left with closed windows respected (arrival inside a window waits it out)
+  function computeAvoidLunch() {
+    const P = S.plan, cur = curPlan();
+    const r = resolveRemaining({ respect: true });
+    const alt = r.res.plans && r.res.plans[0];
+    if (r.res.error || !alt) { P.alt = { ok: false, message: 'No feasible alternative: ' + (r.res.error || 'nothing left to re-plan') + '.' }; return; }
+    if (alt.violations.length) { P.alt = { ok: false, message: 'No feasible alternative: avoiding the closed windows would break a time window (' + alt.violations[0] + ').' }; return; }
+    const at = r.from >= 0 ? Date.now() : Math.max(Date.now(), Date.parse(P.ctx.departAtISO));
+    const base = Solver.retime(cur, r.from, iso(at)); // current plan timed from the same place and moment
+    P.alt = { ok: true, r, plan: alt, deltaMs: alt.endArrival - base.endArrival, baseEnd: base.endArrival };
+  }
+  async function useAlt() {
+    adoptResult(S.plan.alt.r);
+    await savePlan();
+    banner('Using the avoid-lunch plan (closed windows respected).', 'info');
+    render();
+  }
+
+  // ---- persistence: the plan survives closing the app and the service-worker reload ----
+  function planSnapshot() {
+    const P = S.plan, plan = curPlan();
+    if (!P || !plan) return null;
+    return {
+      v: 1, savedAt: new Date().toISOString(), tab: S.tab, noDetour: P.noDetour, provider: P.provider || null, ctx: P.ctx,
+      plan: Object.assign({}, plan, { model: Object.assign({}, plan.model, { matrices: null }) }), // matrices are stored once, in ctx
+    };
+  }
+  async function savePlan() {
+    const snap = planSnapshot();
+    if (!snap) return WPStore.remove('plan', 'current');
+    return WPStore.set('plan', 'current', snap);
+  }
+  async function restorePlan() {
+    let snap = null;
+    try { snap = await WPStore.get('plan', 'current'); } catch (e) { snap = null; }
+    if (!snap || snap.v !== 1 || !snap.plan || !snap.plan.model || !snap.ctx || !snap.ctx.matrices) return;
+    snap.plan.model.matrices = snap.ctx.matrices;
+    S.plan = {
+      ctx: snap.ctx, noDetour: !!snap.noDetour, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: snap.provider || null,
+      result: { plans: [snap.plan], error: null, stats: null, stopIds: snap.plan.model.stopIds },
+    };
+    if (['plan', 'route', 'places', 'settings'].includes(snap.tab)) S.tab = snap.tab;
+  }
+  async function clearPlan() {
+    S.plan = null;
+    await WPStore.remove('plan', 'current');
+    banner(null);
+    render();
   }
 
   // ---------- messaging ----------
@@ -541,7 +742,7 @@
     const plan = r.plans[P.idx];
     const ctx = P.ctx;
     const totalStops = plan.stops.length;
-    const remaining = plan.stops.filter((s) => !P.status[s.placeId]);
+    const remaining = plan.stops.filter((s) => !s.status);
 
     v.append(
       h('div', { class: 'card' },
@@ -551,7 +752,7 @@
           h('div', null, h('b', null, fmt(plan.endArrival)), h('span', { class: 'muted' }, 'arrive ' + (ctx.end.name || 'end')))),
         h('div', { class: 'muted', style: 'margin-top:8px' }, 'Depart ' + fmt(Date.parse(ctx.departAtISO))),
         P.shiftMs > 60000 ? h('div', { class: 'chip detour' }, 'Running ' + Math.round(P.shiftMs / 60000) + ' min behind plan') : null),
-      h('label', { class: 'toggle card' }, h('input', { type: 'checkbox', checked: P.noDetour, onchange: (e) => { P.noDetour = e.target.checked; solveCurrent(); banner('Re-solved from cached travel times — 0 API calls.', 'info'); render(); } }), 'No detour (urgent deliveries first, nothing else in between)'));
+      h('label', { class: 'toggle card' }, h('input', { type: 'checkbox', checked: P.noDetour, onchange: (e) => { P.noDetour = e.target.checked; reSolveFromCache(); } }), 'No detour (urgent deliveries first, nothing else in between)'));
 
     if (plan.violations.length) v.append(h('div', { class: 'violations' }, h('b', null, 'No plan meets every time window:'), plan.violations.map((t) => h('div', null, '• ' + t))));
 
@@ -567,9 +768,13 @@
         h('a', { class: 'btn primary grow', href: gmapsUrl(wps[half - 1], ctx.end, wps.slice(half)), target: '_blank', rel: 'noopener' }, 'Google Maps — Leg 2'));
     }
     navRow.append(h('button', { class: 'grow', onclick: () => replanFromHere() }, 'Replan from here'));
+    // a CLOSED stop still ahead: offer the closed-windows-respected alternative (re-solved from the cached matrices)
+    if (!P.alt && remaining.some((s) => s.closedWarning)) navRow.append(h('button', { class: 'grow', id: 'avoidLunch', onclick: () => { computeAvoidLunch(); render(); } }, 'Avoid lunch'));
+    navRow.append(h('button', { class: 'grow danger', id: 'clearPlan', onclick: () => { if (confirm('Clear the current plan? Stops marked done will be forgotten.')) clearPlan(); } }, 'Clear plan'));
     v.append(navRow);
+    if (P.alt) v.append(altCard(P));
 
-    if (Object.values(P.status).includes('skipped')) v.append(h('div', { class: 'prompt' }, 'A stop was skipped. ', h('button', { class: 'small', onclick: () => replanFromHere() }, 'Replan from here')));
+    if (plan.stops.some((s) => s.status === 'skipped')) v.append(h('div', { class: 'prompt' }, 'A stop was skipped. ', h('button', { class: 'small', onclick: () => replanFromHere() }, 'Replan from here')));
     if (P.prompt) {
       const stop = plan.stops.find((s) => s.placeId === P.prompt.placeId);
       const place = S.places[P.prompt.placeId];
@@ -598,10 +803,34 @@
     }
   }
 
+  function altCard(P) { // the "Avoid lunch" alternative, next to the current plan
+    const A = P.alt, dismiss = () => { P.alt = null; render(); };
+    if (!A.ok) {
+      return h('div', { class: 'prompt', id: 'altCard' }, h('div', { class: 'title' }, 'Avoid lunch'), h('div', null, A.message),
+        h('div', { class: 'row', style: 'margin-top:8px' }, h('button', { class: 'small', onclick: dismiss }, 'OK')));
+    }
+    const d = Math.round(A.deltaMs / 60000);
+    const delta = d === 0 ? 'same total time' : (d > 0 ? '+' + d : '−' + Math.abs(d)) + ' min total';
+    return h('div', { class: 'card alt', id: 'altCard' },
+      h('div', { class: 'row spread' }, h('div', { class: 'title' }, 'Avoid lunch alternative'), h('span', { class: 'chip alt-delta' + (d > 0 ? ' detour' : '') }, delta)),
+      h('div', { class: 'muted' }, 'Arrive ' + ((P.ctx.end && P.ctx.end.name) || 'end') + ' ' + fmt(A.plan.endArrival) + ' (now ' + fmt(A.baseEnd) + ')'),
+      A.plan.stops.map((s, i) => h('div', { class: 'alt-stop' },
+        h('div', { class: 'row spread' }, h('b', null, (i + 1) + '. ' + pName(s.placeId)), h('span', { class: 'times' }, fmt(s.arriveAt) + ' → ' + fmt(s.departAt))),
+        s.waitSec >= 60 ? h('div', { class: 'muted' }, 'wait ' + Math.round(s.waitSec / 60) + ' min at ' + pName(s.placeId)) : null)),
+      h('div', { class: 'row', style: 'margin-top:8px' },
+        h('button', { class: 'primary grow', onclick: () => useAlt() }, 'Use this'),
+        h('button', { class: 'grow', onclick: dismiss }, 'Keep current')));
+  }
+
   function stopCard(stop, i) {
     const P = S.plan;
     const place = S.places[stop.placeId] || P.ctx.places[stop.placeId];
-    const st = P.status[stop.placeId];
+    const st = stop.status;
+    if (st === 'done') { // done stops collapse to one line: tick, name, actual done time
+      return h('div', { class: 'card stop done compact' }, h('div', { class: 'row spread' },
+        h('div', { class: 'title' }, '✓ ' + (i + 1) + '. ' + place.name),
+        h('div', { class: 'muted times' }, 'done ' + fmt(Date.parse(stop.doneAt)))));
+    }
     const hasDelivery = stop.actions.some((a) => a.kind === 'deliver');
     // Actions as boxes (same tokens as the Plan cards): COLLECT "item → customer", DELIVER items, ERRAND.
     const jobOf = (id) => (P.ctx.jobs || []).find((x) => x.id === id) || S.jobs.find((x) => x.id === id);
@@ -625,21 +854,32 @@
     if (hasDelivery) btns.push(h('button', { class: 'small', onclick: () => { const m = stopMessage(stop, P.shiftMs); shareMessage(m.place, m.text); } }, 'MSG'));
     if (!st) {
       btns.push(h('button', { class: 'small ok', onclick: () => markDone(stop, i) }, 'DONE'));
-      btns.push(h('button', { class: 'small', onclick: () => { P.status[stop.placeId] = 'skipped'; toast('Skipped — actions stay pending. Replan to refresh.'); render(); } }, 'SKIP'));
+      btns.push(h('button', { class: 'small', onclick: () => skipStop(stop, i) }, 'SKIP'));
     } else {
-      btns.push(h('span', { class: 'chip' }, st === 'done' ? '✓ Done' : 'Skipped'));
+      btns.push(h('span', { class: 'chip' }, 'Skipped'));
     }
     return h('div', { class: 'card stop ' + (st || '') + (stop.detour ? ' detour' : '') },
       h('div', { class: 'row spread' }, h('div', { class: 'title' }, (i + 1) + '. ' + place.name), h('div', { class: 'times' }, fmt(stop.arriveAt) + ' → ' + fmt(stop.departAt))),
       place.address ? h('div', { class: 'muted' }, place.address) : null,
-      stop.waitSec > 60 ? h('div', { class: 'muted' }, 'Wait ~' + Math.round(stop.waitSec / 60) + ' min for the time window to open') : null,
+      stop.waitSec > 60 ? h('div', { class: 'muted' }, 'Wait ~' + Math.round(stop.waitSec / 60) + ' min here before service starts (' + fmt(stop.arriveAt) + ')') : null,
       chips.length ? h('div', null, chips) : null,
       boxes.length ? h('div', { class: 'stop-boxes' }, boxes) : null,
       h('div', { class: 'row', style: 'margin-top:8px' }, btns));
   }
 
-  async function markDone(stop, i) {
+  // the stop object a button was rendered with may belong to an older plan object (re-timing replaces them): re-find it
+  function liveStop(stop, i) {
+    const cur = curPlan();
+    if (!cur) return null;
+    const ci = cur.stops[i] && cur.stops[i].placeId === stop.placeId ? i : cur.stops.findIndex((s) => s.placeId === stop.placeId && !s.status);
+    return ci < 0 ? null : { stop: cur.stops[ci], i: ci };
+  }
+
+  async function markDone(stop0, i0) {
     const P = S.plan;
+    const ls = liveStop(stop0, i0);
+    if (!ls) return;
+    const stop = ls.stop, i = ls.i;
     const nowIso = new Date().toISOString();
     for (const a of stop.actions) {
       const j = S.jobs.find((x) => x.id === a.jobId);
@@ -652,17 +892,39 @@
       } else { j.status = 'done'; j.doneAt = nowIso; }
       await saveJob(j);
     }
-    P.status[stop.placeId] = 'done';
-    P.shiftMs = Math.max(0, Date.now() - stop.departAt);
+    stop.status = 'done';
+    stop.doneAt = nowIso;
+    P.alt = null;
+    P.result.plans = [P.result.plans[P.idx]]; P.idx = 0; // alternatives pre-date this DONE: drop them
+    await refreshIfStale(P.result.plans[0]);              // travel times older than 30 min are re-fetched first
+    // live re-timing: from this stop, at the current time, order unchanged
+    P.result.plans[0] = Solver.retime(P.result.plans[0], i, nowIso);
+    P.shiftMs = 0;
     // offer to send the ETA to the next stop if it is a delivery and has a WhatsApp number
-    const plan = P.result.plans[P.idx];
-    const next = plan.stops.slice(i + 1).find((s) => !P.status[s.placeId]);
+    const plan = P.result.plans[0];
+    const next = plan.stops.slice(i + 1).find((s) => !s.status);
     P.prompt = null;
     if (next && next.actions.some((a) => a.kind === 'deliver')) {
       const np = S.places[next.placeId];
       if (np && np.whatsapp) P.prompt = { placeId: next.placeId };
     }
-    if (!plan.stops.some((s) => !P.status[s.placeId])) toast('Run complete 🎉');
+    if (!plan.stops.some((s) => !s.status)) toast('Run complete 🎉');
+    await savePlan();
+    render();
+  }
+
+  async function skipStop(stop0, i0) { // actions stay pending; ETAs re-timed from this stop at the current time
+    const P = S.plan;
+    const ls = liveStop(stop0, i0);
+    if (!ls) return;
+    const stop = ls.stop, i = ls.i;
+    stop.status = 'skipped';
+    P.alt = null;
+    P.result.plans = [P.result.plans[P.idx]]; P.idx = 0;
+    P.result.plans[0] = Solver.retime(P.result.plans[0], i, new Date().toISOString());
+    P.shiftMs = 0;
+    toast('Skipped — actions stay pending. Replan to bring it back.');
+    await savePlan();
     render();
   }
 
@@ -682,7 +944,7 @@
       list.replaceChildren(...(items.length ? items.map((p) => h('div', { class: 'card', onclick: () => openPlaceEditor(p) },
         h('div', { class: 'row spread' }, h('div', { class: 'title' }, p.name), h('span', { class: 'chip' }, p.type)),
         h('div', { class: 'muted' }, p.address || (p.lat.toFixed(4) + ', ' + p.lng.toFixed(4))),
-        h('div', { class: 'muted' }, 'Dwell ' + p.dwellMin + ' min' + (p.whatsapp ? ' · WA ' + p.whatsapp : '') + ((p.closedWindows || []).length ? ' · closed ' + p.closedWindows.map((w) => w.from + '–' + w.to).join(', ') : '')))) : [h('div', { class: 'empty card' }, 'No places yet.')]));
+        h('div', { class: 'muted' }, 'Dwell ' + p.dwellMin + ' min' + (p.whatsapp ? ' · WA ' + p.whatsapp : '') + ((p.closedWindows || []).length ? ' · closed ' + p.closedWindows.map((w) => (daysLabel(w.days) ? daysLabel(w.days) + ' ' : '') + w.from + '–' + w.to).join(', ') : '')))) : [h('div', { class: 'empty card' }, 'No places yet.')]));
     }
     v.append(h('div', { class: 'row' }, h('div', { class: 'grow' }, input), h('button', { class: 'primary', onclick: () => openPlacePicker((p) => openPlaceEditor(p), 'Add place') }, '+ Add')), list);
     drawList();
@@ -703,18 +965,25 @@
     function syncType() { salBox.hidden = type.value === 'supplier'; }
     syncType();
     const wBox = h('div');
-    function drawW() {
-      wBox.replaceChildren(...w.map((x, i) => h('div', { class: 'row', style: 'margin-bottom:6px' },
-        h('div', { class: 'grow' }, h('input', { type: 'time', value: x.from, oninput: (e) => { x.from = e.target.value; } })),
-        h('div', { class: 'grow' }, h('input', { type: 'time', value: x.to, oninput: (e) => { x.to = e.target.value; } })),
-        h('button', { class: 'small danger', onclick: () => { w.splice(i, 1); drawW(); } }, '✕'))));
+    w.forEach((x) => { if (!Array.isArray(x.days)) x.days = ALL_DAYS.slice(); });
+    function drawW() { // each window: M T W T F S S toggle chips (ISO Mon=1) + from / to
+      wBox.replaceChildren(...w.map((x, i) => h('div', { class: 'win-row' },
+        h('div', { class: 'days' }, DAY_CHIPS.map((lab, d) => {
+          const on = x.days.includes(d + 1);
+          return h('button', { class: 'day' + (on ? ' on' : ''), type: 'button', 'aria-pressed': on ? 'true' : 'false', 'aria-label': DAY_NAMES[d],
+            onclick: () => { x.days = on ? x.days.filter((n) => n !== d + 1) : x.days.concat(d + 1).sort((a, b) => a - b); drawW(); } }, lab);
+        })),
+        h('div', { class: 'row' },
+          h('div', { class: 'grow' }, h('input', { type: 'time', value: x.from, oninput: (e) => { x.from = e.target.value; } })),
+          h('div', { class: 'grow' }, h('input', { type: 'time', value: x.to, oninput: (e) => { x.to = e.target.value; } })),
+          h('button', { class: 'small danger', 'aria-label': 'Remove window', onclick: () => { w.splice(i, 1); drawW(); } }, '✕')))));
     }
     drawW();
     sh.body.append(
       h('label', { class: 'field' }, 'Name'), name, h('label', { class: 'field' }, 'Address'), addr,
       h('label', { class: 'field' }, 'Type'), type, h('label', { class: 'field' }, 'Dwell (minutes)'), dwell,
-      h('label', { class: 'field' }, 'Closed windows (warning only)'), wBox,
-      h('button', { class: 'small', onclick: () => { w.push({ from: '12:00', to: '13:00' }); drawW(); } }, '+ Add closed window'),
+      h('label', { class: 'field' }, 'Closed windows (by weekday)'), wBox,
+      h('button', { class: 'small', onclick: () => { w.push({ days: ALL_DAYS.slice(), from: '12:00', to: '13:00' }); drawW(); } }, '+ Add closed window'),
       h('label', { class: 'field' }, 'WhatsApp number'), wa,
       salBox,
       h('div', { class: 'sticky-actions' },
@@ -727,7 +996,7 @@
         h('button', { onclick: sh.close }, 'Cancel'),
         h('button', { class: 'primary', onclick: async () => {
           if (!name.value.trim()) { toast('Name is required'); return; }
-          Object.assign(p, { name: name.value.trim(), address: addr.value.trim(), type: type.value, dwellMin: Number(dwell.value) || 0, closedWindows: w.filter((x) => x.from && x.to), whatsapp: wa.value.trim(), salutation: sal.value, lang: lang.value });
+          Object.assign(p, { name: name.value.trim(), address: addr.value.trim(), type: type.value, dwellMin: Number(dwell.value) || 0, closedWindows: w.filter((x) => x.from && x.to && x.days.length), whatsapp: wa.value.trim(), salutation: sal.value, lang: lang.value });
           await savePlace(p); sh.close(); render();
         } }, 'Save')));
   }
@@ -736,7 +1005,7 @@
   function lastPlanText() {
     const res = S.plan && S.plan.result;
     if (!res) return 'Last plan: none yet';
-    if (!res.stats) return 'Last plan: no result';
+    if (!res.stats) return 'Last plan: restored from storage';
     const st = res.stats;
     return 'Last plan: ' + st.nodes + ' nodes, ' + st.ms + ' ms (' + st.mode + (st.truncated ? ', time-limited — best found' : '') + ')';
   }
@@ -810,7 +1079,8 @@
       if (!confirm('Replace current places and jobs with ' + data.places.length + ' places and ' + data.jobs.length + ' jobs from this file?')) return;
       await WPStore.clear('places'); await WPStore.clear('jobs');
       S.places = {}; S.jobs = [];
-      for (const p of data.places) await savePlace(p);
+      for (const p of data.places) { normalizeWindows(p); await savePlace(p); }
+      await WPStore.remove('plan', 'current');
       for (const j of data.jobs) { S.jobs.push(j); await saveJob(j); }
       if (data.settings) {
         const keep = { googleKey: S.settings.googleKey, tomtomKey: S.settings.tomtomKey, placesCallsToday: S.settings.placesCallsToday };
@@ -842,6 +1112,13 @@
     S.tab = b.dataset.tab;
     window.scrollTo(0, 0);
     render();
+    if (S.plan) savePlan(); // the stored plan remembers which tab you were on
+  });
+
+  // Back in the foreground: re-time what is left from the last done stop (or the start) at the current time.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !S.plan) return;
+    if (retimeNow()) { savePlan(); if (S.tab === 'route') render(); }
   });
 
   // Service worker: register, look for updates on every launch and whenever the app comes back to the
@@ -869,6 +1146,7 @@
   }
 
   load().then(() => {
+    if (S.plan && retimeNow()) savePlan(); // restored plan: re-time from the last done stop (or start) at the current time
     render();
     setupServiceWorker();
   }).catch((e) => banner('Startup failed: ' + e.message, 'error'));

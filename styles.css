@@ -143,3 +143,14 @@ a.btn.small { min-height: 40px; padding: 0 10px; font-size: 14px; }
 .stop-boxes .box.errand { flex: 1 1 100%; }
 .stop-boxes .line + .line { margin-top: 4px; }
 @media (max-width: 359px) { .stop-boxes .box { flex-basis: 100%; } }
+/* weekday closed windows, collapsed done stops, avoid-lunch card */
+.win-row { border: 1px solid var(--border); border-radius: 12px; padding: 8px; margin-bottom: 8px; background: var(--card); }
+.days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-bottom: 8px; }
+.day { min-height: 44px; padding: 0; border-radius: 10px; font-size: 15px; font-weight: 700; }
+.day.on { background: var(--brand); color: var(--brand-text); border-color: var(--brand); }
+.card.stop.compact { padding: 8px 12px; margin: 6px 0; }
+.card.stop.compact .title { font-size: 15px; }
+.card.alt { border: 2px solid var(--deliver); }
+.alt-stop { padding: 6px 0; border-top: 1px solid var(--border); }
+.alt-stop:first-of-type { border-top: 0; }
+.chip.alt-delta { font-size: 14px; }
