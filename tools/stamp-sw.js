@@ -13,7 +13,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const ROOT = path.resolve(__dirname, '..');
-const SHELL = ['index.html', 'styles.css', 'app.js', 'solver.js', 'providers.js', 'storage.js', 'messages.js',
+const SHELL = ['index.html', 'styles.css', 'app.js', 'solver.js', 'providers.js', 'storage.js', 'messages.js', 'daylog.js',
   'manifest.json', 'icon-192.png', 'icon-512.png', 'sw.js'];
 const SW_RE = /const BUILD = '[^']*';/;
 const APP_RE = /const BUILD_STAMP = '[^']*';/;

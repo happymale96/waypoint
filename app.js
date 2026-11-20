@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '609bf647'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = 'f3bd180f'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -33,7 +33,7 @@
   const S = {
     tab: 'plan', places: {}, jobs: [], settings: null,
     startSel: 'gps', endSel: 'home', departTime: '',
-    plan: null, busy: false,
+    plan: null, busy: false, days: {},
   };
 
   function defaultSettings() {
@@ -41,7 +41,7 @@
       googleKey: '', tomtomKey: '', defaultLang: 'ms',
       templates: Object.assign({}, Messages.DEFAULT_TEMPLATES),
       etaPaddingMin: 15, dwellDefaults: Object.assign({}, DEFAULT_DWELL),
-      placesCallsToday: { date: todayStr(), count: 0 }, nav: 'waze', seeded: false,
+      placesCallsToday: { date: todayStr(), count: 0 }, nav: 'waze', seeded: false, driverName: 'Calvin',
     };
   }
   const saveSettings = () => WPStore.set('settings', 'main', S.settings);
@@ -64,6 +64,7 @@
     S.jobs = (await WPStore.list('jobs')).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
     if (!S.places[S.endSel]) S.endSel = Object.keys(S.places)[0] || '';
     await runMigrations();
+    await loadDays();
     await restorePlan(); // the Route tab comes back exactly as it was left
   }
 
@@ -127,11 +128,12 @@
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { t.hidden = true; }, 3500);
   }
-  function banner(msg, kind) {
+  function banner(msg, kind, action) {
     const b = document.getElementById('banner');
     if (!msg) { b.hidden = true; b.textContent = ''; return; }
     b.className = 'banner' + (kind ? ' ' + kind : '');
-    b.replaceChildren(h('span', null, msg), kind === 'busy' ? null : h('button', { onclick: () => banner(null) }, 'OK'));
+    const text = action ? h('button', { class: 'banner-link', onclick: () => { banner(null); action(); } }, msg) : h('span', null, msg);
+    b.replaceChildren(text, kind === 'busy' ? null : h('button', { onclick: () => banner(null) }, 'OK'));
     b.hidden = false;
   }
 
@@ -315,6 +317,8 @@
         chip(departLabel, 'depart', () => openDepartSheet())),
       h('button', { class: 'primary big', id: 'planBtn', disabled: S.busy, onclick: () => doPlan({}) }, S.busy ? 'PLANNING…' : 'PLAN')
     );
+    const openDay = dayFor(Date.now(), false);
+    if (openDay && !openDay.closed && openDay.events.length) v.append(h('button', { class: 'end-day', id: 'endDayBtn', onclick: () => openSummary(openDay.date) }, 'End day'));
 
     const pending = pendingJobs().sort((a, b) => (b.urgent - a.urgent) || ((a.urgentRank || 0) - (b.urgentRank || 0)) || String(a.createdAt).localeCompare(String(b.createdAt)));
     const parked = S.jobs.filter((j) => j.status === 'parked');
@@ -397,7 +401,8 @@
         : h('div', { class: 'job-actions' },
           j.errandPlaceId ? null : h('button', { class: 'small urgent-toggle', 'aria-pressed': j.urgent ? 'true' : 'false', title: j.urgent ? 'Clear urgent' : 'Mark urgent', onclick: () => setUrgent(j, !j.urgent) }, 'Urgent'),
           park, del);
-      foot.replaceChildren(...[j.notes ? h('div', { class: 'job-notes' }, j.notes) : null, actions].filter(Boolean));
+      foot.replaceChildren(...[j.notes ? h('div', { class: 'job-notes' }, j.notes) : null,
+        j.carriedFrom ? h('div', { class: 'job-notes carried' }, 'Carried from ' + DayLog.fmtDate(j.carriedFrom) + (j.carryReason ? ' · ' + j.carryReason : '')) : null, actions].filter(Boolean));
     }
     drawFoot(false);
     return h('div', { class: 'card job' + (parked ? ' parked' : '') + (j.urgent ? ' urgent' : '') }, head, grid, foot);
@@ -490,6 +495,7 @@
     const replan = !!opts.replan;
     const s = S.settings;
     banner(null);
+    await reopenIfClosed();
     if (!s.tomtomKey) { banner('TomTom API key missing — add it in Settings. (Travel times come from TomTom Matrix Routing v2.)', 'error'); return; }
     const end = S.places[S.endSel];
     if (!end) { banner('Pick an end place.', 'error'); return; }
@@ -528,6 +534,7 @@
       solveFresh();
       if (prevPlan) S.plan.result.plans = S.plan.result.plans.map((p) => compose(prevPlan, p));
       banner('Travel times: TomTom live traffic — ' + (got.fromCache ? 'from session cache (0 calls)' : got.calls + ' calls') + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
+      logPlan(replan, { start, departAt, places, points, matrices: got.matrices, jobs: Solver.buildStops(jobs, places).jobs });
       S.tab = 'route';
       await savePlan(); // after the tab switch, so a restore reopens the Route tab
     } catch (e) {
@@ -696,6 +703,264 @@
     render();
   }
 
+  // ---------- DAY LOG: record events, undo, close (model + maths live in daylog.js) ----------
+  const DL = DayLog;
+  const saveDay = (d) => WPStore.set('daylogs', d.date, d);
+  const bgSaveDay = (d) => { saveDay(d).catch(() => {}); };
+  const SIX_H = 6 * 3600e3;
+  const lastEventMs = (d) => d.events.reduce((a, e) => Math.max(a, Date.parse(e.t) || 0), 0);
+
+  async function loadDays() {
+    S.days = {};
+    (await WPStore.list('daylogs')).forEach((d) => { if (d && d.date && Array.isArray(d.events)) S.days[d.date] = d; });
+    for (const k of DL.pruneDates(Object.keys(S.days), DL.dateKey(Date.now()))) { delete S.days[k]; await WPStore.remove('daylogs', k); } // keep 120 days
+  }
+  // The day an event belongs to: an unclosed day with activity in the last 6 h (a run past midnight stays on the
+  // date it started), else today's record, else (create) a new one.
+  function dayFor(nowMs, create) {
+    const recent = Object.values(S.days).filter((d) => !d.closed && lastEventMs(d) > 0 && nowMs - lastEventMs(d) <= SIX_H).sort((a, b) => b.date.localeCompare(a.date))[0];
+    if (recent) return recent;
+    const key = DL.dateKey(nowMs);
+    if (S.days[key]) return S.days[key];
+    if (!create) return null;
+    const d = DL.newDay({ date: key, driverId: S.settings.driverName || 'Calvin' });
+    S.days[key] = d;
+    return d;
+  }
+  async function reopenDay(day) { // undo of "Close day": carried / dropped jobs go back exactly as they were
+    const changed = DL.reopenDay(day, S.jobs, new Date().toISOString());
+    for (const j of changed) await saveJob(j);
+    await saveDay(day);
+  }
+  async function reopenIfClosed() { // new activity on a closed day reopens it
+    try {
+      const d = dayFor(Date.now(), false);
+      if (d && d.closed) { await reopenDay(d); toast('Day reopened'); }
+    } catch (e) { /* the day log must never break an action */ }
+  }
+
+  function logPlan(replan, o) {
+    try {
+      const now = Date.now(), day = dayFor(now, true);
+      const plan = curPlan();
+      const order = plan ? plan.order : [];
+      let pk = { plannedKm: null, plannedDriveMin: null };
+      if (!day.planSnapshot && plan) {
+        const seq = [o.start].concat(order.map((id) => o.places[id]).filter(Boolean).map((p) => ({ lat: p.lat, lng: p.lng })));
+        pk = DL.plannedFromMatrices(o.matrices, o.points, seq, o.departAt.getTime());
+      }
+      DL.recordPlan(day, { nowIso: new Date(now).toISOString(), replan: !!replan, start: o.start, departAtIso: o.departAt.toISOString(), jobs: o.jobs, places: o.places, stopOrder: order, plannedKm: pk.plannedKm, plannedDriveMin: pk.plannedDriveMin });
+      bgSaveDay(day);
+    } catch (e) { /* never break planning */ }
+  }
+
+  function logDone(stop, nowIso) {
+    try {
+      const nowMs = Date.parse(nowIso), day = dayFor(nowMs, true);
+      const groups = DL.doneGroups(day), lastG = groups[groups.length - 1];
+      const coord = (id) => { const p = S.places[id] || (S.plan && S.plan.ctx.places[id]) || day.places[id]; return p ? { lat: p.lat, lng: p.lng } : null; };
+      const prev = lastG ? coord(lastG.stopId) : (day.planSnapshot && day.planSnapshot.start);
+      const to = coord(stop.placeId), plan = curPlan();
+      const evs = DL.recordDone(day, { nowIso, stopId: stop.placeId, actions: stop.actions, places: S.places });
+      if (plan && prev && to) { // keep the leg just driven if the plan's own routing matrices cover that exact pair
+        const m = plan.model;
+        const pts = [m.start].concat(m.stopIds.map(coord), [m.end]);
+        if (pts.every(Boolean)) DL.captureLeg(day, prev, to, m.matrices, pts, nowMs);
+      }
+      bgSaveDay(day);
+      attachFix(evs, day);
+    } catch (e) { /* never break DONE */ }
+  }
+  // Geolocation fix for a DONE: only if the permission is ALREADY granted (never prompts), 3 s timeout, fire-and-forget.
+  function attachFix(evs, day) {
+    try {
+      if (!navigator.geolocation || !navigator.permissions || !navigator.permissions.query) return;
+      navigator.permissions.query({ name: 'geolocation' }).then((st) => {
+        if (st.state !== 'granted') return;
+        navigator.geolocation.getCurrentPosition((p) => {
+          evs.forEach((e) => { e.lat = p.coords.latitude; e.lng = p.coords.longitude; e.accuracy = p.coords.accuracy; });
+          bgSaveDay(day);
+        }, () => {}, { timeout: 3000, maximumAge: 60000 });
+      }).catch(() => {});
+    } catch (e) { /* ignore */ }
+  }
+
+  // Undo the most recent DONE: the job actions go back to pending, the day log gets an `undo`, the summary recomputes.
+  async function undoDone(stop0, i0) {
+    const P = S.plan, cur = curPlan();
+    if (!cur) return;
+    const li = lastDoneIdx(cur);
+    if (li < 0 || li !== i0) return;
+    const stop = cur.stops[li];
+    const day = Object.values(S.days).find((d) => DL.hasActiveDone(d, stop.placeId, stop.doneAt));
+    if (day && day.closed) await reopenDay(day); // reopening restores carried / dropped jobs first
+    for (const a of stop.actions) {
+      const j = S.jobs.find((x) => x.id === a.jobId);
+      if (!j) continue;
+      if (a.kind === 'pickup') {
+        const mine = (j.pickups || []).filter((p) => p.placeId === stop.placeId && p.done);
+        const p = mine.filter((q) => (q.item || '') === (a.item || '')).pop() || mine.pop();
+        if (p) p.done = false;
+        if (j.status === 'done') { j.status = 'pending'; j.doneAt = null; }
+      } else { j.status = 'pending'; j.doneAt = null; }
+      await saveJob(j);
+    }
+    if (day) { DL.recordUndo(day, { nowIso: new Date().toISOString(), stopId: stop.placeId }); bgSaveDay(day); }
+    delete stop.status; delete stop.doneAt;
+    P.prompt = null;
+    retimeNow();
+    banner(null);
+    await savePlan();
+    render();
+  }
+
+  function dayCompleteBanner() {
+    try {
+      if (pendingJobs().length) return;
+      const d = dayFor(Date.now(), false);
+      if (d && !d.closed && DL.summarise(d, S.jobs, S.places).jobsDone > 0) banner('Day complete - view summary', 'info', () => openSummary(d.date));
+    } catch (e) { /* ignore */ }
+  }
+
+  // ---------- DAY SUMMARY screen ----------
+  function openSummary(date, opts) {
+    opts = opts || {};
+    const day = S.days[date];
+    if (!day) return;
+    const sh = openSheet('Day summary · ' + DL.fmtDate(date));
+    sh.sheet.classList.add('summary');
+    let routing = false;
+    const sum = () => DL.summarise(day, S.jobs, S.places);
+    const ro = () => !!opts.readOnly;
+    const hm = DL.fmtTime;
+
+    async function routeNow(manual) { // ONE routing request for the whole driven sequence (only when held leg data is missing)
+      const s = sum();
+      if (!s.route.needs || routing) return;
+      if (!S.settings.tomtomKey) { if (manual) toast('TomTom key missing — add it in Settings.'); return; }
+      routing = true; draw();
+      try {
+        const legs = await Providers.routeLegs(s.route.points, S.settings.tomtomKey);
+        day.routed = { key: s.route.key, legs, at: new Date().toISOString() };
+        await saveDay(day);
+      } catch (e) { if (manual) toast(e.message || 'Routing failed'); }
+      routing = false; draw();
+    }
+
+    function editTime(field, current) {
+      const e = openSheet(field === 'startedAt' ? 'Started at' : 'Finished at');
+      const inp = h('input', { type: 'time', value: current != null ? hm(current) : '' });
+      e.body.append(h('label', { class: 'field' }, '24-hour time (Asia/Kuala_Lumpur)'), inp, h('div', { class: 'sticky-actions' },
+        h('button', { onclick: e.close }, 'Cancel'),
+        h('button', { onclick: async () => { delete day.edits[field]; await saveDay(day); e.close(); draw(); } }, 'Reset'),
+        h('button', { class: 'primary', onclick: async () => {
+          if (!inp.value) { toast('Pick a time'); return; }
+          const [hh, mm] = inp.value.split(':').map(Number), s = sum();
+          const baseMs = (current != null ? current : DL.dayStartMs(day.date));
+          const dayMs = DL.dayStartMs(DL.dateKey(baseMs));
+          let t = dayMs + (hh * 60 + mm) * 60000;
+          if (field === 'finishedAt' && s.startedAt != null && t < s.startedAt) t += 86400000; // finished after midnight
+          day.edits[field] = new Date(t).toISOString();
+          await saveDay(day); e.close(); draw();
+        } }, 'Save')));
+    }
+
+    const tile = (label, value, cls, fn) => h('div', { class: 'tile ' + (cls || '') + (fn ? ' tappable' : ''), role: fn ? 'button' : null, tabindex: fn ? '0' : null, onclick: fn || null },
+      h('div', { class: 'tv' }, value), h('div', { class: 'tl' }, label));
+    const sec = (title, cls, kids, empty) => h('div', { class: 'card sum-sec ' + cls }, h('div', { class: 'eyebrow' }, title),
+      kids.length ? kids : h('div', { class: 'muted' }, empty || 'None'));
+    const line = (main, time, chips) => h('div', { class: 'sum-line' }, h('div', { class: 'sl-main' }, main, chips || null), time ? h('div', { class: 'sl-time' }, time) : null);
+
+    function draw() {
+      const s = sum();
+      const kmVal = s.km.status === 'ok' ? s.km.value.toFixed(1) + ' km' : s.km.status === 'none' ? '0.0 km' : routing ? 'Routing…' : 'km unavailable - tap to retry';
+      const kmTile = tile('Est. km (road route between stops, not odometer)', kmVal, 'wide km' + (s.km.status === 'unavailable' ? ' unavailable' : ''),
+        s.km.status === 'unavailable' && !routing ? () => routeNow(true) : null);
+      const total = s.hoursOutMin, drv = s.driveMin;
+      const bar = total && drv != null ? h('div', { class: 'split-bar', 'aria-hidden': 'true' },
+        h('span', { class: 'drive', style: 'flex:' + Math.max(drv, 0.01) }), h('span', { class: 'stops', style: 'flex:' + Math.max(total - drv, 0.01) })) : null;
+      const tiles = h('div', { class: 'tiles' },
+        tile('Jobs done', s.jobsDone + ' of ' + s.jobsTotal, 'jobs'),
+        tile('Stops visited', String(s.stopsVisited), 'stops'),
+        kmTile,
+        tile('Hours out', DL.fmtDur(s.hoursOutMin), 'hours'),
+        h('div', { class: 'tile split' }, h('div', { class: 'tl' }, 'Drive (est.) vs at stops/other'),
+          h('div', { class: 'tv2' }, h('span', { class: 'dv' }, DL.fmtDur(s.driveMin) + ' est.'), h('span', { class: 'sv' }, DL.fmtDur(s.atStopsMin))), bar));
+      const timeRow = h('div', { class: 'row time-edit' },
+        h('button', { class: 'small grow', disabled: ro(), onclick: () => editTime('startedAt', s.startedAt) }, 'Started ' + (s.startedAt != null ? hm(s.startedAt) : '—') + (ro() ? '' : ' ✎')),
+        h('button', { class: 'small grow', disabled: ro(), onclick: () => editTime('finishedAt', s.finishedAt) }, 'Finished ' + (s.finishedAt != null ? hm(s.finishedAt) : '—') + (ro() ? '' : ' ✎')));
+
+      const urgentChip = h('span', { class: 'chip urgent' }, 'URGENT'), lateChip = h('span', { class: 'chip late' }, 'LATE');
+      const collected = sec('Collected', 'collect', s.collected.map((c) => line(h('span', null, c.item || '(item)', ' - ', c.place), hm(c.t))), 'Nothing collected');
+      const delivered = sec('Delivered', 'deliver', s.delivered.map((d) => line(h('span', null, d.item || '(item)', ' - ', d.place), hm(d.t),
+        [d.urgent ? urgentChip.cloneNode(true) : null, d.late ? lateChip.cloneNode(true) : null].filter(Boolean))), 'Nothing delivered');
+      const errands = sec('Errands done', 'errand', s.errands.map((e) => line(h('span', null, e.item, ' - ', e.place), hm(e.t))), 'No errands');
+      const withYou = sec('Still with you', 'inhand', s.stillWithYou.map((r) => line(h('span', null, r.item || '(item)', ' → ', r.to), null, r.urgent ? [urgentChip.cloneNode(true)] : null)), 'Nothing in the van');
+
+      const notDone = sec('Not done', 'notdone', s.notDone.map((r) => {
+        const dec = () => (day.decisions[r.jobId] = day.decisions[r.jobId] || {});
+        const chips = h('div', { class: 'reasons' }, DL.REASONS.map((rs) => h('button', { type: 'button', class: 'chip-btn-r' + (r.reason === rs ? ' on' : ''), disabled: ro(), 'aria-pressed': r.reason === rs ? 'true' : 'false',
+          onclick: (ev) => {
+            const d = dec(); d.reason = d.reason === rs ? '' : rs; bgSaveDay(day);
+            chips.querySelectorAll('button').forEach((b) => { const on = b.textContent === d.reason; b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); });
+          } }, rs)));
+        const carry = h('label', { class: 'toggle carry' }, h('input', { type: 'checkbox', checked: r.carry, disabled: ro(), onchange: (ev) => { dec().carry = ev.target.checked; bgSaveDay(day); } }), 'Carry to tomorrow');
+        return h('div', { class: 'nd-job' },
+          h('div', { class: 'sl-main' }, h('b', null, (r.item || (r.type === 'errand' ? 'Errand' : '(item)')) + (r.to ? ' → ' + r.to : '')), r.urgent ? h('span', { class: 'chip urgent' }, 'URGENT') : null,
+            r.withYou ? h('span', { class: 'chip inhand' }, 'WITH YOU') : null),
+          h('div', { class: 'muted' }, r.from && r.from !== 'in hand' ? 'from ' + r.from : r.type === 'in-hand' ? 'in hand' : ''), chips, carry);
+      }), 'Every job is done 🎉');
+
+      const pv = s.plan;
+      const pvl = (label, planned, actual) => h('div', { class: 'pv-row' }, h('span', null, label), h('span', { class: 'pv-vals' }, h('span', { class: 'muted' }, 'plan ' + planned), h('b', null, actual)));
+      const planVs = h('div', { class: 'card sum-sec' }, h('div', { class: 'eyebrow' }, 'Plan vs actual'),
+        pvl('Distance (est. km)', pv.plannedKm != null ? pv.plannedKm.toFixed(1) : '—', s.km.status === 'ok' ? s.km.value.toFixed(1) : s.km.status === 'none' ? '0.0' : '—'),
+        pvl('Drive time (est.)', pv.plannedDriveMin != null ? DL.fmtDur(pv.plannedDriveMin) : '—', DL.fmtDur(s.driveMin)),
+        pvl('Stops done', pv.stopsPlanned + ' planned', String(pv.stopsDone)),
+        pvl('Replans', '', String(pv.replans)),
+        pvl('Stops done out of the first plan’s order', '', String(pv.outOfOrder)));
+
+      const copyBtn = h('button', { class: 'grow', onclick: async () => { toast((await copyText(DL.toWhatsApp(sum()))) ? 'Summary copied — paste into WhatsApp' : 'Could not copy'); } }, 'Copy summary');
+      const csvBtn = h('button', { class: 'grow', onclick: () => downloadCsv(sum()) }, 'Download CSV');
+      const main = ro() ? null : day.closed
+        ? h('button', { class: 'big grow', id: 'reopenDay', onclick: async () => { await reopenDay(day); render(); draw(); toast('Day reopened'); } }, 'Reopen day')
+        : h('button', { class: 'primary big grow', id: 'closeDay', onclick: async () => {
+          const changed = DL.closeDay(day, S.jobs, S.places, new Date().toISOString());
+          for (const j of changed) await saveJob(j);
+          await saveDay(day); banner(null); render(); draw();
+          toast('Day closed' + (day.carried.length ? ' · ' + day.carried.filter((c) => c.mode !== 'dropped').length + ' job(s) carried' : ''));
+        } }, 'Close day');
+      sh.body.replaceChildren(
+        h('div', { class: 'muted sum-sub' }, day.driverId + ' · ' + (day.closed ? 'closed ' + (day.endedAt ? DL.fmtDate(DL.dateKey(Date.parse(day.endedAt))) + ' ' + hm(Date.parse(day.endedAt)) : '') : 'open') + (ro() ? ' · read-only' : '')),
+        tiles, timeRow, collected, delivered, errands, withYou, notDone, planVs,
+        h('div', { class: 'sum-actions' }, h('div', { class: 'row' }, copyBtn, csvBtn), h('div', { class: 'row' }, main, h('button', { onclick: sh.close }, 'Back'))));
+    }
+    draw();
+    if (!ro() && !day.closed) routeNow(false);
+  }
+
+  function downloadCsv(s) {
+    const a = h('a', { href: URL.createObjectURL(new Blob([DL.toCSV(s)], { type: 'text/csv;charset=utf-8' })), download: 'waypoint-' + s.date + '.csv' });
+    document.body.append(a); a.click(); a.remove();
+  }
+
+  // Settings: current-week totals (Mon–Sun) + the last 30 days; a row reopens that day's summary read-only
+  function historyCard() {
+    const today = DL.dateKey(Date.now());
+    const sums = Object.values(S.days).map((d) => ({ d, s: DL.summarise(d, S.jobs, S.places) }));
+    const rowOf = (x) => ({ date: x.d.date, jobsDone: x.s.jobsDone, jobsTotal: x.s.jobsTotal, km: x.s.km.status === 'ok' ? x.s.km.value : x.s.km.status === 'none' ? 0 : null, hoursOutMin: x.s.hoursOutMin });
+    const w = DL.weekTotals(sums.map(rowOf), today);
+    const keys = DL.historyKeys(Object.keys(S.days), today, 30);
+    return h('div', { class: 'card', id: 'historyCard' }, h('h2', { style: 'margin-top:0' }, 'Day history'),
+      h('div', { class: 'week', id: 'weekTotals' }, h('div', { class: 'muted' }, 'This week · ' + DL.fmtDate(w.from) + ' – ' + DL.fmtDate(w.to)),
+        h('div', { class: 'title' }, w.jobsDone + ' of ' + w.jobsTotal + ' jobs · ' + w.km.toFixed(1) + ' km' + (w.kmMissing ? '*' : '') + ' · ' + DL.fmtDur(w.hoursOutMin) + ' out'),
+        w.kmMissing ? h('div', { class: 'muted' }, '* ' + w.kmMissing + ' day(s) without km') : null),
+      keys.length ? keys.map((k) => { const x = sums.find((y) => y.d.date === k), r = rowOf(x);
+        return h('button', { class: 'hist-row', onclick: () => openSummary(k, { readOnly: true }) },
+          h('span', { class: 'hd' }, DL.fmtDate(k)), h('span', { class: 'hj' }, r.jobsDone + '/' + r.jobsTotal), h('span', { class: 'hk' }, r.km == null ? 'km —' : r.km.toFixed(1) + ' km'), h('span', { class: 'hh' }, DL.fmtDur(r.hoursOutMin))); })
+        : h('div', { class: 'muted' }, 'No days recorded yet.'));
+  }
+
   // ---------- messaging ----------
   async function copyText(text) {
     try { await navigator.clipboard.writeText(text); return true; } catch (e) {
@@ -831,9 +1096,11 @@
     const place = S.places[stop.placeId] || P.ctx.places[stop.placeId];
     const st = stop.status;
     if (st === 'done') { // done stops collapse to one line: tick, name, actual done time
+      const undoable = i === lastDoneIdx(curPlan());
       return h('div', { class: 'card stop done compact' }, h('div', { class: 'row spread' },
         h('div', { class: 'title' }, '✓ ' + (i + 1) + '. ' + dName(place.name)),
-        h('div', { class: 'muted times' }, 'done ' + fmt(Date.parse(stop.doneAt)))));
+        h('div', { class: 'muted times' }, 'done ' + fmt(Date.parse(stop.doneAt))),
+        undoable ? h('button', { class: 'small undo', 'aria-label': 'Undo done', onclick: () => undoDone(stop, i) }, 'Undo') : null));
     }
     const hasDelivery = stop.actions.some((a) => a.kind === 'deliver');
     // Actions as boxes (same tokens as the Plan cards): COLLECT "item → customer", DELIVER items, ERRAND.
@@ -904,6 +1171,7 @@
     const ls = liveStop(stop0, i0);
     if (!ls) return;
     const stop = ls.stop, i = ls.i;
+    await reopenIfClosed();
     const nowIso = new Date().toISOString();
     for (const a of stop.actions) {
       const j = S.jobs.find((x) => x.id === a.jobId);
@@ -918,6 +1186,7 @@
     }
     stop.status = 'done';
     stop.doneAt = nowIso;
+    logDone(stop, nowIso); // synchronous, in memory: never delays DONE (save + geolocation fix happen in the background)
     P.alt = null;
     P.result.plans = [P.result.plans[P.idx]]; P.idx = 0; // alternatives pre-date this DONE: drop them
     await refreshIfStale(P.result.plans[0]);              // travel times older than 30 min are re-fetched first
@@ -935,6 +1204,7 @@
     if (!plan.stops.some((s) => !s.status)) toast('Run complete 🎉');
     await savePlan();
     render();
+    dayCompleteBanner();
   }
 
   async function skipStop(stop0, i0) { // actions stay pending; ETAs re-timed from this stop at the current time
@@ -1057,6 +1327,9 @@
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Google Places calls today'),
         h('div', { class: 'title' }, String(placesCallsToday())),
         h('div', { class: 'muted' }, 'Counted on this device only. Google quota cap 150/day set in Cloud console.')),
+      h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Driver'),
+        field('Driver name (day log + summary)', bind(h('input', { value: s.driverName || 'Calvin', autocomplete: 'off' }), 'driverName', (x) => x.trim() || 'Calvin'))),
+      historyCard(),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Messages'),
         field('Default language', bind(h('select', null, [['ms', 'Bahasa Malaysia'], ['en', 'English']].map(([val, lab]) => h('option', { value: val, selected: s.defaultLang === val }, lab))), 'defaultLang')),
         field('ETA padding (minutes)', bind(h('input', { type: 'number', inputmode: 'numeric', min: '0', value: String(s.etaPaddingMin) }), 'etaPaddingMin', (x) => Number(x) || 0)),

@@ -13,10 +13,11 @@ Live: https://happymale96.github.io/waypoint/
 | `providers.js` | Google Places (New) text search; TomTom Matrix Routing v2 |
 | `storage.js` | Async `get/set/list/remove` over localStorage — swap for a hosted backend later |
 | `messages.js` | WhatsApp text: greeting, ETA rounding, templates, `wa.me` links |
+| `daylog.js` | End-of-day record + `summarise()` (pure: km, hours, collected/delivered, carry-forward, CSV / WhatsApp text, history) |
 | `sw.js`, `manifest.json`, `icon-*.png` | PWA shell |
 | `tools/make-icons.js` | Builds the 192/512 maskable icons (`npm install` in `tools/` first) |
 | `tools/stamp-sw.js` | Writes the build stamp into `sw.js` and `app.js` — **run before every commit** (see below) |
-| `test/*.test.js` | `node test/solver.test.js && node test/messages.test.js` |
+| `test/*.test.js` | `node test/solver.test.js && node test/messages.test.js && node test/daylog.test.js` |
 
 ## Releases and the build stamp
 The service worker's cache name is `waypoint-<stamp>`. The stamp is an 8-character content hash of the whole app shell (html, css, js, json, icons), written by `tools/stamp-sw.js` into `sw.js` (`BUILD`) and `app.js` (`BUILD_STAMP`, shown in **Settings → build …**).
