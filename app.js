@@ -3,6 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
+  const BUILD_STAMP = 'e1ca7b65'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -774,7 +775,25 @@
         h('div', { class: 'row' }, h('button', { class: 'grow', onclick: exportJson }, 'Export JSON'), h('button', { class: 'grow', onclick: () => fileIn.click() }, 'Import JSON'), fileIn),
         h('button', { style: 'margin-top:8px', onclick: () => { Providers.clearCache(); toast('Travel-time cache cleared'); } }, 'Clear travel-time cache')),
       h('div', { class: 'muted', id: 'lastPlan', style: 'text-align:center;font-size:12px' }, lastPlanText()),
-      h('div', { class: 'muted', style: 'text-align:center' }, 'L-Tech Waypoint v' + APP_VERSION));
+      h('div', { class: 'muted', style: 'text-align:center' }, 'L-Tech Waypoint v' + APP_VERSION + ' · build ' + BUILD_STAMP),
+      h('div', { class: 'muted', id: 'swBuild', style: 'text-align:center;font-size:12px' }, 'Service worker: checking…'));
+    describeServiceWorker().then((t) => { const el = document.getElementById('swBuild'); if (el) el.textContent = t; });
+  }
+
+  // Which build is the service worker running? (compare with the build above; they match once an update has applied)
+  async function describeServiceWorker() {
+    if (!('serviceWorker' in navigator)) return 'Service worker: not supported here';
+    const ctl = navigator.serviceWorker.controller;
+    if (!ctl) return 'Service worker: not active (offline cache off)';
+    try {
+      const build = await new Promise((resolve, reject) => {
+        const ch = new MessageChannel();
+        const t = setTimeout(() => reject(new Error('timeout')), 1500);
+        ch.port1.onmessage = (e) => { clearTimeout(t); resolve(e.data); };
+        ctl.postMessage('build', [ch.port2]);
+      });
+      return 'Service worker: build ' + build + (build === BUILD_STAMP ? '' : ' (update pending)');
+    } catch (e) { return 'Service worker: active'; }
   }
 
   function exportJson() {
@@ -825,9 +844,33 @@
     render();
   });
 
+  // Service worker: register, look for updates on every launch and whenever the app comes back to the
+  // foreground, and reload once when a NEW worker takes control (so the fresh code is what you see).
+  function setupServiceWorker() {
+    if (!('serviceWorker' in navigator)) return;
+    const sw = navigator.serviceWorker;
+    const hadController = !!sw.controller; // first install also fires controllerchange (clients.claim): nothing stale then
+    let reloaded = false;
+    const recentlyReloaded = () => { try { return Date.now() - Number(sessionStorage.getItem('wp-sw-reload') || 0) < 10000; } catch (e) { return false; } };
+    function reloadOnce() {
+      if (reloaded || recentlyReloaded()) return; // flag + sessionStorage stamp: never loop
+      // don't wipe a sheet the user is typing in, or a plan that is being computed: wait until it is idle
+      if (S.busy || document.querySelector('.backdrop')) { setTimeout(reloadOnce, 1500); return; }
+      reloaded = true;
+      try { sessionStorage.setItem('wp-sw-reload', String(Date.now())); } catch (e) { /* ignore */ }
+      location.reload();
+    }
+    sw.addEventListener('controllerchange', () => { if (hadController) reloadOnce(); });
+    sw.register('sw.js', { scope: './', updateViaCache: 'none' }).then((reg) => {
+      const check = () => reg.update().catch(() => {});
+      check(); // every launch
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') check(); });
+    }).catch(() => {});
+  }
+
   load().then(() => {
     render();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js', { scope: './' }).catch(() => {});
+    setupServiceWorker();
   }).catch((e) => banner('Startup failed: ' + e.message, 'error'));
 
   window.WaypointDebug = { S, doPlan, render };

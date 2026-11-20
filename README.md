@@ -15,7 +15,17 @@ Live: https://happymale96.github.io/waypoint/
 | `messages.js` | WhatsApp text: greeting, ETA rounding, templates, `wa.me` links |
 | `sw.js`, `manifest.json`, `icon-*.png` | PWA shell |
 | `tools/make-icons.js` | Builds the 192/512 maskable icons (`npm install` in `tools/` first) |
+| `tools/stamp-sw.js` | Writes the build stamp into `sw.js` and `app.js` — **run before every commit** (see below) |
 | `test/*.test.js` | `node test/solver.test.js && node test/messages.test.js` |
+
+## Releases and the build stamp
+The service worker's cache name is `waypoint-<stamp>`. The stamp is an 8-character content hash of the whole app shell (html, css, js, json, icons), written by `tools/stamp-sw.js` into `sw.js` (`BUILD`) and `app.js` (`BUILD_STAMP`, shown in **Settings → build …**).
+
+```
+node tools/stamp-sw.js          # stamp (run before every commit; idempotent — same files, same stamp)
+node tools/stamp-sw.js --check  # exit 1 if the stamp is stale (use in CI or a pre-commit hook)
+```
+How a release reaches the phone: the page and every `.html/.js/.css/.json` file are fetched **network-first** (bypassing the HTTP cache, so GitHub Pages' 10-minute `max-age` can't serve stale code) and only fall back to the cache when offline; icons are cache-first. A new `sw.js` installs with `skipWaiting()`, deletes old `waypoint-*` caches on activate, `clients.claim()`s the open page, and the page reloads once. The app also calls `registration.update()` on every launch and whenever it returns to the foreground. API calls (TomTom, Google) are never cached. If the reload would interrupt an open sheet or a running plan, it waits until you are done.
 
 ## Keys
 Paste them in Settings; they live in this phone's localStorage only (never committed, never exported).

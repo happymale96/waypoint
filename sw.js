@@ -1,33 +1,72 @@
-/* L-Tech Waypoint service worker. Scope = the folder it is served from (works under /waypoint/).
- * Same-origin GETs: stale-while-revalidate. Cross-origin (Google / TomTom APIs) is never touched. */
-const CACHE = 'waypoint-v1.0.0';
-const ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'solver.js', 'providers.js', 'storage.js', 'messages.js', 'manifest.json', 'icon-192.png', 'icon-512.png'];
+/* L-Tech Waypoint service worker (scope = the folder it is served from, e.g. /waypoint/).
+ *
+ * - BUILD is written by tools/stamp-sw.js (content hash of the app shell): every release gets a new cache name.
+ * - install: skipWaiting(). activate: delete old "waypoint-*" caches, then clients.claim().
+ * - Navigations and same-origin .html/.js/.css/.json: NETWORK-FIRST (revalidating, bypassing the HTTP cache so
+ *   GitHub Pages' max-age can't serve stale code), falling back to the cache when offline or on a 5xx.
+ * - Icons / fonts / images: CACHE-FIRST.
+ * - Cross-origin requests (TomTom, Google APIs, anything else) are never intercepted or cached.
+ */
+const BUILD = 'e1ca7b65';
+const CACHE = 'waypoint-' + BUILD;
+const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'solver.js', 'providers.js', 'storage.js', 'messages.js', 'manifest.json', 'icon-192.png', 'icon-512.png'];
+const NEVER_CACHE = /(^|\.)(tomtom\.com|googleapis\.com)$/i; // belt and braces: these are cross-origin anyway
+const CODE = /\.(html|js|css|json)$/i;
+const STATIC = /\.(png|jpe?g|gif|svg|ico|webp|woff2?|ttf|otf)$/i;
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  self.skipWaiting();
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL.map((u) => new Request(u, { cache: 'reload' })))));
 });
 
 self.addEventListener('activate', (e) => {
-  e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))).then(() => self.clients.claim()));
+  e.waitUntil(
+    caches.keys()
+      // only our own old caches: other sites on the same github.io origin share CacheStorage
+      .then((keys) => Promise.all(keys.filter((k) => k.startsWith('waypoint-') && k !== CACHE).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
 });
+
+// The page can ask which build is running (shown in Settings).
+self.addEventListener('message', (e) => {
+  if (e.data === 'build' && e.ports && e.ports[0]) e.ports[0].postMessage(BUILD);
+});
+
+const keyFor = (req) => { const u = new URL(req.url); return u.origin + u.pathname; };
+
+async function networkFirst(e, isNav) {
+  const req = e.request;
+  const cache = await caches.open(CACHE);
+  const key = keyFor(req);
+  try {
+    const res = await fetch(new Request(req, { cache: 'no-cache' }));
+    if (res.ok) { e.waitUntil(cache.put(key, res.clone()).catch(() => {})); return res; }
+    if (res.status >= 500) throw new Error('HTTP ' + res.status);
+    return res; // 404 etc. are real answers, not offline
+  } catch (err) {
+    const hit = (await cache.match(key)) || (isNav ? await cache.match('index.html') : undefined);
+    return hit || new Response('Offline', { status: 503, statusText: 'Offline' });
+  }
+}
+
+async function cacheFirst(e) {
+  const req = e.request;
+  const cache = await caches.open(CACHE);
+  const key = keyFor(req);
+  const hit = await cache.match(key);
+  if (hit) return hit;
+  const res = await fetch(req);
+  if (res.ok) e.waitUntil(cache.put(key, res.clone()).catch(() => {}));
+  return res;
+}
 
 self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
-  if (url.origin !== self.location.origin) return;
-  e.respondWith(
-    caches.open(CACHE).then(async (cache) => {
-      const cached = await cache.match(req, { ignoreSearch: true });
-      const net = fetch(req).then((res) => {
-        if (res && res.ok) cache.put(req, res.clone());
-        return res;
-      }).catch(() => null);
-      if (cached) { e.waitUntil(net); return cached; }
-      const res = await net;
-      if (res) return res;
-      if (req.mode === 'navigate') return cache.match('index.html');
-      return new Response('Offline', { status: 503 });
-    })
-  );
+  if (url.origin !== self.location.origin || NEVER_CACHE.test(url.hostname)) return; // never touch APIs
+  const isNav = req.mode === 'navigate';
+  if (isNav || CODE.test(url.pathname) || url.pathname.endsWith('/')) e.respondWith(networkFirst(e, isNav));
+  else if (STATIC.test(url.pathname)) e.respondWith(cacheFirst(e));
 });
