@@ -33,7 +33,7 @@
         body: JSON.stringify({
           textQuery: query,
           regionCode: 'MY',
-          locationBias: { circle: { center: { latitude: 3.1, longitude: 101.6 }, radius: 80000 } },
+          locationBias: { circle: { center: { latitude: 3.1, longitude: 101.6 }, radius: 50000 } },
         }),
       });
     } catch (e) {
