@@ -342,13 +342,15 @@
       end: { lat: c.input.end.lat, lng: c.input.end.lng },
       stopIds: bs.stopIds.slice(),
       matrices: c.input.matrices,
-      dwellSec: {}, afterMs: {}, closed: {},
+      dwellSec: {}, afterMs: {}, closed: {}, beforeMs: {}, names: {},
       respectClosed: c.respect,
     };
     bs.stopIds.forEach((pid, i) => {
       model.dwellSec[pid] = c.dwell[i];
       model.afterMs[pid] = c.after[i] > -Infinity ? Math.round(t0ms + c.after[i] * 1000) : null;
       model.closed[pid] = places[pid].closedWindows || [];
+      model.names[pid] = places[pid].name;
+      model.beforeMs[pid] = c.targets[i].filter((tg) => tg.before != null).map((tg) => ({ jobId: tg.jobId, ms: Math.round(t0ms + tg.before * 1000) }));
     });
     return {
       order: order.map((i) => bs.stopIds[i]),
@@ -403,7 +405,9 @@
   // location of stop `fromStopIndex` (-1 = the plan's start point) at time `nowISO`. Uses the plan's own model
   // (stored matrices with the nearest-slice rule, dwell, arriveAfter waits, closed windows). Pure: returns a new plan;
   // done/skipped stops (stop.status) are copied untouched.
-  function retime(plan, fromStopIndex, nowISO) {
+  // origin (optional) = {durationToNextSec}: the first not-done stop is reached after that many seconds from NOW
+  // (a live fix + one routing request) instead of the matrix leg from the last done stop / start. Order never changes.
+  function retime(plan, fromStopIndex, nowISO, origin) {
     const m = plan && plan.model;
     if (!m || !m.matrices || !m.matrices.length) throw new Error('retime: plan has no model/matrices');
     const nowMs = Date.parse(nowISO);
@@ -422,12 +426,16 @@
       const p = pidx(plan.stops[fromStopIndex].placeId);
       pos = p == null ? 0 : p;
     }
+    const ov = origin && origin.durationToNextSec != null && isFinite(origin.durationToNextSec) ? Math.max(0, Number(origin.durationToNextSec)) : null;
+    let firstLeft = true;
     let t = nowMs;
     const stops = plan.stops.map((s) => {
       if (s.status === 'done' || s.status === 'skipped') return Object.assign({}, s);
       const pi = pidx(s.placeId);
       if (pi == null) return Object.assign({}, s);
-      const arrive0 = t + leg(pos, pi, t) * 1000;
+      const legSec = firstLeft && ov != null ? ov : leg(pos, pi, t);
+      firstLeft = false;
+      const arrive0 = t + legSec * 1000;
       let arrive = arrive0;
       const af = m.afterMs ? m.afterMs[s.placeId] : null;
       if (af != null && af > arrive) arrive = af;
@@ -443,7 +451,41 @@
       return out;
     });
     const endMs = t + leg(pos, k + 1, t) * 1000;
-    return Object.assign({}, plan, { stops, endArrival: Math.round(endMs), totalSec: Math.round((endMs - m.t0ms) / 1000) });
+    const out = Object.assign({}, plan, { stops, endArrival: Math.round(endMs), totalSec: Math.round((endMs - m.t0ms) / 1000) });
+    if (m.beforeMs) { // window lateness follows the new times (stops still ahead only)
+      const violations = []; let lateMs = 0;
+      stops.forEach((s) => {
+        if (s.status) return;
+        s.late = false;
+        (m.beforeMs[s.placeId] || []).forEach((tg) => {
+          if (s.arriveAt > tg.ms + 1) {
+            s.late = true; lateMs += s.arriveAt - tg.ms;
+            violations.push('Arrive-before missed at ' + ((m.names || {})[s.placeId] || s.placeId) + ': arrives ' + formatETA(s.arriveAt) + ', must be before ' + formatETA(tg.ms) + ' (job ' + tg.jobId + ')');
+          }
+        });
+      });
+      out.violations = violations; out.lateSec = Math.round(lateMs / 1000);
+    }
+    return out;
+  }
+
+  // ---------- live-location rules (pure; the app supplies the clock and the fix) ----------
+  const LOC = { REFRESH_MS: 120000, MOVED_M: 300, ARRIVED_M: 150, MAX_ACCURACY_M: 200 };
+  function distanceM(a, b) { // haversine, metres
+    const R = 6371000, rad = Math.PI / 180;
+    const dLat = (b.lat - a.lat) * rad, dLng = (b.lng - a.lng) * rad;
+    const x = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(x)));
+  }
+  // at most one location refresh per 2 minutes
+  const refreshDue = (nowMs, lastAtMs) => lastAtMs == null || nowMs - lastAtMs >= LOC.REFRESH_MS;
+  // What to do with a fix {lat,lng,accuracy}: 'ignore' (none / accuracy worse than 200 m), 'arrived' (within 150 m of the
+  // next stop: no routing request), 'unmoved' (under 300 m from lastFix, the position of the previous refresh), else 'route'.
+  function judgeFix(fix, lastFix, nextStop) {
+    if (!fix || fix.lat == null || fix.lng == null || !(fix.accuracy <= LOC.MAX_ACCURACY_M)) return 'ignore';
+    if (nextStop && distanceM(fix, nextStop) <= LOC.ARRIVED_M) return 'arrived';
+    if (lastFix && distanceM(fix, lastFix) < LOC.MOVED_M) return 'unmoved';
+    return 'route';
   }
 
   // Sub-matrices for a smaller problem: keep only the listed point indices, in that order (used to re-solve the
@@ -500,5 +542,5 @@
     return buildPlan(c, orderPlaceIds.map((p) => c.idx[p]));
   }
 
-  return { solve, evaluate, retime, reindexMatrices, isClosedAt, buildStops, pointsFor, formatETA, formatDuration, hmToSec, MAX_STOPS, DEFAULT_DWELL };
+  return { solve, evaluate, retime, reindexMatrices, distanceM, refreshDue, judgeFix, LOC, isClosedAt, buildStops, pointsFor, formatETA, formatDuration, hmToSec, MAX_STOPS, DEFAULT_DWELL };
 });

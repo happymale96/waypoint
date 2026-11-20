@@ -17,7 +17,7 @@ Live: https://happymale96.github.io/waypoint/
 | `sw.js`, `manifest.json`, `icon-*.png` | PWA shell |
 | `tools/make-icons.js` | Builds the 192/512 maskable icons (`npm install` in `tools/` first) |
 | `tools/stamp-sw.js` | Writes the build stamp into `sw.js` and `app.js` — **run before every commit** (see below) |
-| `test/*.test.js` | `node test/solver.test.js && node test/messages.test.js && node test/daylog.test.js` |
+| `test/*.test.js` | `node test/solver.test.js && node test/messages.test.js && node test/daylog.test.js && node test/location.test.js` |
 
 ## Releases and the build stamp
 The service worker's cache name is `waypoint-<stamp>`. The stamp is an 8-character content hash of the whole app shell (html, css, js, json, icons), written by `tools/stamp-sw.js` into `sw.js` (`BUILD`) and `app.js` (`BUILD_STAMP`, shown in **Settings → build …**).
@@ -55,3 +55,6 @@ TomTom's current docs list `routeSummary.travelTimeInSeconds` (and `trafficDelay
 8. Per stop: **WAZE** to navigate, **MSG** for a WhatsApp ETA, **DONE** when finished (offers to message the next delivery).
 9. If plans change: **SKIP**, then *Replan from here*.
 10. Settings → Export JSON for a backup.
+
+## ETAs from your location
+On opening the Route tab, returning to the app, and after DONE (at most once per 2 minutes, skipped if you moved under 300 m), the app takes a geolocation fix **only if permission is already granted** (high accuracy, 5 s; accuracy worse than 200 m is ignored). With a good fix it makes ONE TomTom Matrix request (you → next stop, live traffic) and re-times the stops via `Solver.retime(plan, from, now, {durationToNextSec})`: first ETA = now + that duration, later ETAs follow through the existing legs and dwell times; order never changes. Within 150 m of the next stop it counts as arrived (no request). CLOSED / LATE flags and the Avoid-lunch delta follow the new times. The Route tab says "Times from your location, HH:MM" or "Times from plan start" (no fix, denied, offline, provider error).

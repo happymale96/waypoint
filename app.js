@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = 'f3bd180f'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '041f08c4'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -33,7 +33,7 @@
   const S = {
     tab: 'plan', places: {}, jobs: [], settings: null,
     startSel: 'gps', endSel: 'home', departTime: '',
-    plan: null, busy: false, days: {},
+    plan: null, busy: false, days: {}, loc: { lastAt: null, origin: null, busy: false }, timesFrom: null,
   };
 
   function defaultSettings() {
@@ -534,6 +534,7 @@
       solveFresh();
       if (prevPlan) S.plan.result.plans = S.plan.result.plans.map((p) => compose(prevPlan, p));
       banner('Travel times: TomTom live traffic — ' + (got.fromCache ? 'from session cache (0 calls)' : got.calls + ' calls') + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
+      S.loc.origin = null; S.loc.lastAt = null;
       logPlan(replan, { start, departAt, places, points, matrices: got.matrices, jobs: Solver.buildStops(jobs, places).jobs });
       S.tab = 'route';
       await savePlan(); // after the tab switch, so a restore reopens the Route tab
@@ -542,6 +543,7 @@
     } finally {
       S.busy = false;
       render();
+      if (S.tab === 'route' && S.plan) refreshFromLocation();
     }
   }
 
@@ -580,7 +582,7 @@
 
   // Re-solve what is left (not done / skipped) from where we are, using the plan's OWN matrices — no API call.
   function resolveRemaining(opts) {
-    opts = opts || {};
+    opts = opts || {}; // opts.shiftMs: start the re-solve later/earlier (live-location offset)
     const P = S.plan, plan = curPlan(), m = plan.model;
     const from = lastDoneIdx(plan);
     const live = new Set(plan.stops.filter((s) => !s.status).map((s) => s.placeId));
@@ -600,7 +602,7 @@
     const idxList = [aIdx].concat(stopIds.map((pid) => m.stopIds.indexOf(pid) + 1), [m.stopIds.length + 1]);
     const matrices = Solver.reindexMatrices(m.matrices, idxList);
     const now = Date.now();
-    const at = from >= 0 ? now : Math.max(now, Date.parse(P.ctx.departAtISO));
+    const at = (from >= 0 ? now : Math.max(now, Date.parse(P.ctx.departAtISO))) + (opts.shiftMs || 0);
     const respect = opts.respect != null ? opts.respect : !!m.respectClosed;
     const res = Solver.solve({ start: anchor, end: { lat: m.end.lat, lng: m.end.lng }, jobs, places: S.places, matrices, departAtISO: iso(at), noDetour: P.noDetour, respectClosedWindows: respect });
     return { res, jobs: JSON.parse(JSON.stringify(jobs)), anchor, matrices, departAtISO: iso(at), from };
@@ -616,20 +618,77 @@
   async function reSolveFromCache() { // No-detour toggle
     const r = resolveRemaining({});
     if (r.res.error) banner(r.res.error, 'error');
-    else { adoptResult(r); banner('Re-solved from cached travel times — 0 API calls.', 'info'); }
+    else { adoptResult(r); S.loc.origin = null; banner('Re-solved from cached travel times — 0 API calls.', 'info'); await logReplanVia('no-detour'); }
     await savePlan();
     render();
   }
 
   // Live re-timing from the last done stop (or the start) at the current time. Order never changes.
+  // The live-location origin (S.loc.origin) only applies while the next not-done stop is the one it was measured for.
+  function originFor(plan, at) {
+    const o = S.loc.origin, nx = plan.stops.find((s) => !s.status);
+    if (!o || !nx || nx.placeId !== o.placeId || at > Date.now()) return null;
+    return { durationToNextSec: Math.max(0, (o.arriveMs - at) / 1000) };
+  }
   function retimeNow() {
     const P = S.plan, plan = curPlan();
     if (!plan || !plan.stops.some((s) => !s.status)) return false;
     const from = lastDoneIdx(plan), now = Date.now();
     const at = from < 0 ? Math.max(now, Date.parse(P.ctx.departAtISO)) : now; // before the planned departure: keep the planned times
-    P.result.plans[P.idx] = Solver.retime(plan, from, iso(at));
+    const org = originFor(plan, at);
+    P.result.plans[P.idx] = Solver.retime(plan, from, iso(at), org);
+    S.timesFrom = org ? S.loc.origin.usedAt : null;
     P.alt = null; P.shiftMs = 0;
     return true;
+  }
+
+  // ---------- ETAs from the current location ----------
+  // Geolocation only if the permission is ALREADY granted (never prompts). Returns a fix, {denied:true}, or null (failed).
+  async function quickFix() {
+    try {
+      if (!navigator.geolocation || !navigator.permissions || !navigator.permissions.query) return { denied: true };
+      const st = await navigator.permissions.query({ name: 'geolocation' });
+      if (st.state !== 'granted') return { denied: true };
+      return await new Promise((resolve) => navigator.geolocation.getCurrentPosition(
+        (p) => resolve({ lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy }),
+        () => resolve(null), { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }));
+    } catch (e) { return null; }
+  }
+  // Fix -> ONE routing request (fix -> next not-done stop, live traffic, depart now) -> first ETA = now + duration, later
+  // stops follow through the existing legs and dwell times. No solver run, same order. Silent on any failure.
+  async function refreshFromLocation() {
+    const P = S.plan, L = S.loc;
+    if (!P || L.busy || !Solver.refreshDue(Date.now(), L.lastAt)) return;
+    const plan0 = curPlan(), nx0 = plan0 && plan0.stops.find((s) => !s.status);
+    if (!nx0) return;
+    L.busy = true; L.lastAt = Date.now();
+    try {
+      const fix = await quickFix();
+      if (fix && fix.denied) { if (L.origin) { L.origin = null; retimeNow(); await savePlan(); if (S.tab === 'route') render(); } return; }
+      const place = S.places[nx0.placeId] || P.ctx.places[nx0.placeId];
+      const o = L.origin && L.origin.placeId === nx0.placeId ? L.origin : null;
+      const verdict = place ? Solver.judgeFix(fix, o && { lat: o.lat, lng: o.lng }, place) : 'ignore';
+      if (verdict === 'ignore' || verdict === 'unmoved') return;
+      let dur = 0;
+      if (verdict === 'route') {
+        try {
+          const legs = await Providers.routeLegs([{ lat: fix.lat, lng: fix.lng }, { lat: place.lat, lng: place.lng }], S.settings.tomtomKey);
+          if (!legs[0] || legs[0].s == null) throw new Error('no duration');
+          dur = legs[0].s;
+        } catch (e) { // offline / provider error: today's re-time, shown as "plan start"
+          if (L.origin) { L.origin = null; retimeNow(); await savePlan(); if (S.tab === 'route') render(); }
+          return;
+        }
+      }
+      const cur = curPlan(), nx = cur && cur.stops.find((s) => !s.status);
+      if (!nx || nx.placeId !== nx0.placeId) return; // the plan moved on while we waited
+      const hadAlt = !!P.alt, now = Date.now();
+      L.origin = { placeId: nx.placeId, lat: fix.lat, lng: fix.lng, arriveMs: now + dur * 1000, usedAt: now };
+      retimeNow();
+      if (hadAlt) computeAvoidLunch(); // the Avoid-lunch delta follows the new times
+      await savePlan();
+      if (S.tab === 'route') render();
+    } finally { L.busy = false; }
   }
 
   // travel times older than 30 min are re-fetched (3 slices, like PLAN) before re-timing at a DONE
@@ -656,16 +715,24 @@
   // "Avoid lunch": re-solve what is left with closed windows respected (arrival inside a window waits it out)
   function computeAvoidLunch() {
     const P = S.plan, cur = curPlan();
-    const r = resolveRemaining({ respect: true });
+    const from0 = lastDoneIdx(cur), at0 = from0 >= 0 ? Date.now() : Math.max(Date.now(), Date.parse(P.ctx.departAtISO));
+    const org = originFor(cur, at0);
+    const base = Solver.retime(cur, from0, iso(at0), org); // current plan, timed from the same place and moment (live origin included)
+    let shiftMs = 0;
+    if (org) { // the alternative is solved from the last done stop: shift it by what the live fix changed for the next stop
+      const b0 = Solver.retime(cur, from0, iso(at0)), n0 = b0.stops.find((s) => !s.status), n1 = base.stops.find((s) => !s.status);
+      if (n0 && n1) shiftMs = n1.arriveAt - n0.arriveAt;
+    }
+    const r = resolveRemaining({ respect: true, shiftMs });
     const alt = r.res.plans && r.res.plans[0];
     if (r.res.error || !alt) { P.alt = { ok: false, message: 'No feasible alternative: ' + (r.res.error || 'nothing left to re-plan') + '.' }; return; }
     if (alt.violations.length) { P.alt = { ok: false, message: 'No feasible alternative: avoiding the closed windows would break a time window (' + alt.violations[0] + ').' }; return; }
-    const at = r.from >= 0 ? Date.now() : Math.max(Date.now(), Date.parse(P.ctx.departAtISO));
-    const base = Solver.retime(cur, r.from, iso(at)); // current plan timed from the same place and moment
     P.alt = { ok: true, r, plan: alt, deltaMs: alt.endArrival - base.endArrival, baseEnd: base.endArrival };
   }
   async function useAlt() {
     adoptResult(S.plan.alt.r);
+    S.loc.origin = null;
+    await logReplanVia('avoid-lunch');
     await savePlan();
     banner('Using the avoid-lunch plan (closed windows respected).', 'info');
     render();
@@ -697,7 +764,7 @@
     if (['plan', 'route', 'places', 'settings'].includes(snap.tab)) S.tab = snap.tab;
   }
   async function clearPlan() {
-    S.plan = null;
+    S.plan = null; S.loc.origin = null; S.timesFrom = null;
     await WPStore.remove('plan', 'current');
     banner(null);
     render();
@@ -737,6 +804,16 @@
       const d = dayFor(Date.now(), false);
       if (d && d.closed) { await reopenDay(d); toast('Day reopened'); }
     } catch (e) { /* the day log must never break an action */ }
+  }
+
+  async function logReplanVia(via) { // "No detour" / "Avoid lunch" re-solves count as replans in the day log
+    try {
+      await reopenIfClosed();
+      const d = dayFor(Date.now(), false);
+      if (!d) return;
+      DL.recordReplan(d, { nowIso: new Date().toISOString(), via });
+      bgSaveDay(d);
+    } catch (e) { /* never break planning */ }
   }
 
   function logPlan(replan, o) {
@@ -807,6 +884,7 @@
     }
     if (day) { DL.recordUndo(day, { nowIso: new Date().toISOString(), stopId: stop.placeId }); bgSaveDay(day); }
     delete stop.status; delete stop.doneAt;
+    S.loc.origin = null;
     P.prompt = null;
     retimeNow();
     banner(null);
@@ -1013,6 +1091,7 @@
     const totalStops = plan.stops.length;
     const remaining = plan.stops.filter((s) => !s.status);
 
+    v.append(h('div', { class: 'muted times-from', id: 'timesFrom' }, S.timesFrom ? 'Times from your location, ' + fmt(S.timesFrom) : 'Times from plan start'));
     v.append(
       h('div', { class: 'card' },
         h('div', { class: 'totals' },
@@ -1119,6 +1198,7 @@
     const pills = [];
     if (stop.detour) pills.push(h('span', { class: 'pill detour' }, 'DETOUR'));
     if (stop.closedWarning) pills.push(h('span', { class: 'pill closed' }, 'CLOSED'));
+    if (stop.late) pills.push(h('span', { class: 'pill closed' }, 'LATE'));
     // expanded section (state lives in openStops for this session only, keyed by place; not persisted)
     const wd = (() => { const d = new Date(stop.arriveAt).getDay(); return d === 0 ? 7 : d; })();
     const todays = (place.closedWindows || []).filter((w) => (Array.isArray(w.days) ? w.days : ALL_DAYS).indexOf(wd) >= 0);
@@ -1186,6 +1266,7 @@
     }
     stop.status = 'done';
     stop.doneAt = nowIso;
+    S.loc.origin = null;
     logDone(stop, nowIso); // synchronous, in memory: never delays DONE (save + geolocation fix happen in the background)
     P.alt = null;
     P.result.plans = [P.result.plans[P.idx]]; P.idx = 0; // alternatives pre-date this DONE: drop them
@@ -1205,6 +1286,7 @@
     await savePlan();
     render();
     dayCompleteBanner();
+    refreshFromLocation(); // after DONE: ETAs from where we are now (throttled; silent on failure)
   }
 
   async function skipStop(stop0, i0) { // actions stay pending; ETAs re-timed from this stop at the current time
@@ -1213,6 +1295,7 @@
     if (!ls) return;
     const stop = ls.stop, i = ls.i;
     stop.status = 'skipped';
+    S.loc.origin = null;
     P.alt = null;
     P.result.plans = [P.result.plans[P.idx]]; P.idx = 0;
     P.result.plans[0] = Solver.retime(P.result.plans[0], i, new Date().toISOString());
@@ -1410,12 +1493,14 @@
     window.scrollTo(0, 0);
     render();
     if (S.plan) savePlan(); // the stored plan remembers which tab you were on
+    if (S.tab === 'route' && S.plan) refreshFromLocation(); // opening the Route tab
   });
 
   // Back in the foreground: re-time what is left from the last done stop (or the start) at the current time.
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible' || !S.plan) return;
     if (retimeNow()) { savePlan(); if (S.tab === 'route') render(); }
+    refreshFromLocation(); // back in the foreground
   });
 
   // Service worker: register, look for updates on every launch and whenever the app comes back to the
@@ -1445,6 +1530,7 @@
   load().then(() => {
     if (S.plan && retimeNow()) savePlan(); // restored plan: re-time from the last done stop (or start) at the current time
     render();
+    if (S.tab === 'route' && S.plan) refreshFromLocation();
     setupServiceWorker();
   }).catch((e) => banner('Startup failed: ' + e.message, 'error'));
 

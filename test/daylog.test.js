@@ -315,5 +315,33 @@ console.log('export');
   ok(DL.fmtDate('2026-01-05') === '05 Jan 2026' && DL.fmtDur(95) === '1 h 35 min' && DL.fmtDur(null) === '—' && DL.fmtTime(Date.parse('2026-11-20T16:05:00Z')) === '00:05', 'formats: dd Mmm yyyy, h/min, 24-hour KL time');
 }
 
+console.log('hours out ends at the last DONE; replans via avoid-lunch / no-detour');
+{
+  const jobs = mkJobs(), day = mkDay(jobs);
+  doEverything(day); // last DONE 11:45, started 09:00
+  DL.closeDay(day, jobs, places, T(18, 30)); // Close day tapped much later
+  const s = DL.summarise(day, jobs, places);
+  near(s.finishedAt, Date.parse(T(11, 45)), 'Finished defaults to the last DONE, not the Close day time');
+  near(s.hoursOutMin, 165, 'Hours out = last DONE - start (2 h 45 min), although the day was closed at 18:30');
+  ok(day.closedAt === T(18, 30) && s.closedAt === Date.parse(T(18, 30)), 'the close time is kept separately as closedAt');
+  day.edits.finishedAt = T(13, 0);
+  near(DL.summarise(day, jobs, places).hoursOutMin, 240, 'a manual edit of Finished still wins (13:00 -> 4 h)');
+  DL.reopenDay(day, jobs, T(19, 0));
+  ok(day.closedAt === null && DL.summarise(day, jobs, places).closedAt === null, 'reopen clears closedAt');
+}
+{
+  const jobs = mkJobs(), day = mkDay(jobs);
+  let s = DL.summarise(day, jobs, places);
+  ok(s.plan.replans === 0, 'baseline: one PLAN, zero replans');
+  DL.recordReplan(day, { nowIso: T(10, 0), via: 'no-detour' });
+  s = DL.summarise(day, jobs, places);
+  ok(s.plan.replans === 1 && day.events[day.events.length - 1].type === 'replan' && day.events[day.events.length - 1].via === 'no-detour', 'a No detour re-solve adds exactly one replan event');
+  DL.recordReplan(day, { nowIso: T(10, 30), via: 'avoid-lunch' });
+  s = DL.summarise(day, jobs, places);
+  ok(s.plan.replans === 2 && day.events.filter((e) => e.via === 'avoid-lunch').length === 1, 'an Avoid lunch adoption adds exactly one more');
+  DL.recordPlan(day, { nowIso: T(11, 0), replan: true, start: START, departAtIso: T(11, 0), jobs, places, stopOrder: PLAN_ORDER });
+  ok(DL.summarise(day, jobs, places).plan.replans === 3, 'summary replan count matches: replan-from-here + no-detour + avoid-lunch = 3');
+}
+
 console.log('\n' + passes + ' passed, ' + failures + ' failed');
 process.exit(failures ? 1 : 0);

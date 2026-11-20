@@ -6,7 +6,8 @@
  *   { schemaVersion, date, driverId, startedAt, endedAt, closed, planSnapshot, events[],
  *     jobsSnap{}, places{}, legs{}, routed, edits{}, decisions{}, carried[] }
  *   events: { t (ISO), type: plan|replan|done|undo|endday, jobId, stopId, lat, lng, accuracy, [kind, item, departAt, jobIds, of] }
- *   startedAt = depart time of the first plan; endedAt = when the day was closed (null while open).
+ *   startedAt = depart time of the first plan; closedAt = when Close day was tapped (endedAt = same, kept for old records).
+ *   Finished / Hours out come from the LAST DONE event (or edits.finishedAt), never from closedAt.
  *   edits.startedAt / edits.finishedAt = user overrides (ISO) of Started / Finished.
  *   legs  = per-leg metres/seconds already held from routing responses: "lat,lng>lat,lng" -> {m, s}
  *   routed = result of the ONE routing request made at End Day: {key, legs:[{m,s}], at}
@@ -60,7 +61,7 @@
   // ---------- record ----------
   function newDay(o) {
     return {
-      schemaVersion: SCHEMA, date: o.date, driverId: o.driverId || 'Calvin', startedAt: null, endedAt: null, closed: false,
+      schemaVersion: SCHEMA, date: o.date, driverId: o.driverId || 'Calvin', startedAt: null, endedAt: null, closedAt: null, closed: false,
       planSnapshot: null, events: [], jobsSnap: {}, places: {}, legs: {}, routed: null, edits: {}, decisions: {}, carried: [],
     };
   }
@@ -107,6 +108,11 @@
       t: info.nowIso, type: first ? 'plan' : (info.replan ? 'replan' : 'plan'),
       departAt: info.departAtIso || info.nowIso, jobIds: (info.jobs || []).map((j) => j.id),
     });
+  }
+
+  // A replan that is not a fresh PLAN: "Avoid lunch" adopted, or the "No detour" re-solve. via = 'avoid-lunch' | 'no-detour'.
+  function recordReplan(day, info) { // info: {nowIso, via}
+    return appendEvent(day, { t: info.nowIso, type: 'replan', via: info.via || null });
   }
 
   // A DONE tap: one event per action at the stop, all sharing t (the fix, if any, is patched in later).
@@ -278,7 +284,7 @@
     const replans = day.events.filter((e, i) => e.type === 'replan' || (e.type === 'plan' && i !== firstPlanIdx)).length;
 
     return {
-      date: day.date, driverId: day.driverId, closed: !!day.closed,
+      date: day.date, driverId: day.driverId, closed: !!day.closed, closedAt: ms(day.closedAt != null ? day.closedAt : day.endedAt),
       jobsDone: rows.filter((r) => r.complete).length, jobsTotal: rows.length,
       stopsVisited: doneSeq.length, doneSeq,
       km, driveMin, hoursOutMin, atStopsMin, startedAt, finishedAt,
@@ -319,7 +325,7 @@
       changed.push(j);
     });
     appendEvent(day, { t: nowIso, type: 'endday' });
-    day.closed = true; day.endedAt = nowIso;
+    day.closed = true; day.endedAt = nowIso; day.closedAt = nowIso;
     return changed;
   }
 
@@ -338,7 +344,7 @@
       changed.push(j);
     });
     day.carried = [];
-    day.closed = false; day.endedAt = null;
+    day.closed = false; day.endedAt = null; day.closedAt = null;
     appendEvent(day, { t: nowIso, type: 'undo', of: 'endday' });
     return changed;
   }
@@ -399,7 +405,7 @@
   return {
     SCHEMA, KEEP_DAYS, REASONS, CSV_HEADER,
     dateKey, fmtDate, fmtTime, fmtDur, fmtKm, addDaysKey, dayStartMs, ageDays,
-    newDay, appendEvent, recordPlan, recordDone, recordUndo, doneGroups, hasActiveDone,
+    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordUndo, doneGroups, hasActiveDone,
     ptKey, legKey, seqKey, legFromMatrices, captureLeg, plannedFromMatrices,
     summarise, closeDay, reopenDay, pruneDates, weekRange, weekTotals, historyKeys, toCSV, csvCell, toWhatsApp,
   };
