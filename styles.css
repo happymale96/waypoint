@@ -6,6 +6,7 @@
   /* Collect (amber) / Deliver (teal): shared by the Plan job cards and the Route chips */
   --collect: #d99a00; --collect-tint: #fff1cc; --collect-ink: #7a4b00;
   --deliver: #0f9488; --deliver-tint: #d9f2ef; --deliver-ink: #0b5f57;
+  --inhand: #3fa34d; --inhand-tint: #dcf3df; --inhand-ink: #1b6a2b;
   --urgent-bg: #c62828;
 }
 @media (prefers-color-scheme: dark) {
@@ -15,6 +16,7 @@
     --danger: #ff6b6b; --ok: #5fd38a; --warn: #ffb74d; --chip: #243342;
     --collect: #ffb300; --collect-tint: #3c3824; --collect-ink: #ffd166;
     --deliver: #2dd4bf; --deliver-tint: #1b3e43; --deliver-ink: #7de8da;
+    --inhand: #5fd38a; --inhand-tint: #1c3b27; --inhand-ink: #8be6ab;
   }
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -129,3 +131,15 @@ a.btn.small { min-height: 40px; padding: 0 10px; font-size: 14px; }
 .job-actions .sub { color: var(--muted); font-size: 14px; }
 .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 40px; min-height: 40px; height: 40px; padding: 0; border-radius: 10px; }
 .icon-btn.danger { color: var(--danger); border-color: var(--danger); }
+/* IN HAND (green) box, urgent toggle + tappable badge, boxed Route stops */
+.box.inhand { background: var(--inhand-tint); border-left-color: var(--inhand); }
+.box.inhand .eyebrow { color: var(--inhand-ink); }
+.urgent-toggle { min-height: 40px; height: 40px; padding: 0 12px; border-radius: 10px; font-size: 14px; }
+.urgent-toggle[aria-pressed="true"] { background: var(--urgent-bg); border-color: var(--urgent-bg); color: #fff; }
+.urgent-badge { cursor: pointer; }
+.urgent-badge .urgent-label { width: auto; font-weight: 800; font-size: 13px; letter-spacing: .06em; padding: 0 6px; white-space: nowrap; }
+.stop-boxes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.stop-boxes .box { flex: 1 1 0; min-width: 0; padding: 8px 10px; border-radius: 8px; border-left-width: 4px; border-left-style: solid; overflow-wrap: anywhere; }
+.stop-boxes .box.errand { flex: 1 1 100%; }
+.stop-boxes .line + .line { margin-top: 4px; }
+@media (max-width: 359px) { .stop-boxes .box { flex-basis: 100%; } }

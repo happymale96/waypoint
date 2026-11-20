@@ -216,6 +216,21 @@
   const pendingJobs = () => S.jobs.filter((j) => !j.status || j.status === 'pending');
   const urgentSorted = () => pendingJobs().filter((j) => j.urgent).sort((a, b) => (a.urgentRank || 0) - (b.urgentRank || 0));
 
+  // Toggle urgent from the card: on = next rank (max + 1); off = clear and renumber the rest 1..n. Persisted.
+  async function setUrgent(j, on) {
+    if (on) {
+      const max = Math.max(0, ...S.jobs.filter((x) => x !== j && x.urgent && x.status !== 'done').map((x) => x.urgentRank || 0));
+      j.urgent = true; j.urgentRank = max + 1;
+      await saveJob(j);
+    } else {
+      j.urgent = false; j.urgentRank = 0;
+      const rest = S.jobs.filter((x) => x.urgent && x.status !== 'done').sort((a, b) => (a.urgentRank || 0) - (b.urgentRank || 0));
+      rest.forEach((x, i) => { x.urgentRank = i + 1; });
+      await Promise.all([j].concat(rest).map(saveJob));
+    }
+    render();
+  }
+
   async function moveUrgent(j, dir) {
     const list = urgentSorted();
     list.forEach((x, i) => { x.urgentRank = i + 1; });
@@ -295,13 +310,18 @@
         win));
     } else {
       const pk = j.pickups || [];
-      grid = h('div', { class: 'job-grid' },
-        h('div', { class: 'box collect' },
+      // no pickups = already in hand: green IN HAND box (not the amber COLLECT box)
+      const left = pk.length
+        ? h('div', { class: 'box collect' },
           h('div', { class: 'eyebrow' }, 'COLLECT'),
-          pk.length ? pk.map((p) => h('div', { class: 'pick' + (p.done ? ' done' : '') },
+          pk.map((p) => h('div', { class: 'pick' + (p.done ? ' done' : '') },
             h('div', { class: 'name' }, (p.done ? '✓ ' : '') + pName(p.placeId)),
-            p.item ? h('div', { class: 'muted sub' }, p.item) : null))
-            : h('div', { class: 'pick' }, h('div', { class: 'muted' }, 'In hand'), j.inHandItem ? h('div', { class: 'muted sub' }, j.inHandItem) : null)),
+            p.item ? h('div', { class: 'muted sub' }, p.item) : null)))
+        : h('div', { class: 'box inhand' },
+          h('div', { class: 'eyebrow' }, 'IN HAND'),
+          j.inHandItem ? h('div', { class: 'muted sub' }, j.inHandItem) : null);
+      grid = h('div', { class: 'job-grid' },
+        left,
         h('div', { class: 'arrow', 'aria-hidden': 'true' }, '→'),
         h('div', { class: 'box deliver' },
           h('div', { class: 'eyebrow' }, 'DELIVER'),
@@ -309,10 +329,11 @@
           win));
     }
     const idx = urgentList.indexOf(j);
-    const head = j.urgent ? h('div', { class: 'job-head' }, h('div', { class: 'urgent-badge' },
-      parked ? null : h('button', { 'aria-label': 'Raise urgent rank', onclick: () => moveUrgent(j, -1) }, '▲'),
-      h('span', { class: 'urgent-label' }, 'URGENT ' + (idx >= 0 ? idx + 1 : '–')),
-      parked ? null : h('button', { 'aria-label': 'Lower urgent rank', onclick: () => moveUrgent(j, 1) }, '▼'))) : null;
+    // tapping the badge clears urgent; the arrows (stopPropagation) change the rank instead
+    const head = j.urgent ? h('div', { class: 'job-head' }, h('div', { class: 'urgent-badge', onclick: () => setUrgent(j, false) },
+      parked ? null : h('button', { 'aria-label': 'Raise urgent rank', onclick: (e) => { e.stopPropagation(); moveUrgent(j, -1); } }, '▲'),
+      h('button', { class: 'urgent-label', 'aria-label': 'Urgent ' + (idx >= 0 ? idx + 1 : '') + ', tap to clear', title: 'Tap to clear urgent' }, 'URGENT ' + (idx >= 0 ? idx + 1 : '–')),
+      parked ? null : h('button', { 'aria-label': 'Lower urgent rank', onclick: (e) => { e.stopPropagation(); moveUrgent(j, 1); } }, '▼'))) : null;
 
     const foot = h('div', { class: 'job-foot' });
     function drawFoot(confirming) {
@@ -323,7 +344,9 @@
         ? h('div', { class: 'job-actions' }, h('span', { class: 'sub' }, 'Delete this job?'),
           h('button', { class: 'small', onclick: () => drawFoot(false) }, 'Cancel'),
           h('button', { class: 'small danger', onclick: async () => { await WPStore.remove('jobs', j.id); S.jobs = S.jobs.filter((x) => x !== j); render(); } }, 'Delete'))
-        : h('div', { class: 'job-actions' }, park, del);
+        : h('div', { class: 'job-actions' },
+          j.errandPlaceId ? null : h('button', { class: 'small urgent-toggle', 'aria-pressed': j.urgent ? 'true' : 'false', title: j.urgent ? 'Clear urgent' : 'Mark urgent', onclick: () => setUrgent(j, !j.urgent) }, 'Urgent'),
+          park, del);
       foot.replaceChildren(...[j.notes ? h('div', { class: 'job-notes' }, j.notes) : null, actions].filter(Boolean));
     }
     drawFoot(false);
@@ -579,10 +602,19 @@
     const place = S.places[stop.placeId] || P.ctx.places[stop.placeId];
     const st = P.status[stop.placeId];
     const hasDelivery = stop.actions.some((a) => a.kind === 'deliver');
-    const chips = stop.actions.map((a) => {
-      const label = a.kind === 'pickup' ? 'Collect: ' + (a.item || 'items') : a.kind === 'deliver' ? 'Deliver' + (deliverItem(a) ? ': ' + deliverItem(a) : '') : 'Errand: ' + (a.item || '');
-      return h('span', { class: 'chip ' + (a.kind === 'deliver' ? 'deliver' : a.kind === 'errand' ? 'errand' : 'collect') }, label);
-    });
+    // Actions as boxes (same tokens as the Plan cards): COLLECT "item → customer", DELIVER items, ERRAND.
+    const jobOf = (id) => (P.ctx.jobs || []).find((x) => x.id === id) || S.jobs.find((x) => x.id === id);
+    const customerOf = (a) => {
+      const j = jobOf(a.jobId), pid = j && j.deliveryPlaceId;
+      return pid ? ((P.ctx.places[pid] || S.places[pid] || {}).name || '(unknown)') : '(no delivery)';
+    };
+    const box = (cls, label, lines) => h('div', { class: 'box ' + cls }, h('div', { class: 'eyebrow' }, label), lines.map((t) => h('div', { class: 'line' }, t)));
+    const ofKind = (k) => stop.actions.filter((a) => a.kind === k);
+    const boxes = [];
+    if (ofKind('pickup').length) boxes.push(box('collect', 'COLLECT', ofKind('pickup').map((a) => (a.item || 'items') + ' → ' + customerOf(a))));
+    if (ofKind('deliver').length) boxes.push(box('deliver', 'DELIVER', ofKind('deliver').map((a) => deliverItem(a) || '—')));
+    if (ofKind('errand').length) boxes.push(box('errand', 'ERRAND', ofKind('errand').map((a) => a.item || 'Errand')));
+    const chips = [];
     if (stop.detour) chips.push(h('span', { class: 'chip detour' }, 'DETOUR'));
     if (stop.closedWarning) chips.push(h('span', { class: 'chip closed' }, 'CLOSED'));
     const nav = S.settings.nav || 'waze';
@@ -600,7 +632,8 @@
       h('div', { class: 'row spread' }, h('div', { class: 'title' }, (i + 1) + '. ' + place.name), h('div', { class: 'times' }, fmt(stop.arriveAt) + ' → ' + fmt(stop.departAt))),
       place.address ? h('div', { class: 'muted' }, place.address) : null,
       stop.waitSec > 60 ? h('div', { class: 'muted' }, 'Wait ~' + Math.round(stop.waitSec / 60) + ' min for the time window to open') : null,
-      h('div', null, chips),
+      chips.length ? h('div', null, chips) : null,
+      boxes.length ? h('div', { class: 'stop-boxes' }, boxes) : null,
       h('div', { class: 'row', style: 'margin-top:8px' }, btns));
   }
 
