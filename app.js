@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = 'd165a299'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '609bf647'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -253,6 +253,10 @@
 
   // ---------- job helpers ----------
   const pName = (id) => (S.places[id] ? S.places[id].name : '(deleted place)');
+  const openStops = new Set(); // place ids of expanded Route cards (in memory only, not persisted)
+  // DISPLAY-only: drop a trailing company suffix (Sdn Bhd / Sdn. Bhd. / S/B / Bhd, any case, dots optional). Stored names are untouched.
+  const SUFFIX_RE = /[\s,]+(?:sdn\.?\s*bhd\.?|s\/b\.?|bhd\.?)\s*$/i;
+  const dName = (n) => { const s = String(n == null ? '' : n); const t = s.replace(SUFFIX_RE, '').trim(); return t || s; };
   function jobTitle(j) {
     if (j.errandPlaceId) return h('span', null, 'Errand @ ', pName(j.errandPlaceId), ' (', j.dwellMin != null ? j.dwellMin : S.places[j.errandPlaceId] ? S.places[j.errandPlaceId].dwellMin : 10, ' min)');
     const pk = (j.pickups || []).map((p) => (p.done ? '✓ ' : '') + pName(p.placeId) + (p.item ? ' (' + p.item + ')' : ''));
@@ -351,7 +355,7 @@
       const dw = j.dwellMin != null ? j.dwellMin : (S.places[j.errandPlaceId] || {}).dwellMin;
       grid = h('div', { class: 'job-grid' }, h('div', { class: 'box errand' },
         h('div', { class: 'eyebrow' }, 'ERRAND'),
-        h('div', { class: 'name' }, pName(j.errandPlaceId)),
+        h('div', { class: 'name' }, dName(pName(j.errandPlaceId))),
         dw != null ? h('div', { class: 'muted sub' }, dw + ' min there') : null,
         win));
     } else {
@@ -361,7 +365,7 @@
         ? h('div', { class: 'box collect' },
           h('div', { class: 'eyebrow' }, 'COLLECT'),
           pk.map((p) => h('div', { class: 'pick' + (p.done ? ' done' : '') },
-            h('div', { class: 'name' }, (p.done ? '✓ ' : '') + pName(p.placeId)),
+            h('div', { class: 'name' }, (p.done ? '✓ ' : '') + dName(pName(p.placeId))),
             p.item ? h('div', { class: 'muted sub' }, p.item) : null)))
         : h('div', { class: 'box inhand' },
           h('div', { class: 'eyebrow' }, 'IN HAND'),
@@ -371,7 +375,7 @@
         h('div', { class: 'arrow', 'aria-hidden': 'true' }, '→'),
         h('div', { class: 'box deliver' },
           h('div', { class: 'eyebrow' }, 'DELIVER'),
-          j.deliveryPlaceId ? h('div', { class: 'name' }, pName(j.deliveryPlaceId)) : h('div', { class: 'muted' }, 'Collect only'),
+          j.deliveryPlaceId ? h('div', { class: 'name' }, dName(pName(j.deliveryPlaceId))) : h('div', { class: 'muted' }, 'Collect only'),
           win));
     }
     const idx = urgentList.indexOf(j);
@@ -770,7 +774,6 @@
     navRow.append(h('button', { class: 'grow', onclick: () => replanFromHere() }, 'Replan from here'));
     // a CLOSED stop still ahead: offer the closed-windows-respected alternative (re-solved from the cached matrices)
     if (!P.alt && remaining.some((s) => s.closedWarning)) navRow.append(h('button', { class: 'grow', id: 'avoidLunch', onclick: () => { computeAvoidLunch(); render(); } }, 'Avoid lunch'));
-    navRow.append(h('button', { class: 'grow danger', id: 'clearPlan', onclick: () => { if (confirm('Clear the current plan? Stops marked done will be forgotten.')) clearPlan(); } }, 'Clear plan'));
     v.append(navRow);
     if (P.alt) v.append(altCard(P));
 
@@ -779,7 +782,7 @@
       const stop = plan.stops.find((s) => s.placeId === P.prompt.placeId);
       const place = S.places[P.prompt.placeId];
       if (stop && place) {
-        v.append(h('div', { class: 'prompt' }, h('div', { class: 'title' }, 'Send ETA to ' + place.name + '?'),
+        v.append(h('div', { class: 'prompt' }, h('div', { class: 'title' }, 'Send ETA to ' + dName(place.name) + '?'),
           h('div', { class: 'row', style: 'margin-top:8px' },
             h('button', { class: 'primary grow', onclick: () => { const m = stopMessage(stop, P.shiftMs); P.prompt = null; shareMessage(m.place, m.text); render(); } }, 'Send'),
             h('button', { class: 'grow', onclick: () => { P.prompt = null; render(); } }, 'Dismiss'))));
@@ -791,13 +794,14 @@
     plan.stops.forEach((stop, i) => tl.append(stopCard(stop, i)));
     v.append(tl);
     v.append(h('div', { class: 'card muted' }, 'Then to ' + (ctx.end.name || 'end') + ', arriving ' + fmt(plan.endArrival) + '.'));
+    v.append(h('button', { class: 'text-btn', id: 'clearPlan', onclick: () => { if (confirm('Clear the current plan? Stops marked done will be forgotten.')) clearPlan(); } }, 'Clear plan'));
 
     // alternatives
     if (r.plans.length > 1) {
       v.append(h('details', null, h('summary', null, 'Alternatives (' + (r.plans.length - 1) + ')'),
         r.plans.map((alt, i) => i === P.idx ? null : h('div', { class: 'card' },
           h('div', { class: 'row spread' }, h('b', null, 'Plan ' + (i + 1) + ' · ' + Solver.formatDuration(alt.totalSec)), h('span', { class: 'times' }, '→ ' + fmt(alt.endArrival))),
-          h('div', { class: 'muted' }, alt.order.map(pName).join(' → ')),
+          h('div', { class: 'muted' }, alt.order.map((id) => dName(pName(id))).join(' → ')),
           alt.violations.length ? h('div', { class: 'chip closed' }, alt.violations.length + ' window issue(s)') : null,
           h('button', { class: 'small', style: 'margin-top:8px', onclick: () => { P.idx = i; render(); } }, 'Use this plan')))));
     }
@@ -815,8 +819,8 @@
       h('div', { class: 'row spread' }, h('div', { class: 'title' }, 'Avoid lunch alternative'), h('span', { class: 'chip alt-delta' + (d > 0 ? ' detour' : '') }, delta)),
       h('div', { class: 'muted' }, 'Arrive ' + ((P.ctx.end && P.ctx.end.name) || 'end') + ' ' + fmt(A.plan.endArrival) + ' (now ' + fmt(A.baseEnd) + ')'),
       A.plan.stops.map((s, i) => h('div', { class: 'alt-stop' },
-        h('div', { class: 'row spread' }, h('b', null, (i + 1) + '. ' + pName(s.placeId)), h('span', { class: 'times' }, fmt(s.arriveAt) + ' → ' + fmt(s.departAt))),
-        s.waitSec >= 60 ? h('div', { class: 'muted' }, 'wait ' + Math.round(s.waitSec / 60) + ' min at ' + pName(s.placeId)) : null)),
+        h('div', { class: 'row spread' }, h('b', null, (i + 1) + '. ' + dName(pName(s.placeId))), h('span', { class: 'times' }, fmt(s.arriveAt) + ' → ' + fmt(s.departAt))),
+        s.waitSec >= 60 ? h('div', { class: 'muted' }, 'wait ' + Math.round(s.waitSec / 60) + ' min at ' + dName(pName(s.placeId))) : null)),
       h('div', { class: 'row', style: 'margin-top:8px' },
         h('button', { class: 'primary grow', onclick: () => useAlt() }, 'Use this'),
         h('button', { class: 'grow', onclick: dismiss }, 'Keep current')));
@@ -828,7 +832,7 @@
     const st = stop.status;
     if (st === 'done') { // done stops collapse to one line: tick, name, actual done time
       return h('div', { class: 'card stop done compact' }, h('div', { class: 'row spread' },
-        h('div', { class: 'title' }, '✓ ' + (i + 1) + '. ' + place.name),
+        h('div', { class: 'title' }, '✓ ' + (i + 1) + '. ' + dName(place.name)),
         h('div', { class: 'muted times' }, 'done ' + fmt(Date.parse(stop.doneAt)))));
     }
     const hasDelivery = stop.actions.some((a) => a.kind === 'deliver');
@@ -838,15 +842,38 @@
       const j = jobOf(a.jobId), pid = j && j.deliveryPlaceId;
       return pid ? ((P.ctx.places[pid] || S.places[pid] || {}).name || '(unknown)') : '(no delivery)';
     };
-    const box = (cls, label, lines) => h('div', { class: 'box ' + cls }, h('div', { class: 'eyebrow' }, label), lines.map((t) => h('div', { class: 'line' }, t)));
+    // one line per action; colour rule + arrow carry the meaning (amber pickup, teal delivery, green errand)
     const ofKind = (k) => stop.actions.filter((a) => a.kind === k);
-    const boxes = [];
-    if (ofKind('pickup').length) boxes.push(box('collect', 'COLLECT', ofKind('pickup').map((a) => (a.item || 'items') + ' → ' + customerOf(a))));
-    if (ofKind('deliver').length) boxes.push(box('deliver', 'DELIVER', ofKind('deliver').map((a) => deliverItem(a) || '—')));
-    if (ofKind('errand').length) boxes.push(box('errand', 'ERRAND', ofKind('errand').map((a) => a.item || 'Errand')));
-    const chips = [];
-    if (stop.detour) chips.push(h('span', { class: 'chip detour' }, 'DETOUR'));
-    if (stop.closedWarning) chips.push(h('span', { class: 'chip closed' }, 'CLOSED'));
+    const line = (cls, t) => h('div', { class: 'act ' + cls }, t);
+    const lines = [].concat(
+      ofKind('pickup').map((a) => line('collect', (a.item || 'items') + ' → ' + dName(customerOf(a)))),
+      ofKind('deliver').map((a) => line('deliver', deliverItem(a) || '—')),
+      ofKind('errand').map((a) => line('errand', a.item || 'Errand')));
+    const pills = [];
+    if (stop.detour) pills.push(h('span', { class: 'pill detour' }, 'DETOUR'));
+    if (stop.closedWarning) pills.push(h('span', { class: 'pill closed' }, 'CLOSED'));
+    // expanded section (state lives in openStops for this session only, keyed by place; not persisted)
+    const wd = (() => { const d = new Date(stop.arriveAt).getDay(); return d === 0 ? 7 : d; })();
+    const todays = (place.closedWindows || []).filter((w) => (Array.isArray(w.days) ? w.days : ALL_DAYS).indexOf(wd) >= 0);
+    const more = h('div', { class: 'stop-more', hidden: !openStops.has(stop.placeId) },
+      place.address ? h('div', null, place.address) : null,
+      h('div', { class: 'times' }, fmt(stop.arriveAt) + ' → ' + fmt(stop.departAt)),
+      todays.length ? h('div', null, 'Closed today: ' + todays.map((w) => w.from + '–' + w.to).join(', ')) : null,
+      stop.waitSec > 60 ? h('div', null, 'Wait ~' + Math.round(stop.waitSec / 60) + ' min here before service starts.') : null,
+      stop.detour ? h('div', null, 'Detour: not urgent, but visited before the last urgent delivery.') : null,
+      stop.closedWarning ? h('div', null, 'Closed: expected arrival falls inside a closed window.') : null);
+    const head = h('div', { class: 'stop-head', role: 'button', tabindex: '0', 'aria-expanded': String(openStops.has(stop.placeId)) },
+      h('span', { class: 'num' }, (i + 1) + '.'),
+      h('span', { class: 'nm' }, dName(place.name)),
+      pills,
+      h('span', { class: 'times' }, fmt(stop.arriveAt)));
+    const toggle = () => {
+      const on = more.hidden; more.hidden = !on;
+      head.setAttribute('aria-expanded', String(on));
+      if (on) openStops.add(stop.placeId); else openStops.delete(stop.placeId);
+    };
+    head.onclick = toggle;
+    head.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } };
     const nav = S.settings.nav || 'waze';
     const btns = [];
     if (nav === 'waze' || nav === 'both') btns.push(h('a', { class: 'btn small', href: wazeUrl(place), target: '_blank', rel: 'noopener' }, 'WAZE'));
@@ -859,12 +886,9 @@
       btns.push(h('span', { class: 'chip' }, 'Skipped'));
     }
     return h('div', { class: 'card stop ' + (st || '') + (stop.detour ? ' detour' : '') },
-      h('div', { class: 'row spread' }, h('div', { class: 'title' }, (i + 1) + '. ' + place.name), h('div', { class: 'times' }, fmt(stop.arriveAt) + ' → ' + fmt(stop.departAt))),
-      place.address ? h('div', { class: 'muted' }, place.address) : null,
-      stop.waitSec > 60 ? h('div', { class: 'muted' }, 'Wait ~' + Math.round(stop.waitSec / 60) + ' min here before service starts (' + fmt(stop.arriveAt) + ')') : null,
-      chips.length ? h('div', null, chips) : null,
-      boxes.length ? h('div', { class: 'stop-boxes' }, boxes) : null,
-      h('div', { class: 'row', style: 'margin-top:8px' }, btns));
+      head, more,
+      lines.length ? h('div', { class: 'stop-acts' }, lines) : null,
+      h('div', { class: 'stop-btns' }, btns));
   }
 
   // the stop object a button was rendered with may belong to an older plan object (re-timing replaces them): re-find it

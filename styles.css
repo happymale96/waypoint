@@ -138,11 +138,6 @@ a.btn.small { min-height: 40px; padding: 0 10px; font-size: 14px; }
 .urgent-toggle[aria-pressed="true"] { background: var(--urgent-bg); border-color: var(--urgent-bg); color: #fff; }
 .urgent-badge { cursor: pointer; }
 .urgent-badge .urgent-label { width: auto; font-weight: 800; font-size: 13px; letter-spacing: .06em; padding: 0 6px; white-space: nowrap; }
-.stop-boxes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-.stop-boxes .box { flex: 1 1 0; min-width: 0; padding: 8px 10px; border-radius: 8px; border-left-width: 4px; border-left-style: solid; overflow-wrap: anywhere; }
-.stop-boxes .box.errand { flex: 1 1 100%; }
-.stop-boxes .line + .line { margin-top: 4px; }
-@media (max-width: 359px) { .stop-boxes .box { flex-basis: 100%; } }
 /* weekday closed windows, collapsed done stops, avoid-lunch card */
 .win-row { border: 1px solid var(--border); border-radius: 12px; padding: 8px; margin-bottom: 8px; background: var(--card); }
 .days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-bottom: 8px; }
@@ -154,3 +149,25 @@ a.btn.small { min-height: 40px; padding: 0 10px; font-size: 14px; }
 .alt-stop { padding: 6px 0; border-top: 1px solid var(--border); }
 .alt-stop:first-of-type { border-top: 0; }
 .chip.alt-delta { font-size: 14px; }
+/* compact Route stop cards */
+.card.stop { padding: 6px 10px 8px; }
+.stop-head { display: flex; align-items: center; gap: 6px; min-height: 32px; cursor: pointer; }
+.stop-head .num { flex: none; font-weight: 700; font-size: 16px; }
+.stop-head .nm { flex: 0 1 auto; min-width: 0; font-weight: 700; font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stop-head .times { flex: none; margin-left: auto; padding-left: 6px; font-size: 16px; }
+.pill { flex: none; font-size: 11px; font-weight: 800; letter-spacing: .04em; line-height: 1; padding: 3px 7px; border-radius: 999px; color: #fff; }
+.pill.detour { background: var(--warn); }
+.pill.closed { background: var(--danger); }
+.stop-more { margin: 2px 0 4px; font-size: 14px; color: var(--muted); overflow-wrap: anywhere; }
+.stop-more[hidden] { display: none; }
+.stop-more > div + div { margin-top: 2px; }
+.stop-acts { margin-top: 2px; }
+.act { font-size: 15px; line-height: 1.3; padding-left: 8px; border-left: 3px solid var(--border); overflow-wrap: anywhere; }
+.act + .act { margin-top: 3px; }
+.act.collect { border-left-color: var(--collect); }
+.act.deliver { border-left-color: var(--deliver); }
+.act.errand { border-left-color: var(--inhand); }
+.stop-btns { display: flex; flex-wrap: nowrap; gap: 6px; margin-top: 6px; }
+.card.stop .stop-btns > * { flex: 1 1 0; min-width: 0; height: 36px; min-height: 36px; padding: 0 6px; font-size: 13px; line-height: 1; text-transform: uppercase; letter-spacing: .03em; border-radius: 10px; }
+.card.stop .stop-btns > .chip { display: inline-flex; align-items: center; justify-content: center; margin: 0; border-radius: 10px; }
+.text-btn { display: block; margin: 4px auto 12px; min-height: 36px; padding: 0 12px; border: 0; background: none; color: var(--muted); font-size: 13px; font-weight: 500; text-decoration: underline; }
