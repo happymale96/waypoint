@@ -14,9 +14,9 @@
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 body { padding-bottom: calc(68px + env(safe-area-inset-bottom)); }
-.topbar { display: flex; align-items: center; gap: 10px; padding: calc(10px + env(safe-area-inset-top)) 16px 10px; background: var(--brand); color: var(--brand-text); position: sticky; top: 0; z-index: 5; }
-.topbar img { border-radius: 6px; background: #fff; }
-.topbar h1 { font-size: 18px; margin: 0; }
+.topbar { display: flex; align-items: center; gap: 8px; padding: calc(2px + env(safe-area-inset-top)) 12px 2px; background: var(--brand); color: var(--brand-text); position: sticky; top: 0; z-index: 5; }
+.topbar img { width: 24px; height: 24px; border-radius: 5px; background: #fff; }
+.topbar h1 { font-size: 15px; line-height: 24px; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 main { max-width: 640px; margin: 0 auto; padding: 12px 12px 24px; }
 h2 { font-size: 17px; margin: 18px 0 8px; }
 .tabs { position: fixed; bottom: 0; left: 0; right: 0; display: flex; background: var(--card); border-top: 1px solid var(--border); padding-bottom: env(safe-area-inset-bottom); z-index: 6; }
@@ -89,3 +89,9 @@ a.btn.small { min-height: 40px; padding: 0 10px; font-size: 14px; }
 .divider { display: flex; align-items: center; gap: 10px; margin: 10px 2px 8px; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
 .divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
 @media (min-width: 700px) { .sheet.picker { height: min(100%, 640px); } }
+/* Plan tab header: one compact row of three chips (start / end / depart) */
+.chips-row { display: flex; gap: 8px; align-items: center; height: 48px; margin: 0 0 10px; }
+.chip-btn { flex: 1 1 0; min-width: 0; height: 44px; min-height: 44px; padding: 0 12px; border-radius: 999px; font-size: 15px; background: var(--card); }
+.chip-btn span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-btn.depart { flex: 0 0 auto; max-width: 34%; }
+.banner[hidden] { display: none; } /* an empty hidden banner was still taking ~21px under the title bar */

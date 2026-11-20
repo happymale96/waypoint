@@ -120,7 +120,7 @@
     return p;
   }
 
-  function openPlacePicker(onPick, title) {
+  function openPlacePicker(onPick, title, extras) {
     // Single autocomplete box: saved places filter instantly; Google is searched automatically
     // (800 ms debounce) only when the query is >= 3 chars and nothing saved matches; Enter searches at once.
     let timer = null, token = 0, closed = false, busy = false, sh = null;
@@ -153,7 +153,10 @@
       h('span', { class: 'title' }, name), h('span', { class: 'muted' }, sub || ''));
 
     function paint() {
-      const kids = localMatches(input.value.trim()).map((p) => row(p.name, p.type + (p.address ? ' · ' + p.address : ''), () => choose(p)));
+      const q0 = input.value.trim();
+      // optional fixed rows (e.g. "Use my location" for the start chip) shown while the box is empty
+      const kids = (extras && !q0 ? extras.map((x) => row(x.label, '', () => { sh.close(); x.fn(); })) : [])
+        .concat(localMatches(q0).map((p) => row(p.name, p.type + (p.address ? ' · ' + p.address : ''), () => choose(p))));
       if (g.state === 'done' && g.results.length) {
         kids.push(h('div', { class: 'divider' }, 'Google'));
         g.results.forEach((r) => kids.push(row(r.name, r.address, async () => {
@@ -207,7 +210,7 @@
   function jobTitle(j) {
     if (j.errandPlaceId) return h('span', null, 'Errand @ ', pName(j.errandPlaceId), ' (', j.dwellMin != null ? j.dwellMin : S.places[j.errandPlaceId] ? S.places[j.errandPlaceId].dwellMin : 10, ' min)');
     const pk = (j.pickups || []).map((p) => (p.done ? '✓ ' : '') + pName(p.placeId) + (p.item ? ' (' + p.item + ')' : ''));
-    const left = pk.length ? pk.join(' + ') : 'In hand';
+    const left = pk.length ? pk.join(' + ') : 'In hand' + (j.inHandItem ? ' (' + j.inHandItem + ')' : '');
     return h('span', null, left, ' → ', j.deliveryPlaceId ? pName(j.deliveryPlaceId) : 'collect only');
   }
   const pendingJobs = () => S.jobs.filter((j) => !j.status || j.status === 'pending');
@@ -224,23 +227,27 @@
   }
 
   // ---------- PLAN tab ----------
+  function openDepartSheet() {
+    const sh = openSheet('Depart at');
+    const t = h('input', { type: 'time', value: S.departTime });
+    sh.body.append(h('label', { class: 'field' }, 'Time today (empty = now)'), t,
+      h('div', { class: 'sticky-actions' },
+        h('button', { onclick: () => { S.departTime = ''; sh.close(); render(); } }, 'Now'),
+        h('button', { class: 'primary', onclick: () => { S.departTime = t.value; sh.close(); render(); } }, 'Set')));
+  }
+
   function renderPlan(v) {
-    const places = Object.values(S.places).sort(byName);
-    const startSel = h('select', { onchange: (e) => { if (e.target.value === '__pick') { e.target.value = S.startSel; openPlacePicker((p) => { S.startSel = p.id; render(); }, 'Pick start'); } else S.startSel = e.target.value; } },
-      h('option', { value: 'gps', selected: S.startSel === 'gps' }, '📍 Use my location'),
-      places.map((p) => h('option', { value: p.id, selected: S.startSel === p.id }, p.name)),
-      h('option', { value: '__pick' }, 'Pick another place…'));
-    const endSel = h('select', { onchange: (e) => { if (e.target.value === '__pick') { e.target.value = S.endSel; openPlacePicker((p) => { S.endSel = p.id; render(); }, 'Pick end'); } else S.endSel = e.target.value; } },
-      places.map((p) => h('option', { value: p.id, selected: S.endSel === p.id }, p.name)),
-      h('option', { value: '__pick' }, 'Pick another place…'));
-    const dep = h('input', { type: 'time', value: S.departTime, oninput: (e) => { S.departTime = e.target.value; } });
+    const startLabel = S.startSel === 'gps' ? '📍 My location' : '📍 ' + (S.places[S.startSel] ? S.places[S.startSel].name : 'Pick start');
+    const endLabel = '→ ' + (S.places[S.endSel] ? S.places[S.endSel].name : 'Pick end');
+    const departLabel = S.departTime || 'Now';
+    const chip = (label, cls, fn) => h('button', { class: 'chip-btn ' + cls, title: label, onclick: fn }, h('span', null, label));
 
     v.append(
-      h('div', { class: 'card' },
-        h('label', { class: 'field' }, 'Start'), startSel,
-        h('label', { class: 'field' }, 'End'), endSel,
-        h('label', { class: 'field' }, 'Depart at (empty = now)'),
-        h('div', { class: 'row' }, h('div', { class: 'grow' }, dep), h('button', { onclick: () => { S.departTime = ''; dep.value = ''; } }, 'Now'))),
+      h('div', { class: 'chips-row', id: 'headerChips' },
+        chip(startLabel, 'start', () => openPlacePicker((p) => { S.startSel = p.id; render(); }, 'Start from',
+          [{ label: '📍 Use my location', fn: () => { S.startSel = 'gps'; render(); } }])),
+        chip(endLabel, 'end', () => openPlacePicker((p) => { S.endSel = p.id; render(); }, 'Drive to')),
+        chip(departLabel, 'depart', () => openDepartSheet())),
       h('button', { class: 'primary big', id: 'planBtn', disabled: S.busy, onclick: () => doPlan({}) }, S.busy ? 'PLANNING…' : 'PLAN')
     );
 
@@ -281,7 +288,7 @@
   // ---------- Add job sheet ----------
   function openJobSheet() {
     let mode = 'delivery';
-    const st = { pickups: [{ placeId: null, item: '' }], deliveryPlaceId: null, errandPlaceId: null, dwellMin: '', notes: '', urgent: false, after: '', before: '' };
+    const st = { pickups: [{ placeId: null, item: '' }], deliveryPlaceId: null, errandPlaceId: null, dwellMin: '', notes: '', urgent: false, after: '', before: '', inHandItem: '' };
     const sh = openSheet('Add job');
     function placeBtn(id, placeholder, onPick) {
       return h('button', { style: 'width:100%;text-align:left', onclick: () => openPlacePicker((p) => { onPick(p); draw(); }) }, id ? pName(id) : placeholder);
@@ -304,6 +311,11 @@
           h('label', { class: 'field' }, 'Deliver to'),
           h('div', { class: 'row' }, h('div', { class: 'grow' }, placeBtn(st.deliveryPlaceId, 'Pick delivery place', (pl) => { st.deliveryPlaceId = pl.id; })),
             st.deliveryPlaceId ? h('button', { onclick: () => { st.deliveryPlaceId = null; draw(); } }, '✕') : null));
+        // no pickup place chosen = the item is already in hand: optional item name for the delivery itself
+        if (!st.pickups.some((p) => p.placeId)) {
+          body.append(h('label', { class: 'field' }, 'Item (optional — already in hand)'),
+            h('input', { placeholder: 'e.g. Test gasket', value: st.inHandItem, oninput: (e) => { st.inHandItem = e.target.value; } }));
+        }
       } else {
         body.append(h('label', { class: 'field' }, 'Errand place (bank, meeting…)'),
           placeBtn(st.errandPlaceId, 'Pick errand place', (pl) => { st.errandPlaceId = pl.id; if (st.dwellMin === '') st.dwellMin = String(pl.dwellMin != null ? pl.dwellMin : 10); }),
@@ -333,6 +345,7 @@
         j.pickups = st.pickups.filter((p) => p.placeId).map((p) => ({ placeId: p.placeId, item: p.item.trim(), done: false }));
         j.deliveryPlaceId = st.deliveryPlaceId;
         if (!j.pickups.length && !j.deliveryPlaceId) { toast('Add a pickup or a delivery place'); return; }
+        if (!j.pickups.length) j.inHandItem = st.inHandItem.trim();
         if (st.urgent) { j.urgent = true; j.urgentRank = urgentSorted().length + 1; }
       }
       S.jobs.push(j);
@@ -426,9 +439,15 @@
     const ok = await copyText(text);
     toast(ok ? 'Copied — paste into WhatsApp' : 'Could not copy. Add a WhatsApp number to the place.');
   }
+  // The solver only knows pickup items; an in-hand job carries its own item on the job (inHandItem).
+  function deliverItem(a) {
+    if (a.item) return a.item;
+    const j = ((S.plan && S.plan.ctx.jobs) || []).find((x) => x.id === a.jobId) || S.jobs.find((x) => x.id === a.jobId);
+    return (j && j.inHandItem) || '';
+  }
   function stopMessage(stop, shiftMs) {
     const place = S.plan.ctx.places[stop.placeId] || S.places[stop.placeId];
-    const items = stop.actions.filter((a) => a.kind === 'deliver').map((a) => a.item).filter(Boolean).join(', ');
+    const items = stop.actions.filter((a) => a.kind === 'deliver').map(deliverItem).filter(Boolean).join(', ');
     const live = S.places[stop.placeId] || place; // latest edits to number/salutation win
     const text = Messages.buildMessage({ place: live, settings: S.settings, arriveAt: new Date(stop.arriveAt + (shiftMs || 0)), items });
     return { place: live, text };
@@ -461,7 +480,7 @@
           h('div', null, h('b', null, totalStops), h('span', { class: 'muted' }, 'stops')),
           h('div', null, h('b', null, Solver.formatDuration(plan.totalSec)), h('span', { class: 'muted' }, 'total')),
           h('div', null, h('b', null, fmt(plan.endArrival)), h('span', { class: 'muted' }, 'arrive ' + (ctx.end.name || 'end')))),
-        h('div', { class: 'muted', style: 'margin-top:8px' }, 'Depart ' + fmt(Date.parse(ctx.departAtISO)) + ' · ' + (r.stats ? r.stats.nodes + ' nodes, ' + r.stats.ms + ' ms' + (r.stats.truncated ? ' (time-limited, best found)' : '') : '')),
+        h('div', { class: 'muted', style: 'margin-top:8px' }, 'Depart ' + fmt(Date.parse(ctx.departAtISO))),
         P.shiftMs > 60000 ? h('div', { class: 'chip detour' }, 'Running ' + Math.round(P.shiftMs / 60000) + ' min behind plan') : null),
       h('label', { class: 'toggle card' }, h('input', { type: 'checkbox', checked: P.noDetour, onchange: (e) => { P.noDetour = e.target.checked; solveCurrent(); banner('Re-solved from cached travel times — 0 API calls.', 'info'); render(); } }), 'No detour (urgent deliveries first, nothing else in between)'));
 
@@ -516,7 +535,7 @@
     const st = P.status[stop.placeId];
     const hasDelivery = stop.actions.some((a) => a.kind === 'deliver');
     const chips = stop.actions.map((a) => {
-      const label = a.kind === 'pickup' ? 'Collect: ' + (a.item || 'items') : a.kind === 'deliver' ? 'Deliver' + (a.item ? ': ' + a.item : '') : 'Errand: ' + (a.item || '');
+      const label = a.kind === 'pickup' ? 'Collect: ' + (a.item || 'items') : a.kind === 'deliver' ? 'Deliver' + (deliverItem(a) ? ': ' + deliverItem(a) : '') : 'Errand: ' + (a.item || '');
       return h('span', { class: 'chip ' + (a.kind === 'deliver' ? 'deliver' : a.kind === 'errand' ? 'errand' : '') }, label);
     });
     if (stop.detour) chips.push(h('span', { class: 'chip detour' }, 'DETOUR'));
@@ -596,10 +615,14 @@
     const name = h('input', { value: p.name });
     const addr = h('input', { value: p.address });
     const dwell = h('input', { type: 'number', inputmode: 'numeric', min: '0', value: String(p.dwellMin) });
-    const type = h('select', { onchange: (e) => { dwell.value = String(S.settings.dwellDefaults[e.target.value] != null ? S.settings.dwellDefaults[e.target.value] : 10); } }, TYPES.map((t) => h('option', { value: t, selected: p.type === t }, t)));
+    const type = h('select', { onchange: (e) => { dwell.value = String(S.settings.dwellDefaults[e.target.value] != null ? S.settings.dwellDefaults[e.target.value] : 10); syncType(); } }, TYPES.map((t) => h('option', { value: t, selected: p.type === t }, t)));
     const wa = h('input', { type: 'tel', inputmode: 'tel', value: p.whatsapp || '', placeholder: '012-345 6789' });
     const sal = h('select', null, ['Encik', 'Puan', 'Cik'].map((t) => h('option', { value: t, selected: (p.salutation || 'Encik') === t }, t)));
     const lang = h('select', null, [['default', 'Default (' + S.settings.defaultLang + ')'], ['ms', 'Bahasa Malaysia'], ['en', 'English']].map(([val, lab]) => h('option', { value: val, selected: (p.lang || 'default') === val }, lab)));
+    // suppliers are collected from, never messaged: hide salutation + language for them (WhatsApp stays)
+    const salBox = h('div', null, h('label', { class: 'field' }, 'Salutation'), sal, h('label', { class: 'field' }, 'Message language'), lang);
+    function syncType() { salBox.hidden = type.value === 'supplier'; }
+    syncType();
     const wBox = h('div');
     function drawW() {
       wBox.replaceChildren(...w.map((x, i) => h('div', { class: 'row', style: 'margin-bottom:6px' },
@@ -614,7 +637,7 @@
       h('label', { class: 'field' }, 'Closed windows (warning only)'), wBox,
       h('button', { class: 'small', onclick: () => { w.push({ from: '12:00', to: '13:00' }); drawW(); } }, '+ Add closed window'),
       h('label', { class: 'field' }, 'WhatsApp number'), wa,
-      h('label', { class: 'field' }, 'Salutation'), sal, h('label', { class: 'field' }, 'Message language'), lang,
+      salBox,
       h('div', { class: 'sticky-actions' },
         h('button', { class: 'danger', onclick: async () => {
           const used = S.jobs.some((j) => j.status !== 'done' && (j.deliveryPlaceId === p.id || j.errandPlaceId === p.id || (j.pickups || []).some((x) => x.placeId === p.id)));
@@ -631,6 +654,13 @@
   }
 
   // ---------- SETTINGS tab ----------
+  function lastPlanText() {
+    const res = S.plan && S.plan.result;
+    if (!res) return 'Last plan: none yet';
+    if (!res.stats) return 'Last plan: no result';
+    const st = res.stats;
+    return 'Last plan: ' + st.nodes + ' nodes, ' + st.ms + ' ms (' + st.mode + (st.truncated ? ', time-limited — best found' : '') + ')';
+  }
   function renderSettings(v) {
     const s = S.settings;
     const field = (label, el) => [h('label', { class: 'field' }, label), el];
@@ -665,6 +695,7 @@
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Data'),
         h('div', { class: 'row' }, h('button', { class: 'grow', onclick: exportJson }, 'Export JSON'), h('button', { class: 'grow', onclick: () => fileIn.click() }, 'Import JSON'), fileIn),
         h('button', { style: 'margin-top:8px', onclick: () => { Providers.clearCache(); toast('Travel-time cache cleared'); } }, 'Clear travel-time cache')),
+      h('div', { class: 'muted', id: 'lastPlan', style: 'text-align:center;font-size:12px' }, lastPlanText()),
       h('div', { class: 'muted', style: 'text-align:center' }, 'L-Tech Waypoint v' + APP_VERSION));
   }
 
