@@ -90,13 +90,13 @@
   }
 
   // ---------- sheets ----------
-  function openSheet(title) {
+  function openSheet(title, onClose) {
     const body = h('div');
     const sheet = h('div', { class: 'sheet', role: 'dialog' }, h('h3', null, title), body);
     const back = h('div', { class: 'backdrop', onclick: (e) => { if (e.target === back) close(); } }, sheet);
     document.body.append(back);
-    function close() { back.remove(); }
-    return { body, close, sheet };
+    function close() { back.remove(); if (onClose) onClose(); }
+    return { body, close, sheet, back };
   }
 
   // ---------- Google calls counter ----------
@@ -111,7 +111,7 @@
     return c.date === todayStr() ? c.count : 0;
   }
 
-  // ---------- place picker (local first, Google on demand) ----------
+  // ---------- place picker (single autocomplete box) ----------
   async function savePlaceFromSearch(r) {
     const dup = Object.values(S.places).find((p) => Math.abs(p.lat - r.lat) < 1e-4 && Math.abs(p.lng - r.lng) < 1e-4);
     if (dup) return dup;
@@ -121,34 +121,84 @@
   }
 
   function openPlacePicker(onPick, title) {
-    const sh = openSheet(title || 'Pick a place');
-    const input = h('input', { type: 'search', placeholder: 'Search saved places…', autocomplete: 'off' });
-    const list = h('div', { class: 'card' });
-    const gres = h('div');
-    const gbtn = h('button', { class: 'primary', style: 'width:100%;margin-top:8px' }, 'Search Google');
-    function row(name, sub, label, fn) {
-      return h('div', { class: 'result' }, h('div', null, h('div', { class: 'title' }, name), h('div', { class: 'muted' }, sub || '')), h('button', { class: 'small', onclick: fn }, label));
-    }
-    function showLocal() {
-      const q = input.value.trim().toLowerCase();
-      const items = Object.values(S.places).filter((p) => !q || (p.name + ' ' + p.address).toLowerCase().includes(q)).sort(byName);
-      list.replaceChildren(...(items.length ? items.map((p) => row(p.name, p.type + (p.address ? ' · ' + p.address : ''), 'Use', () => { sh.close(); onPick(p); })) : [h('div', { class: 'empty' }, 'No saved place matches. Try Search Google.')]));
-    }
-    input.addEventListener('input', showLocal);
-    gbtn.onclick = async () => {
-      const q = input.value.trim();
-      if (!q) { toast('Type something to search'); return; }
-      if (!S.settings.googleKey) { gres.replaceChildren(h('div', { class: 'violations' }, 'Google Places key missing — add it in Settings.')); return; }
-      gbtn.disabled = true; gbtn.textContent = 'Searching…';
-      try {
-        const res = await Providers.searchGoogle(q, S.settings.googleKey, bumpPlacesCalls);
-        gres.replaceChildren(h('div', { class: 'card' }, res.length ? res.map((r) => row(r.name, r.address, 'Save & use', async () => { const p = await savePlaceFromSearch(r); sh.close(); onPick(p); })) : h('div', { class: 'empty' }, 'Google found nothing.')));
-      } catch (e) {
-        gres.replaceChildren(h('div', { class: 'violations' }, e.message));
-      } finally { gbtn.disabled = false; gbtn.textContent = 'Search Google'; }
+    // Single autocomplete box: saved places filter instantly; Google is searched automatically
+    // (800 ms debounce) only when the query is >= 3 chars and nothing saved matches; Enter searches at once.
+    let timer = null, token = 0, closed = false, busy = false, sh = null;
+    let g = { state: 'idle', results: [], error: '' };
+    const vv = window.visualViewport;
+    const fit = () => {
+      if (!vv || !sh) return; // size the sheet to what the on-screen keyboard leaves visible
+      const b = sh.back.style;
+      b.inset = 'auto'; b.top = vv.offsetTop + 'px'; b.left = vv.offsetLeft + 'px';
+      b.width = vv.width + 'px'; b.height = vv.height + 'px';
     };
-    sh.body.append(input, list, gbtn, gres, h('div', { class: 'sticky-actions' }, h('button', { onclick: sh.close }, 'Cancel')));
-    showLocal();
+    function cleanup() {
+      closed = true; token++; clearTimeout(timer);
+      if (vv) { vv.removeEventListener('resize', fit); vv.removeEventListener('scroll', fit); }
+    }
+    sh = openSheet(title || 'Pick a place', cleanup);
+    sh.sheet.classList.add('picker');
+    sh.body.className = 'picker-body';
+    if (vv) { vv.addEventListener('resize', fit); vv.addEventListener('scroll', fit); fit(); }
+
+    const input = h('input', { type: 'search', placeholder: 'Type a place name…', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', enterkeyhint: 'search' });
+    const status = h('div', { class: 'muted picker-status', role: 'status' });
+    const list = h('div', { class: 'picker-list' });
+    const localMatches = (q) => {
+      const ql = q.toLowerCase();
+      return Object.values(S.places).filter((p) => !ql || (p.name + ' ' + p.address).toLowerCase().includes(ql)).sort(byName);
+    };
+    const choose = (p) => { sh.close(); onPick(p); };
+    const row = (name, sub, fn) => h('button', { class: 'pick-row', onclick: fn },
+      h('span', { class: 'title' }, name), h('span', { class: 'muted' }, sub || ''));
+
+    function paint() {
+      const kids = localMatches(input.value.trim()).map((p) => row(p.name, p.type + (p.address ? ' · ' + p.address : ''), () => choose(p)));
+      if (g.state === 'done' && g.results.length) {
+        kids.push(h('div', { class: 'divider' }, 'Google'));
+        g.results.forEach((r) => kids.push(row(r.name, r.address, async () => {
+          if (busy) return;
+          busy = true;
+          try { choose(await savePlaceFromSearch(r)); } finally { busy = false; }
+        })));
+      }
+      list.replaceChildren(...kids);
+      status.className = 'muted picker-status' + (g.state === 'error' ? ' error' : '');
+      status.textContent = g.state === 'searching' ? 'Searching Google…' : g.state === 'error' ? g.error : (g.state === 'done' && !g.results.length) ? 'No results' : '';
+    }
+
+    function googleSearch(q) {
+      clearTimeout(timer);
+      const mine = ++token;
+      if (!S.settings.googleKey) { g = { state: 'error', results: [], error: 'Google Places key missing — add it in Settings.' }; paint(); return; }
+      g = { state: 'searching', results: [], error: '' };
+      paint();
+      const current = () => !closed && mine === token && input.value.trim() === q; // ignore stale responses
+      Providers.searchGoogle(q, S.settings.googleKey, bumpPlacesCalls).then((res) => {
+        if (!current()) return;
+        g = { state: 'done', results: res, error: '' }; paint();
+      }).catch((e) => {
+        if (!current()) return;
+        g = { state: 'error', results: [], error: e.message }; paint();
+      });
+    }
+
+    input.addEventListener('input', () => {
+      clearTimeout(timer); token++;
+      g = { state: 'idle', results: [], error: '' };
+      paint();
+      const q = input.value.trim();
+      if (q.length >= 3 && !localMatches(q).length) timer = setTimeout(() => googleSearch(q), 800);
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const q = input.value.trim();
+      if (q) googleSearch(q);
+    });
+
+    sh.body.append(input, status, list, h('button', { style: 'margin-top:8px', onclick: sh.close }, 'Cancel'));
+    paint();
     setTimeout(() => input.focus(), 50);
   }
 
