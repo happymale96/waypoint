@@ -267,22 +267,67 @@
     }
   }
 
+  function svgIcon(d) {
+    const ns = 'http://www.w3.org/2000/svg';
+    const s = document.createElementNS(ns, 'svg');
+    s.setAttribute('viewBox', '0 0 24 24'); s.setAttribute('width', '20'); s.setAttribute('height', '20');
+    s.setAttribute('fill', 'currentColor'); s.setAttribute('aria-hidden', 'true');
+    const p = document.createElementNS(ns, 'path');
+    p.setAttribute('d', d); s.append(p);
+    return s;
+  }
+  const ICON_PARK = 'M6 5h4v14H6zM14 5h4v14h-4z';
+  const ICON_UNPARK = 'M7 4l13 8-13 8z';
+  const ICON_TRASH = 'M9 3h6l1 2h4v2H4V5h4l1-2zM6 9h12l-1 12H7L6 9z';
+
+  // Two-column card: COLLECT (amber) -> DELIVER (teal); errands get one full-width ERRAND box.
   function jobCard(j, urgentList) {
     const parked = j.status === 'parked';
-    const chips = [];
-    if (j.urgent) chips.push(h('span', { class: 'chip urgent' }, 'URGENT #' + (urgentList.indexOf(j) + 1 || '–')));
-    if (j.arriveAfter) chips.push(h('span', { class: 'chip' }, 'after ' + j.arriveAfter));
-    if (j.arriveBefore) chips.push(h('span', { class: 'chip' }, 'before ' + j.arriveBefore));
-    const arrows = j.urgent && !parked ? [
-      h('button', { class: 'small', 'aria-label': 'Move up', onclick: () => moveUrgent(j, -1) }, '▲'),
-      h('button', { class: 'small', 'aria-label': 'Move down', onclick: () => moveUrgent(j, 1) }, '▼')] : [];
-    return h('div', { class: 'card' },
-      h('div', { class: 'title' }, jobTitle(j)),
-      j.notes ? h('div', { class: 'muted' }, j.notes) : null,
-      h('div', null, chips),
-      h('div', { class: 'row', style: 'margin-top:8px' }, arrows,
-        h('button', { class: 'small', onclick: async () => { j.status = parked ? 'pending' : 'parked'; await saveJob(j); render(); } }, parked ? 'Unpark' : 'Park'),
-        h('button', { class: 'small danger', onclick: async () => { if (!confirm('Delete this job?')) return; await WPStore.remove('jobs', j.id); S.jobs = S.jobs.filter((x) => x !== j); render(); } }, 'Delete')));
+    const win = (j.arriveAfter || j.arriveBefore)
+      ? h('span', { class: 'chip win' }, [j.arriveAfter && 'after ' + j.arriveAfter, j.arriveBefore && 'before ' + j.arriveBefore].filter(Boolean).join(' · ')) : null;
+    let grid;
+    if (j.errandPlaceId) {
+      const dw = j.dwellMin != null ? j.dwellMin : (S.places[j.errandPlaceId] || {}).dwellMin;
+      grid = h('div', { class: 'job-grid' }, h('div', { class: 'box errand' },
+        h('div', { class: 'eyebrow' }, 'ERRAND'),
+        h('div', { class: 'name' }, pName(j.errandPlaceId)),
+        dw != null ? h('div', { class: 'muted sub' }, dw + ' min there') : null,
+        win));
+    } else {
+      const pk = j.pickups || [];
+      grid = h('div', { class: 'job-grid' },
+        h('div', { class: 'box collect' },
+          h('div', { class: 'eyebrow' }, 'COLLECT'),
+          pk.length ? pk.map((p) => h('div', { class: 'pick' + (p.done ? ' done' : '') },
+            h('div', { class: 'name' }, (p.done ? '✓ ' : '') + pName(p.placeId)),
+            p.item ? h('div', { class: 'muted sub' }, p.item) : null))
+            : h('div', { class: 'pick' }, h('div', { class: 'muted' }, 'In hand'), j.inHandItem ? h('div', { class: 'muted sub' }, j.inHandItem) : null)),
+        h('div', { class: 'arrow', 'aria-hidden': 'true' }, '→'),
+        h('div', { class: 'box deliver' },
+          h('div', { class: 'eyebrow' }, 'DELIVER'),
+          j.deliveryPlaceId ? h('div', { class: 'name' }, pName(j.deliveryPlaceId)) : h('div', { class: 'muted' }, 'Collect only'),
+          win));
+    }
+    const idx = urgentList.indexOf(j);
+    const head = j.urgent ? h('div', { class: 'job-head' }, h('div', { class: 'urgent-badge' },
+      parked ? null : h('button', { 'aria-label': 'Raise urgent rank', onclick: () => moveUrgent(j, -1) }, '▲'),
+      h('span', { class: 'urgent-label' }, 'URGENT ' + (idx >= 0 ? idx + 1 : '–')),
+      parked ? null : h('button', { 'aria-label': 'Lower urgent rank', onclick: () => moveUrgent(j, 1) }, '▼'))) : null;
+
+    const foot = h('div', { class: 'job-foot' });
+    function drawFoot(confirming) {
+      const park = h('button', { class: 'icon-btn', 'aria-label': parked ? 'Unpark job' : 'Park job', title: parked ? 'Unpark' : 'Park',
+        onclick: async () => { j.status = parked ? 'pending' : 'parked'; await saveJob(j); render(); } }, svgIcon(parked ? ICON_UNPARK : ICON_PARK));
+      const del = h('button', { class: 'icon-btn danger', 'aria-label': 'Delete job', title: 'Delete', onclick: () => drawFoot(true) }, svgIcon(ICON_TRASH));
+      const actions = confirming
+        ? h('div', { class: 'job-actions' }, h('span', { class: 'sub' }, 'Delete this job?'),
+          h('button', { class: 'small', onclick: () => drawFoot(false) }, 'Cancel'),
+          h('button', { class: 'small danger', onclick: async () => { await WPStore.remove('jobs', j.id); S.jobs = S.jobs.filter((x) => x !== j); render(); } }, 'Delete'))
+        : h('div', { class: 'job-actions' }, park, del);
+      foot.replaceChildren(...[j.notes ? h('div', { class: 'job-notes' }, j.notes) : null, actions].filter(Boolean));
+    }
+    drawFoot(false);
+    return h('div', { class: 'card job' + (parked ? ' parked' : '') + (j.urgent ? ' urgent' : '') }, head, grid, foot);
   }
 
   // ---------- Add job sheet ----------
@@ -536,7 +581,7 @@
     const hasDelivery = stop.actions.some((a) => a.kind === 'deliver');
     const chips = stop.actions.map((a) => {
       const label = a.kind === 'pickup' ? 'Collect: ' + (a.item || 'items') : a.kind === 'deliver' ? 'Deliver' + (deliverItem(a) ? ': ' + deliverItem(a) : '') : 'Errand: ' + (a.item || '');
-      return h('span', { class: 'chip ' + (a.kind === 'deliver' ? 'deliver' : a.kind === 'errand' ? 'errand' : '') }, label);
+      return h('span', { class: 'chip ' + (a.kind === 'deliver' ? 'deliver' : a.kind === 'errand' ? 'errand' : 'collect') }, label);
     });
     if (stop.detour) chips.push(h('span', { class: 'chip detour' }, 'DETOUR'));
     if (stop.closedWarning) chips.push(h('span', { class: 'chip closed' }, 'CLOSED'));
