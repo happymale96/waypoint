@@ -13,12 +13,12 @@ Live: https://happymale96.github.io/waypoint/
 | `providers.js` | Google Places (New) text search; TomTom Matrix Routing v2 |
 | `storage.js` | Async `get/set/list/remove` over localStorage — swap for a hosted backend later |
 | `messages.js` | WhatsApp text: greeting, ETA rounding, templates, `wa.me` links |
-| `daylog.js` | End-of-day record + `summarise()` (pure: km, hours, collected/delivered, carry-forward, CSV / WhatsApp text, history) |
+| `daylog.js` | End-of-day record + `summarise()` (pure: km, hours, collected/delivered, carry-forward, CSV / WhatsApp text, history). One record per device-local date (a plan run keeps its depart date past midnight); End day closes the open day and never creates an empty record; activity on a closed date merges into it. One-time repair on load (`runRepairOnce`, flag `meta:daylogRepair`, backup `backup:daylogs-repair-1`). Export/Import JSON carry `dayLog` + `dayHistory` |
 | `geo.js` | Pure location helpers: coordinate parsing (manual place entry), the geolocation fix rules, place-record builders, pin move / undo |
 | `sw.js`, `manifest.json`, `icon-*.png` | PWA shell |
 | `tools/make-icons.js` | Builds the 192/512 maskable icons (`npm install` in `tools/` first) |
 | `tools/stamp-sw.js` | Writes the build stamp into `sw.js` and `app.js` — **run before every commit** (see below) |
-| `test/*.test.js` | `node test/solver.test.js && node test/messages.test.js && node test/daylog.test.js && node test/location.test.js && node test/route.test.js && node test/geo.test.js` |
+| `test/*.test.js` | `TZ=Asia/Kuala_Lumpur sh -c "node test/solver.test.js && node test/messages.test.js && node test/daylog.test.js && node test/location.test.js && node test/route.test.js && node test/geo.test.js && node test/endday.test.js"` (day keys are the device's local date) |
 
 ## Releases and the build stamp
 The service worker's cache name is `waypoint-<stamp>`. The stamp is an 8-character content hash of the whole app shell (html, css, js, json, icons), written by `tools/stamp-sw.js` into `sw.js` (`BUILD`) and `app.js` (`BUILD_STAMP`, shown in **Settings → build …**).
@@ -32,7 +32,7 @@ How a release reaches the phone: the page and every `.html/.js/.css/.json` file 
 ## Keys
 Paste them in Settings; they live in this phone's localStorage only (never committed, never exported).
 - **TomTom** — all travel times (Matrix Routing v2, live traffic). 3 calls per plan (depart, +2 h, +4 h); results are cached in memory for the session, so the *No detour* toggle re-solves with zero API calls. *Replan from here* forces fresh calls.
-- **Google Places (New)** — place search only, and only when you tap *Search Google*. Saved places are searched locally first. The Settings screen shows a client-side call counter; set the real quota cap (150/day) in Google Cloud console.
+- **Google Places (New)** — place search only, and only when you tap *Search Google*. Saved places are searched locally first. The Settings screen shows a client-side call counter (this device only; no Google-side cap is set yet). One request type: `POST places:searchText`, field mask `places.displayName,places.formattedAddress,places.location` (Text Search **Pro** SKU; all three fields are read).
 
 TomTom's current docs list `routeSummary.travelTimeInSeconds` (and `trafficDelayInSeconds`) in the response; `noTrafficTravelTimeInSeconds` is not documented, so it is only used as a fallback if present. `departAt` must be `now` or a future time; the first slice uses `now` when departing immediately.
 

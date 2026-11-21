@@ -504,12 +504,15 @@
     left.forEach((s) => { end = Math.max(end, s.arriveAt, s.departAt); });
     return { stops, endArrival: end, left: left.length, leftSec: Math.max(0, Math.round((end - nowMs) / 1000)), shiftMs };
   }
-  const TIMES_REASON = { denied: 'location not allowed', nofix: 'no GPS fix', routing: 'routing failed', offline: 'offline' };
-  // st = {liveAt (ms of the live fix used) | null, lastDoneAt (ms) | null, reason: 'denied'|'nofix'|'routing'|'offline'|null}
+  const TIMES_REASON = { denied: 'location off or not allowed', nofix: 'no GPS fix', routing: 'routing failed', offline: 'offline' };
+  const GETTING = 'getting location…';
+  // st = {liveAt (ms of the live fix used) | null, lastDoneAt (ms) | null, reason: 'denied'|'nofix'|'routing'|'offline'|null,
+  //       busy: a fix is being fetched}. A fallback anchor ALWAYS carries a reason: while a fix is being fetched (e.g. after
+  //       location comes back), or before the first attempt has reported, that reason is "getting location…".
   function timesLine(st) {
     if (st.liveAt != null) return 'Times from your location, ' + formatETA(st.liveAt);
     const base = st.lastDoneAt != null ? 'Times from last DONE, ' + formatETA(st.lastDoneAt) : 'Times from plan start';
-    return TIMES_REASON[st.reason] ? base + ' - ' + TIMES_REASON[st.reason] : base;
+    return base + ' - ' + (st.busy ? GETTING : TIMES_REASON[st.reason] || GETTING);
   }
 
   // Sub-matrices for a smaller problem: keep only the listed point indices, in that order (used to re-solve the

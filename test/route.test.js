@@ -69,13 +69,13 @@ console.log('A2 status line: the three anchors');
 {
   ok(Solver.timesLine({ liveAt: at(16, 52), lastDoneAt: at(16, 40), reason: null }) === 'Times from your location, 16:52', 'live fix used');
   ok(Solver.timesLine({ liveAt: at(16, 52), lastDoneAt: at(16, 40), reason: 'routing' }) === 'Times from your location, 16:52', 'live fix used: no reason appended even if a later attempt failed');
-  ok(Solver.timesLine({ liveAt: null, lastDoneAt: at(16, 40), reason: null }) === 'Times from last DONE, 16:40', 'no live fix, something done -> last DONE');
-  ok(Solver.timesLine({ liveAt: null, lastDoneAt: null, reason: null }) === 'Times from plan start', 'nothing done, no fix -> plan start');
+  ok(Solver.timesLine({ liveAt: null, lastDoneAt: at(16, 40), reason: null }) === 'Times from last DONE, 16:40 - getting location…', 'no live fix, something done -> last DONE (never without a reason)');
+  ok(Solver.timesLine({ liveAt: null, lastDoneAt: null, reason: null }) === 'Times from plan start - getting location…', 'nothing done, no fix -> plan start (never without a reason)');
 }
 console.log('A2 status line: the four reasons');
 {
   const L = (reason) => Solver.timesLine({ liveAt: null, lastDoneAt: at(16, 40), reason });
-  ok(L('denied') === 'Times from last DONE, 16:40 - location not allowed', 'reason: location not allowed');
+  ok(L('denied') === 'Times from last DONE, 16:40 - location off or not allowed', 'reason: location off or not allowed');
   ok(L('nofix') === 'Times from last DONE, 16:40 - no GPS fix', 'reason: no GPS fix');
   ok(L('routing') === 'Times from last DONE, 16:40 - routing failed', 'reason: routing failed');
   ok(L('offline') === 'Times from last DONE, 16:40 - offline', 'reason: offline');

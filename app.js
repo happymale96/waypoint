@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = 'a40f27fe'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '600e6ef8'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -207,9 +207,6 @@
           try { choose(await savePlaceFromSearch(r)); } finally { busy = false; }
         })));
       }
-      // always the last row: zero results, a failed search, offline - the way out is manual entry (no Google request)
-      kids.push(h('button', { class: 'pick-row manual', id: 'addManual', onclick: () => { const q = input.value.trim(); sh.close(); openManualPlace(q, (p) => onPick(p)); } },
-        h('span', { class: 'title' }, "Can't find it? Add manually")));
       list.replaceChildren(...kids);
       status.className = 'muted picker-status' + (g.state === 'error' ? ' error' : '');
       status.textContent = g.state === 'searching' ? 'Searching Google…' : g.state === 'error' ? g.error : (g.state === 'done' && !g.results.length) ? 'No results' : '';
@@ -245,7 +242,10 @@
       if (q) googleSearch(q);
     });
 
-    sh.body.append(input, status, list, h('button', { style: 'margin-top:8px', onclick: sh.close }, 'Cancel'));
+    // pinned outside the scrolling list, just above Cancel: always visible (zero results, failed search, offline...)
+    const manual = h('button', { class: 'pick-row manual', id: 'addManual', onclick: () => { const q = input.value.trim(); sh.close(); openManualPlace(q, (p) => onPick(p)); } },
+      h('span', { class: 'title' }, "Can't find it? Add manually"));
+    sh.body.append(input, status, list, manual, h('button', { style: 'margin-top:8px', onclick: sh.close }, 'Cancel'));
     paint();
     setTimeout(() => input.focus(), 50);
   }
@@ -385,8 +385,7 @@
         chip(departLabel, 'depart', () => openDepartSheet())),
       h('button', { class: 'primary big', id: 'planBtn', disabled: S.busy, onclick: () => doPlan({}) }, S.busy ? 'PLANNING…' : 'PLAN')
     );
-    const openDay = dayFor(Date.now(), false);
-    if (openDay && !openDay.closed && openDay.events.length) v.append(h('button', { class: 'end-day', id: 'endDayBtn', onclick: () => openSummary(openDay.date) }, 'End day'));
+    if (openDayKey()) v.append(h('button', { class: 'end-day', id: 'endDayBtn', onclick: endDayTap }, 'End day'));
 
     const pending = pendingJobs().sort((a, b) => (b.urgent - a.urgent) || ((a.urgentRank || 0) - (b.urgentRank || 0)) || String(a.createdAt).localeCompare(String(b.createdAt)));
     const parked = S.jobs.filter((j) => j.status === 'parked');
@@ -561,7 +560,6 @@
     const replan = !!opts.replan;
     const s = S.settings;
     banner(null);
-    await reopenIfClosed();
     if (!s.tomtomKey) { banner('TomTom API key missing — add it in Settings. (Travel times come from TomTom Matrix Routing v2.)', 'error'); return; }
     const end = S.places[S.endSel];
     if (!end) { banner('Pick an end place.', 'error'); return; }
@@ -594,9 +592,11 @@
       const got = await Providers.getMatrices(points, input.departAtISO, s.tomtomKey, { force: replan });
       const prevNoDetour = S.plan ? S.plan.noDetour : false;
       const prevPlan = replan ? curPlan() : null; // a replan keeps the stops already done on top
+      // the run's day = local date it departed; a replan stays in its run's day (even past midnight)
+      const dayKey = replan && planDayKey() ? planDayKey() : DL.dateKey(departAt.getTime());
       const fetchedAt = new Date().toISOString();
       got.matrices.forEach((x) => { if (!x.fetchedAt) x.fetchedAt = fetchedAt; });
-      S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial } };
+      S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices, dayKey }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial } };
       solveFresh();
       if (prevPlan) S.plan.result.plans = S.plan.result.plans.map((p) => compose(prevPlan, p));
       banner('Travel times: TomTom live traffic — ' + (got.fromCache ? 'from session cache (0 calls)' : got.calls + ' calls') + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
@@ -738,6 +738,7 @@
     const target = nx0 ? (S.places[nx0.placeId] || P.ctx.places[nx0.placeId]) : P.ctx.end;
     if (!target) return;
     L.busy = true; L.lastAt = Date.now();
+    paintTimesLine(); // "getting location…" while the fix is fetched (e.g. location just came back on)
     const fail = async (reason) => {
       L.reason = reason;
       // denied, or a live origin older than 5 min: fall back to the last DONE (a fresher origin may still stand)
@@ -770,7 +771,23 @@
       if (hadAlt && cur.stops.some((s) => !s.status)) computeAvoidLunch(); // the Avoid-lunch delta follows the new times
       await savePlan();
       if (S.tab === 'route') render();
-    } finally { L.busy = false; }
+    } finally { L.busy = false; paintTimesLine(); }
+  }
+  // Location allowed again (permission flips to granted): fetch a fix at once; the line says "getting location…" meanwhile.
+  function watchLocationPermission() {
+    try {
+      if (!navigator.permissions || !navigator.permissions.query) return;
+      navigator.permissions.query({ name: 'geolocation' }).then((st) => {
+        st.addEventListener('change', () => { if (st.state === 'granted' && S.plan) refreshFromLocation({ force: true }); });
+      }).catch(() => {});
+    } catch (e) { /* not supported */ }
+  }
+  // repaint only the status line (no full render): keeps it in step with S.loc.busy / reason
+  function paintTimesLine() {
+    const el = document.getElementById('timesFrom'), plan = curPlan();
+    if (!el || !plan) return;
+    const di = lastDoneIdx(plan);
+    el.textContent = Solver.timesLine({ liveAt: S.timesFrom, lastDoneAt: di >= 0 ? Date.parse(plan.stops[di].doneAt) : null, reason: S.loc.reason, busy: S.loc.busy });
   }
 
   // travel times older than 30 min are re-fetched (3 slices, like PLAN) before re-timing at a DONE
@@ -854,43 +871,40 @@
 
   // ---------- DAY LOG: record events, undo, close (model + maths live in daylog.js) ----------
   const DL = DayLog;
-  const saveDay = (d) => WPStore.set('daylogs', d.date, d);
+  const saveDay = (d) => { // activity merged into a closed record: its stored totals are recomputed
+    if (d.closed) { try { DL.refreshTotals(d, S.jobs, S.places); } catch (e) { /* totals are a cache */ } }
+    return WPStore.set('daylogs', d.date, d);
+  };
   const bgSaveDay = (d) => { saveDay(d).catch(() => {}); };
-  const SIX_H = 6 * 3600e3;
-  const lastEventMs = (d) => d.events.reduce((a, e) => Math.max(a, Date.parse(e.t) || 0), 0);
 
   async function loadDays() {
+    try { await DL.runRepairOnce(WPStore, S.jobs, S.places, new Date().toISOString()); } catch (e) { /* repair retries next launch */ }
     S.days = {};
     (await WPStore.list('daylogs')).forEach((d) => { if (d && d.date && Array.isArray(d.events)) S.days[d.date] = d; });
     for (const k of DL.pruneDates(Object.keys(S.days), DL.dateKey(Date.now()))) { delete S.days[k]; await WPStore.remove('daylogs', k); } // keep 120 days
   }
-  // The day an event belongs to: an unclosed day with activity in the last 6 h (a run past midnight stays on the
-  // date it started), else today's record, else (create) a new one.
+  // The local date of the current plan run (the date it departed; a replan keeps its run's date).
+  const planDayKey = () => (S.plan && S.plan.ctx ? (S.plan.ctx.dayKey || DL.dateKey(Date.parse(S.plan.ctx.departAtISO))) : null);
+  // The record activity at nowMs belongs to: the current run's date (even past midnight), else that moment's local date.
+  // A closed record is NOT reopened: the activity is merged into it. create=false never makes a record.
   function dayFor(nowMs, create) {
-    const recent = Object.values(S.days).filter((d) => !d.closed && lastEventMs(d) > 0 && nowMs - lastEventMs(d) <= SIX_H).sort((a, b) => b.date.localeCompare(a.date))[0];
-    if (recent) return recent;
-    const key = DL.dateKey(nowMs);
-    if (S.days[key]) return S.days[key];
-    if (!create) return null;
-    const d = DL.newDay({ date: key, driverId: S.settings.driverName || 'Calvin' });
-    S.days[key] = d;
-    return d;
+    const key = DL.activityKey(nowMs, planDayKey());
+    if (S.days[key] || !create) return S.days[key] || null;
+    return DL.recordFor(S.days, key, S.settings.driverName || 'Calvin');
+  }
+  const openDayKey = () => DL.openDayKey(S.days, planDayKey());
+  function endDayTap() { // End day closes the open day whenever it is tapped; with nothing open it saves nothing
+    const k = openDayKey();
+    if (k) openSummary(k); else toast('Nothing to close — no open day with activity.');
   }
   async function reopenDay(day) { // undo of "Close day": carried / dropped jobs go back exactly as they were
     const changed = DL.reopenDay(day, S.jobs, new Date().toISOString());
     for (const j of changed) await saveJob(j);
     await saveDay(day);
   }
-  async function reopenIfClosed() { // new activity on a closed day reopens it
-    try {
-      const d = dayFor(Date.now(), false);
-      if (d && d.closed) { await reopenDay(d); toast('Day reopened'); }
-    } catch (e) { /* the day log must never break an action */ }
-  }
 
   async function logReplanVia(via) { // "No detour" / "Avoid lunch" re-solves count as replans in the day log
     try {
-      await reopenIfClosed();
       const d = dayFor(Date.now(), false);
       if (!d) return;
       DL.recordReplan(d, { nowIso: new Date().toISOString(), via });
@@ -977,7 +991,6 @@
   async function markArrivedEnd() {
     const P = S.plan;
     if (!P) return;
-    await reopenIfClosed();
     const nowMs = Date.now(), nowIso = new Date(nowMs).toISOString(), end = P.ctx.end;
     const day = dayFor(nowMs, true);
     if (DL.arrivedEnd(day)) return;
@@ -1116,7 +1129,9 @@
       const main = ro() ? null : day.closed
         ? h('button', { class: 'big grow', id: 'reopenDay', onclick: async () => { await reopenDay(day); render(); draw(); toast('Day reopened'); } }, 'Reopen day')
         : h('button', { class: 'primary big grow', id: 'closeDay', onclick: async () => {
-          const changed = DL.closeDay(day, S.jobs, S.places, new Date().toISOString());
+          const res = DL.endDay(S.days, { key: day.date, jobs: S.jobs, places: S.places, nowIso: new Date().toISOString() });
+          if (!res.key) { toast('Nothing to close — no activity on this day. Nothing saved.'); sh.close(); return; }
+          const changed = res.changed;
           for (const j of changed) await saveJob(j);
           await saveDay(day); banner(null); render(); draw();
           toast('Day closed' + (day.carried.length ? ' · ' + day.carried.filter((c) => c.mode !== 'dropped').length + ' job(s) carried' : ''));
@@ -1211,7 +1226,7 @@
 
     // which anchor the times come from (and why not the phone's location); a tap retries at once, bypassing the throttle
     v.append(h('button', { class: 'times-from', id: 'timesFrom', type: 'button', onclick: () => { if (S.loc.busy) toast('Checking your location…'); else refreshFromLocation({ force: true, prompt: true }); } },
-      Solver.timesLine({ liveAt: S.timesFrom, lastDoneAt, reason: S.loc.reason })));
+      Solver.timesLine({ liveAt: S.timesFrom, lastDoneAt, reason: S.loc.reason, busy: S.loc.busy })));
     v.append(
       h('div', { class: 'card' },
         h('div', { class: 'totals', id: 'routeTotals' },
@@ -1241,7 +1256,7 @@
     v.append(navRow);
     if (P.alt) v.append(altCard(P));
 
-    if (plan.stops.some((s) => s.status === 'skipped')) v.append(h('div', { class: 'prompt' }, 'A stop was skipped. ', h('button', { class: 'small', onclick: () => replanFromHere() }, 'Replan from here')));
+    if (view.left > 0 && plan.stops.some((s) => s.status === 'skipped')) v.append(h('div', { class: 'prompt' }, 'A stop was skipped. ', h('button', { class: 'small', onclick: () => replanFromHere() }, 'Replan from here')));
     if (P.prompt) {
       const stop = plan.stops.find((s) => s.placeId === P.prompt.placeId);
       const place = S.places[P.prompt.placeId];
@@ -1258,7 +1273,7 @@
     view.stops.forEach((stop, i) => tl.append(stopCard(stop, i)));
     v.append(tl);
     v.append(endCard(view.endArrival, arrEv));
-    v.append(h('button', { class: 'end-day', id: 'routeEndDay', onclick: () => { const d = dayFor(Date.now(), false); if (d) openSummary(d.date); else toast('Nothing recorded today yet.'); } }, 'End day'));
+    v.append(h('button', { class: 'end-day', id: 'routeEndDay', onclick: endDayTap }, 'End day'));
     v.append(h('button', { class: 'text-btn', id: 'clearPlan', onclick: () => { if (confirm('Clear the current plan? Stops marked done will be forgotten.')) clearPlan(); } }, 'Clear plan'));
 
     // alternatives
@@ -1394,7 +1409,6 @@
     const ls = liveStop(stop0, i0);
     if (!ls) return;
     const stop = ls.stop, i = ls.i;
-    await reopenIfClosed();
     const nowIso = new Date().toISOString();
     for (const a of stop.actions) {
       const j = S.jobs.find((x) => x.id === a.jobId);
@@ -1476,10 +1490,11 @@
     function drawList() {
       const q = placeFilter.trim().toLowerCase();
       const items = Object.values(S.places).filter((p) => !q || (p.name + ' ' + p.address).toLowerCase().includes(q)).sort(byName);
+      const none = Object.keys(S.places).length ? 'No places match.' : 'No places yet.';
       list.replaceChildren(...(items.length ? items.map((p) => h('div', { class: 'card', onclick: () => openPlaceEditor(p) },
         h('div', { class: 'row spread' }, h('div', { class: 'title' }, p.name), h('span', { class: 'chip' }, p.type)),
         h('div', { class: 'muted' }, p.address || (p.lat.toFixed(4) + ', ' + p.lng.toFixed(4))),
-        h('div', { class: 'muted' }, 'Dwell ' + p.dwellMin + ' min' + (p.whatsapp ? ' · WA ' + p.whatsapp : '') + ((p.closedWindows || []).length ? ' · closed ' + p.closedWindows.map((w) => (daysLabel(w.days) ? daysLabel(w.days) + ' ' : '') + w.from + '–' + w.to).join(', ') : '')))) : [h('div', { class: 'empty card' }, 'No places yet.')]));
+        h('div', { class: 'muted' }, 'Dwell ' + p.dwellMin + ' min' + (p.whatsapp ? ' · WA ' + p.whatsapp : '') + ((p.closedWindows || []).length ? ' · closed ' + p.closedWindows.map((w) => (daysLabel(w.days) ? daysLabel(w.days) + ' ' : '') + w.from + '–' + w.to).join(', ') : '')))) : [h('div', { class: 'empty card' }, none)]));
     }
     v.append(h('div', { class: 'row' }, h('div', { class: 'grow' }, input), h('button', { class: 'primary', onclick: () => openPlacePicker((p) => openPlaceEditor(p), 'Add place') }, '+ Add')), list);
     drawList();
@@ -1588,7 +1603,7 @@
         h('div', { class: 'muted' }, 'Keys stay on this device (never in the code, never exported).')),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Google Places calls today'),
         h('div', { class: 'title' }, String(placesCallsToday())),
-        h('div', { class: 'muted' }, 'Counted on this device only. Google quota cap 150/day set in Cloud console.')),
+        h('div', { class: 'muted' }, 'Counted on this device only. No Google-side cap is set yet.')),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Driver'),
         field('Driver name (day log + summary)', bind(h('input', { value: s.driverName || 'Calvin', autocomplete: 'off' }), 'driverName', (x) => x.trim() || 'Calvin'))),
       historyCard(),
@@ -1626,7 +1641,8 @@
 
   function exportJson() {
     const settings = Object.assign({}, S.settings); delete settings.googleKey; delete settings.tomtomKey;
-    const data = { app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), places: Object.values(S.places), jobs: S.jobs, settings };
+    const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), places: Object.values(S.places), jobs: S.jobs, settings },
+      DL.exportPayload(S.days, S.jobs, S.places)); // + dayLog (records) and dayHistory (per-day totals); keys never included
     const a = h('a', { href: URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })), download: 'waypoint-' + new Date().toISOString().slice(0, 10) + '.json' });
     document.body.append(a); a.click(); a.remove();
   }
@@ -1635,12 +1651,17 @@
     try {
       const data = JSON.parse(await file.text());
       if (data.app !== 'waypoint' || !Array.isArray(data.places) || !Array.isArray(data.jobs)) throw new Error('Not a Waypoint export.');
-      if (!confirm('Replace current places and jobs with ' + data.places.length + ' places and ' + data.jobs.length + ' jobs from this file?')) return;
+      const dl = DL.importPayload(data); // older exports have no day log: the current one is kept
+      if (!confirm('Replace current places and jobs with ' + data.places.length + ' places and ' + data.jobs.length + ' jobs' + (dl.present ? ' and ' + dl.records.length + ' day record(s)' : '') + ' from this file?')) return;
       await WPStore.clear('places'); await WPStore.clear('jobs');
       S.places = {}; S.jobs = [];
       for (const p of data.places) { normalizeWindows(p); await savePlace(p); }
       await WPStore.remove('plan', 'current');
       for (const j of data.jobs) { S.jobs.push(j); await saveJob(j); }
+      if (dl.present) {
+        await WPStore.clear('daylogs'); S.days = {};
+        for (const d of dl.records) { S.days[d.date] = d; await WPStore.set('daylogs', d.date, d); }
+      }
       if (data.settings) {
         const keep = { googleKey: S.settings.googleKey, tomtomKey: S.settings.tomtomKey, placesCallsToday: S.settings.placesCallsToday };
         S.settings = Object.assign(defaultSettings(), data.settings, keep);
@@ -1715,6 +1736,7 @@
     if (S.plan && retimeNow()) savePlan(); // restored plan: re-time from the last done stop (or start) at the current time
     render();
     if (S.tab === 'route' && S.plan) refreshFromLocation();
+    watchLocationPermission();
     setupServiceWorker();
   }).catch((e) => banner('Startup failed: ' + e.message, 'error'));
 

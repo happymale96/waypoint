@@ -2,7 +2,10 @@
  * End-of-day record + summary. Pure logic (no DOM, no network, no storage): the app owns I/O, this file owns the
  * data model and every number shown in the summary, so it can be unit tested and recomputed after an undo.
  *
- * One record per calendar day (Asia/Kuala_Lumpur, fixed UTC+8, no DST), keyed by the date the day STARTED:
+ * One record per calendar date, keyed by the DEVICE'S LOCAL date of the activity (never UTC, never the date End day
+ * is tapped). A plan run is keyed by the local date it departed (plan.ctx.dayKey); its DONE / ARRIVED taps belong to
+ * that run's record even past midnight. Activity on a date whose record is closed is merged into it (totals recomputed).
+ * Record:
  *   { schemaVersion, date, driverId, startedAt, endedAt, closed, planSnapshot, events[],
  *     jobsSnap{}, places{}, legs{}, routed, edits{}, decisions{}, carried[] }
  *   events: { t (ISO), type: plan|replan|done|undo|arrived_end|endday, jobId, stopId, lat, lng, accuracy, [kind, item, departAt, jobIds, of] }
@@ -23,7 +26,7 @@
 
   const SCHEMA = 1;
   const KEEP_DAYS = 120;
-  const KL_MS = 8 * 3600e3; // Asia/Kuala_Lumpur is UTC+8 all year
+  const REPAIR_VERSION = 1; // one-time history repair (see repairHistory / runRepairOnce)
   const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const REASONS = ['Closed', 'Item not ready', 'Ran out of time', 'Customer postponed', 'Other'];
   const CSV_HEADER = ['date', 'driver', 'type', 'item', 'from', 'to', 'done time', 'status', 'reason', 'urgent', 'late'];
@@ -31,10 +34,10 @@
   const pad2 = (n) => (n < 10 ? '0' : '') + n;
   const clean = (n) => { const s = String(n == null ? '' : n); const t = s.replace(SUFFIX_RE, '').trim(); return t || s; };
 
-  // ---------- date / time (KL) ----------
+  // ---------- date / time (device local) ----------
   function klParts(ms) {
-    const d = new Date(ms + KL_MS);
-    return { y: d.getUTCFullYear(), mo: d.getUTCMonth(), d: d.getUTCDate(), h: d.getUTCHours(), mi: d.getUTCMinutes() };
+    const d = new Date(ms);
+    return { y: d.getFullYear(), mo: d.getMonth(), d: d.getDate(), h: d.getHours(), mi: d.getMinutes() };
   }
   const dateKey = (ms) => { const p = klParts(ms); return p.y + '-' + pad2(p.mo + 1) + '-' + pad2(p.d); };
   function parseKey(key) { const a = String(key).split('-').map(Number); return { y: a[0], m: a[1], d: a[2] }; }
@@ -52,7 +55,7 @@
     return h ? h + ' h ' + pad2(m) + ' min' : m + ' min';
   }
   const fmtKm = (km) => (km == null ? '—' : km.toFixed(1) + ' km');
-  const dayStartMs = (key) => { const p = parseKey(key); return Date.UTC(p.y, p.m - 1, p.d) - KL_MS; };
+  const dayStartMs = (key) => { const p = parseKey(key); return new Date(p.y, p.m - 1, p.d).getTime(); }; // local midnight
   function hmToMin(hm) {
     if (!hm || typeof hm !== 'string') return null;
     const p = hm.split(':').map(Number);
@@ -264,7 +267,11 @@
 
     // ---- time ----
     const lastDone = groups.reduce((acc, g) => Math.max(acc, g.tMs), -Infinity);
-    const startedAt = ms(day.edits.startedAt) != null ? ms(day.edits.startedAt) : (snap ? ms(snap.departAt || snap.t) : null);
+    // Started = first plan's depart, but never after the first DONE (a DONE can predate the first logged plan, e.g. backfilled)
+    const firstDone = groups.reduce((acc, g) => Math.min(acc, g.tMs), Infinity);
+    const planStart = snap ? ms(snap.departAt || snap.t) : null;
+    const autoStart = planStart != null ? (isFinite(firstDone) ? Math.min(planStart, firstDone) : planStart) : null;
+    const startedAt = ms(day.edits.startedAt) != null ? ms(day.edits.startedAt) : autoStart;
     const arrEv = arrivedEnd(day), arrivedAt = arrEv ? ms(arrEv.t) : null;
     const finishedAt = ms(day.edits.finishedAt) != null ? ms(day.edits.finishedAt) : arrivedAt != null ? arrivedAt : (isFinite(lastDone) ? lastDone : null);
     const hoursOutMin = startedAt != null && finishedAt != null ? Math.max(0, (finishedAt - startedAt) / 60000) : null;
@@ -345,7 +352,129 @@
     });
     appendEvent(day, { t: nowIso, type: 'endday' });
     day.closed = true; day.endedAt = nowIso; day.closedAt = nowIso;
+    refreshTotals(day, jobs, places);
     return changed;
+  }
+
+  // ---------- which record: open day, merge, End day ----------
+  // Stored totals of a record (written at close and again whenever activity is merged into a closed record).
+  function refreshTotals(day, jobs, places) {
+    const s = summarise(day, jobs, places);
+    day.totals = {
+      jobsDone: s.jobsDone, jobsTotal: s.jobsTotal, stopsVisited: s.stopsVisited,
+      km: s.km.status === 'ok' ? s.km.value : s.km.status === 'none' ? 0 : null, hoursOutMin: s.hoursOutMin,
+    };
+    return day.totals;
+  }
+  // The record for a local date: the existing one (closed or not: activity is merged into it), else a new one.
+  function recordFor(days, key, driverId) {
+    if (!days[key]) days[key] = newDay({ date: key, driverId });
+    return days[key];
+  }
+  // Local date a piece of activity belongs to: its plan run's date when it happened inside a run, else its own local date.
+  const activityKey = (atMs, planDayKey) => planDayKey || dateKey(atMs);
+  // Anything worth closing: a plan, an active DONE, or an active ARRIVED.
+  const hasActivity = (day) => !!(day && (day.planSnapshot || doneGroups(day).length || arrivedEnd(day)));
+  // 0 jobs, 0 stops, no km, no start time (the repair removes these; End day never creates one)
+  function isEmptyRecord(day, jobs, places) {
+    const s = summarise(day, jobs, places);
+    return s.jobsTotal === 0 && s.stopsVisited === 0 && !(s.km.status === 'ok' && s.km.value > 0) && s.startedAt == null;
+  }
+  // The open day End day closes, whenever it is tapped: the current plan run's record if it is open, else the latest
+  // unclosed record with activity. null = nothing to close.
+  function openDayKey(days, planDayKey) {
+    const open = (d) => d && !d.closed && hasActivity(d);
+    if (planDayKey && open(days[planDayKey])) return planDayKey;
+    const keys = Object.keys(days).filter((k) => open(days[k])).sort();
+    return keys.length ? keys[keys.length - 1] : null;
+  }
+  // End day: close the open day (opts.key = a specific record, else openDayKey). Never creates a record.
+  // Returns {key|null, changed jobs[]}. key null = nothing saved.
+  function endDay(days, opts) {
+    const key = opts.key ? (days[opts.key] && !days[opts.key].closed && hasActivity(days[opts.key]) ? opts.key : null) : openDayKey(days, opts.planDayKey);
+    if (!key) return { key: null, changed: [] };
+    return { key, changed: closeDay(days[key], opts.jobs, opts.places, opts.nowIso) };
+  }
+
+  // ---------- one-time repair of stored history ----------
+  // 1) remove empty records (0 jobs, 0 stops, no km, no start time);
+  // 2) backfill DONEs that never reached the day log (jobs marked done whose doneAt local date has a non-empty record,
+  //    and which no record shows as complete) as events at their doneAt. Never removes events, never shrinks a record.
+  // Pure + idempotent: a second run finds nothing to do. Returns {removed:[keys], backfilled:{key:[jobIds]}, changed:[keys]}.
+  function repairHistory(days, jobs, places) {
+    const out = { removed: [], backfilled: {}, changed: [] };
+    Object.keys(days).forEach((k) => { if (isEmptyRecord(days[k], jobs, places)) { delete days[k]; out.removed.push(k); } });
+    const completeSomewhere = new Set();
+    Object.values(days).forEach((d) => summarise(d, jobs, places).rows.forEach((r) => { if (r.complete) completeSomewhere.add(r.jobId); }));
+    (jobs || []).forEach((j) => {
+      if (j.status !== 'done' || !j.doneAt || completeSomewhere.has(j.id)) return;
+      const t = ms(j.doneAt);
+      if (t == null || isNaN(t)) return;
+      const key = dateKey(t), day = days[key];
+      if (!day) return; // never create a record from job data alone
+      const iso = new Date(t).toISOString();
+      const ev = (stopId, kind, item) => ({ t: iso, type: 'done', jobId: j.id, stopId, lat: null, lng: null, accuracy: null, kind, item: item || '', backfill: true });
+      let evs = [];
+      const pickupOnly = !j.errandPlaceId && !j.deliveryPlaceId;
+      if (!day.jobsSnap[j.id]) {
+        const sn = snapJob(j);
+        if (pickupOnly) sn.pickups.forEach((p) => { p.done = false; }); // its pickups ARE the job: count them as done that day
+        day.jobsSnap[j.id] = sn;
+      }
+      if (j.errandPlaceId) evs = [ev(j.errandPlaceId, 'errand', j.notes || 'Errand')];
+      else if (j.deliveryPlaceId) evs = [ev(j.deliveryPlaceId, 'deliver', '')];
+      else {
+        const logged = day.events.filter((e) => e.type === 'done' && e.jobId === j.id && e.kind === 'pickup').map((e) => e.stopId);
+        evs = (j.pickups || []).filter((p) => logged.indexOf(p.placeId) < 0).map((p) => ev(p.placeId, 'pickup', p.item));
+      }
+      evs.forEach((e) => {
+        snapPlace(day, places, e.stopId);
+        const at = day.events.findIndex((x) => ms(x.t) > t); // chronological: the driven order stays the tap order
+        if (at < 0) day.events.push(e); else day.events.splice(at, 0, e);
+      });
+      if (!evs.length) return;
+      (out.backfilled[key] = out.backfilled[key] || []).push(j.id);
+      if (out.changed.indexOf(key) < 0) out.changed.push(key);
+    });
+    out.changed.forEach((k) => { if (days[k].closed) refreshTotals(days[k], jobs, places); });
+    return out;
+  }
+  // Runs the repair once per REPAIR_VERSION over a WPStore-like store ({get,set,list,remove}). Before changing anything
+  // it copies the whole stored history to backup:daylogs-repair-<v>. Returns the repair result, or null if already done.
+  async function runRepairOnce(store, jobs, places, nowIso) {
+    const flag = await store.get('meta', 'daylogRepair');
+    if (flag && flag.version >= REPAIR_VERSION) return null;
+    const list = (await store.list('daylogs')).filter((d) => d && d.date && Array.isArray(d.events));
+    const days = {};
+    list.forEach((d) => { days[d.date] = d; });
+    const fixed = JSON.parse(JSON.stringify(days)); // the repair works on a copy; storage is untouched until the backup exists
+    const res = repairHistory(fixed, jobs, places);
+    if (res.removed.length || res.changed.length) {
+      const bk = 'daylogs-repair-' + REPAIR_VERSION;
+      if (!(await store.get('backup', bk))) await store.set('backup', bk, { at: nowIso, days: list });
+      for (const k of res.changed) await store.set('daylogs', k, fixed[k]);
+      for (const k of res.removed) await store.remove('daylogs', k);
+    }
+    await store.set('meta', 'daylogRepair', { version: REPAIR_VERSION, at: nowIso, removed: res.removed, backfilled: res.backfilled });
+    return res;
+  }
+
+  // ---------- Export / Import JSON (day log + day history) ----------
+  // dayLog = the full records (everything the summary is computed from); dayHistory = their per-day totals.
+  function exportPayload(days, jobs, places) {
+    const recs = Object.keys(days).sort().map((k) => days[k]);
+    return {
+      dayLog: JSON.parse(JSON.stringify(recs)),
+      dayHistory: recs.map((d) => { const s = summarise(d, jobs, places); return { date: d.date, closed: !!d.closed, jobsDone: s.jobsDone, jobsTotal: s.jobsTotal, stopsVisited: s.stopsVisited, km: s.km.status === 'ok' ? s.km.value : s.km.status === 'none' ? 0 : null, hoursOutMin: s.hoursOutMin }; }),
+    };
+  }
+  // -> {present:false} for an export made before day logs were exported (keep the current ones), else
+  //    {present:true, records:[valid records]} (dayHistory is derived from the records, so it comes back with them).
+  function importPayload(data) {
+    if (!data || !Array.isArray(data.dayLog)) return { present: false, records: [] };
+    const records = data.dayLog.filter((d) => d && typeof d.date === 'string' && /^\d{4}-\d\d-\d\d$/.test(d.date) && Array.isArray(d.events))
+      .map((d) => Object.assign(newDay({ date: d.date, driverId: d.driverId }), d));
+    return { present: true, records };
   }
 
   // Undo the close: restore every carried / dropped job, reopen the day.
@@ -426,6 +555,7 @@
     dateKey, fmtDate, fmtTime, fmtDur, fmtKm, addDaysKey, dayStartMs, ageDays,
     newDay, appendEvent, recordPlan, recordReplan, recordDone, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, arrivedEnd, doneGroups, hasActiveDone,
     ptKey, legKey, seqKey, legFromMatrices, captureLeg, plannedFromMatrices,
-    summarise, closeDay, reopenDay, pruneDates, weekRange, weekTotals, historyKeys, toCSV, csvCell, toWhatsApp,
+    summarise, closeDay, reopenDay, refreshTotals, recordFor, activityKey, hasActivity, isEmptyRecord, openDayKey, endDay,
+    REPAIR_VERSION, repairHistory, runRepairOnce, exportPayload, importPayload, pruneDates, weekRange, weekTotals, historyKeys, toCSV, csvCell, toWhatsApp,
   };
 });
