@@ -225,4 +225,14 @@ button.end-day { width: 100%; margin: 8px 0 0; min-height: 44px; }
 .hist-row .hd { flex: 1 1 auto; min-width: 0; }
 .hist-row .hj, .hist-row .hk, .hist-row .hh { flex: none; }
 .week { margin-bottom: 6px; }
-.times-from { margin: 6px 2px 0; font-size: 13px; }
+.times-from { display: block; width: 100%; margin: 6px 0 0; min-height: 36px; padding: 0 2px; border: 0; background: none; color: var(--muted); font-size: 13px; font-weight: 500; text-align: left; }
+
+/* Route: skipped stops are greyed with Undo skip; the end point is a card; arrived = green edge */
+.card.stop.skipped.compact { opacity: 1; border-left-color: var(--muted); }
+.card.stop.skipped.compact .title { flex: 1 1 auto; min-width: 0; color: var(--muted); text-decoration: line-through; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card.stop.skipped.compact button.undo { flex: none; min-height: 32px; height: 32px; padding: 0 10px; font-size: 13px; }
+.card.stop.endcard .end-label { margin: 0 0 2px; font-size: 13px; }
+.card.stop.endcard.arrived { border-left-color: var(--ok); }
+.card.stop.endcard.arrived button.undo { min-height: 36px; height: 36px; }
+.error-text { color: var(--danger); font-weight: 600; }
+.pick-row.manual { border-style: dashed; }

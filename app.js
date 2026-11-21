@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '041f08c4'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = 'a40f27fe'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -33,7 +33,7 @@
   const S = {
     tab: 'plan', places: {}, jobs: [], settings: null,
     startSel: 'gps', endSel: 'home', departTime: '',
-    plan: null, busy: false, days: {}, loc: { lastAt: null, origin: null, busy: false }, timesFrom: null,
+    plan: null, busy: false, days: {}, loc: { lastAt: null, origin: null, busy: false, reason: null }, timesFrom: null,
   };
 
   function defaultSettings() {
@@ -111,14 +111,8 @@
     await WPStore.set('meta', 'migrations', rec);
   }
 
-  function newPlace(o) {
-    const type = o.type || 'other';
-    return Object.assign({
-      id: uid('p'), name: '', address: '', lat: 0, lng: 0, type,
-      dwellMin: S.settings.dwellDefaults[type] != null ? S.settings.dwellDefaults[type] : DEFAULT_DWELL[type],
-      closedWindows: [], whatsapp: '', salutation: 'Encik', lang: 'default',
-    }, o);
-  }
+  const placeCtx = () => ({ uid, dwellDefaults: S.settings.dwellDefaults, DEFAULT_DWELL });
+  function newPlace(o) { return Geo.makePlace(o, placeCtx()); }
 
   // ---------- banner / toast ----------
   let toastTimer = null;
@@ -213,6 +207,9 @@
           try { choose(await savePlaceFromSearch(r)); } finally { busy = false; }
         })));
       }
+      // always the last row: zero results, a failed search, offline - the way out is manual entry (no Google request)
+      kids.push(h('button', { class: 'pick-row manual', id: 'addManual', onclick: () => { const q = input.value.trim(); sh.close(); openManualPlace(q, (p) => onPick(p)); } },
+        h('span', { class: 'title' }, "Can't find it? Add manually")));
       list.replaceChildren(...kids);
       status.className = 'muted picker-status' + (g.state === 'error' ? ' error' : '');
       status.textContent = g.state === 'searching' ? 'Searching Google…' : g.state === 'error' ? g.error : (g.state === 'done' && !g.results.length) ? 'No results' : '';
@@ -251,6 +248,77 @@
     sh.body.append(input, status, list, h('button', { style: 'margin-top:8px', onclick: sh.close }, 'Cancel'));
     paint();
     setTimeout(() => input.focus(), 50);
+  }
+
+  // ---------- manual place entry (no Google Places, no routing: a fix or pasted coordinates only) ----------
+  const FIX_MSG = {
+    denied: 'Location permission is off for this app. Paste the coordinates below instead.',
+    timeout: "Couldn't get a location in time. Try again, or paste the coordinates below.",
+    unavailable: "Couldn't get a location. Try again, or paste the coordinates below.",
+  };
+  const fmtLL = (lat, lng) => Number(lat).toFixed(5) + ', ' + Number(lng).toFixed(5);
+
+  function openManualPlace(prefill, onSaved) {
+    const sh = openSheet('Add place manually');
+    let loc = null; // {lat, lng, accuracy|null}
+    const name = h('input', { id: 'manualName', value: prefill || '', placeholder: 'Place name', autocomplete: 'off' });
+    const addr = h('input', { id: 'manualAddr', placeholder: 'Optional - shown only, never looked up', autocomplete: 'off' });
+    const type = h('select', { id: 'manualType', onchange: () => { salBox.hidden = type.value === 'supplier'; } }, TYPES.map((t) => h('option', { value: t, selected: t === 'other' }, t)));
+    const sal = h('select', { id: 'manualSal' }, ['Encik', 'Puan', 'Cik'].map((t) => h('option', { value: t }, t)));
+    const lang = h('select', { id: 'manualLang' }, [['default', 'Default (' + S.settings.defaultLang + ')'], ['ms', 'Bahasa Malaysia'], ['en', 'English']].map(([val, lab]) => h('option', { value: val }, lab)));
+    const salBox = h('div', null, h('label', { class: 'field' }, 'Salutation'), sal, h('label', { class: 'field' }, 'Message language'), lang);
+    const locStatus = h('div', { class: 'muted', id: 'manualLocStatus', role: 'status' });
+    const check = h('a', { class: 'btn small', id: 'manualCheck', target: '_blank', rel: 'noopener', hidden: true }, 'Check in Google Maps');
+    const nowBtn = h('button', { id: 'manualNow', type: 'button' }, 'Use where I am now');
+    const paste = h('input', { id: 'manualPaste', placeholder: '3.1234, 101.5678  or a Google Maps link', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false' });
+
+    function setLoc(l, msg, isError) {
+      loc = l;
+      locStatus.className = 'muted' + (isError ? ' error-text' : '');
+      locStatus.textContent = msg || '';
+      check.hidden = !l;
+      if (l) check.href = Geo.mapsCheckUrl(l.lat, l.lng);
+    }
+    nowBtn.onclick = async () => {
+      nowBtn.disabled = true; locStatus.className = 'muted'; locStatus.textContent = 'Getting your location…';
+      const f = await Geo.getFix(navigator.geolocation);
+      nowBtn.disabled = false;
+      if (!f.ok) { setLoc(loc, FIX_MSG[f.code] || FIX_MSG.unavailable, true); return; } // the paste field stays usable
+      paste.value = '';
+      const acc = Math.round(f.accuracy);
+      const poor = !(f.accuracy <= Geo.GOOD_ACCURACY_M);
+      setLoc({ lat: f.lat, lng: f.lng, accuracy: f.accuracy }, 'Got it, accurate to about ' + acc + ' m' + (poor ? ' - that is not very accurate. Try again, or save it anyway.' : ''));
+      nowBtn.textContent = poor ? 'Try again' : 'Use where I am now';
+    };
+    paste.addEventListener('input', () => {
+      const t = paste.value.trim();
+      if (!t) return;
+      nowBtn.textContent = 'Use where I am now';
+      const r = Geo.parseCoords(t);
+      if (r.ok) setLoc({ lat: r.lat, lng: r.lng, accuracy: null }, 'Location: ' + fmtLL(r.lat, r.lng) + (r.outsideMalaysia ? ' (outside Malaysia)' : ''));
+      else setLoc(null, r.error, true);
+    });
+    async function save() {
+      if (!name.value.trim()) { toast('Name is required'); return; }
+      if (!loc || !Geo.inRange(loc.lat, loc.lng)) { toast('Set the location first: use where you are now, or paste coordinates.'); return; }
+      if (Geo.outsideMalaysia(loc.lat, loc.lng) && !confirm('This is outside Malaysia. Save anyway?')) return;
+      const p = Geo.manualPlace({ name: name.value, address: addr.value, type: type.value, salutation: sal.value, lang: lang.value, lat: loc.lat, lng: loc.lng, accuracy: loc.accuracy }, placeCtx());
+      await savePlace(p);
+      sh.close();
+      toast('Saved ' + p.name);
+      if (onSaved) onSaved(p);
+    }
+    salBox.hidden = type.value === 'supplier';
+    sh.body.append(
+      h('label', { class: 'field' }, 'Name'), name,
+      h('label', { class: 'field' }, 'Type'), type, salBox,
+      h('label', { class: 'field' }, 'Location'),
+      h('div', { class: 'row' }, h('div', { class: 'grow' }, nowBtn)),
+      h('label', { class: 'field' }, 'or paste coordinates / a Google Maps link'), paste,
+      locStatus, h('div', { class: 'row', style: 'margin-top:6px' }, check),
+      h('label', { class: 'field' }, 'Address / landmark note'), addr,
+      h('div', { class: 'sticky-actions' }, h('button', { onclick: sh.close }, 'Cancel'), h('button', { class: 'primary', id: 'manualSave', onclick: save }, 'Save place')));
+    setTimeout(() => { if (!name.value) name.focus(); }, 50);
   }
 
   // ---------- job helpers ----------
@@ -480,15 +548,13 @@
   }
 
   // ---------- planning ----------
-  function getGps() {
-    return new Promise((resolve, reject) => {
-      if (!navigator.geolocation) return reject(new Error('Location is not available on this device. Pick a start place instead.'));
-      navigator.geolocation.getCurrentPosition(
-        (p) => resolve({ lat: p.coords.latitude, lng: p.coords.longitude }),
-        (e) => reject(new Error('Could not get your location (' + e.message + '). Pick a start place instead.')),
-        { enableHighAccuracy: true, timeout: 12000, maximumAge: 20000 });
-    });
+  async function getGps() { // same fix rules as everywhere (Geo.getFix: high accuracy 10 s, then low accuracy 5 s)
+    if (!navigator.geolocation) throw new Error('Location is not available on this device. Pick a start place instead.');
+    const f = await Geo.getFix(navigator.geolocation);
+    if (!f.ok) throw new Error('Could not get your location (' + FIX_ERR[f.code] + '). Pick a start place instead.');
+    return { lat: f.lat, lng: f.lng };
   }
+  const FIX_ERR = { denied: 'permission denied', timeout: 'timed out', unavailable: 'no position available' };
 
   async function doPlan(opts) {
     if (S.busy) return;
@@ -534,7 +600,7 @@
       solveFresh();
       if (prevPlan) S.plan.result.plans = S.plan.result.plans.map((p) => compose(prevPlan, p));
       banner('Travel times: TomTom live traffic — ' + (got.fromCache ? 'from session cache (0 calls)' : got.calls + ' calls') + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
-      S.loc.origin = null; S.loc.lastAt = null;
+      S.loc.origin = null; S.loc.lastAt = null; S.loc.reason = null;
       logPlan(replan, { start, departAt, places, points, matrices: got.matrices, jobs: Solver.buildStops(jobs, places).jobs });
       S.tab = 'route';
       await savePlan(); // after the tab switch, so a restore reopens the Route tab
@@ -624,15 +690,18 @@
   }
 
   // Live re-timing from the last done stop (or the start) at the current time. Order never changes.
-  // The live-location origin (S.loc.origin) only applies while the next not-done stop is the one it was measured for.
+  // The live-location origin (S.loc.origin) only applies while it was measured for the CURRENT target (the next not-done
+  // stop, or the end point once every stop is done / skipped) and is at most 5 minutes old.
+  const END_ID = '__end__';
+  const targetId = (plan) => { const nx = plan.stops.find((s) => !s.status); return nx ? nx.placeId : END_ID; };
   function originFor(plan, at) {
-    const o = S.loc.origin, nx = plan.stops.find((s) => !s.status);
-    if (!o || !nx || nx.placeId !== o.placeId || at > Date.now()) return null;
+    const o = S.loc.origin, now = Date.now();
+    if (!o || o.placeId !== targetId(plan) || at > now || !Solver.originFresh(o, now)) return null;
     return { durationToNextSec: Math.max(0, (o.arriveMs - at) / 1000) };
   }
-  function retimeNow() {
+  function retimeNow() { // also with nothing left to visit: the end arrival is then re-timed (from the last done stop, or the live origin)
     const P = S.plan, plan = curPlan();
-    if (!plan || !plan.stops.some((s) => !s.status)) return false;
+    if (!plan) return false;
     const from = lastDoneIdx(plan), now = Date.now();
     const at = from < 0 ? Math.max(now, Date.parse(P.ctx.departAtISO)) : now; // before the planned departure: keep the planned times
     const org = originFor(plan, at);
@@ -643,49 +712,62 @@
   }
 
   // ---------- ETAs from the current location ----------
-  // Geolocation only if the permission is ALREADY granted (never prompts). Returns a fix, {denied:true}, or null (failed).
-  async function quickFix() {
+  // Geolocation fix under the shared rules (Geo.getFix). Without `prompt` it NEVER asks for permission (only if already
+  // granted); a tap on the status line passes prompt. Returns {ok:true, lat, lng, accuracy} | {ok:false, code}.
+  async function quickFix(prompt) {
     try {
-      if (!navigator.geolocation || !navigator.permissions || !navigator.permissions.query) return { denied: true };
-      const st = await navigator.permissions.query({ name: 'geolocation' });
-      if (st.state !== 'granted') return { denied: true };
-      return await new Promise((resolve) => navigator.geolocation.getCurrentPosition(
-        (p) => resolve({ lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy }),
-        () => resolve(null), { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }));
-    } catch (e) { return null; }
+      if (!navigator.geolocation) return { ok: false, code: 'unavailable' };
+      if (navigator.permissions && navigator.permissions.query) {
+        const st = await navigator.permissions.query({ name: 'geolocation' });
+        if (st.state === 'denied' || (st.state !== 'granted' && !prompt)) return { ok: false, code: 'denied' };
+      } else if (!prompt) return { ok: false, code: 'denied' };
+      return await Geo.getFix(navigator.geolocation);
+    } catch (e) { return { ok: false, code: 'unavailable' }; }
   }
-  // Fix -> ONE routing request (fix -> next not-done stop, live traffic, depart now) -> first ETA = now + duration, later
-  // stops follow through the existing legs and dwell times. No solver run, same order. Silent on any failure.
-  async function refreshFromLocation() {
+  // Fix -> ONE routing request (fix -> next not-done stop, or the end point when every stop is done / skipped; live
+  // traffic, depart now) -> first ETA = now + duration, later stops follow through the existing legs and dwell times.
+  // No solver run, same order. Never blocks: on any failure it records WHY (S.loc.reason) for the status line.
+  // opts.force = bypass the 2-minute / 300 m throttle (DONE, SKIP, status-line tap); opts.prompt = may ask for permission.
+  async function refreshFromLocation(opts) {
+    opts = opts || {};
     const P = S.plan, L = S.loc;
-    if (!P || L.busy || !Solver.refreshDue(Date.now(), L.lastAt)) return;
-    const plan0 = curPlan(), nx0 = plan0 && plan0.stops.find((s) => !s.status);
-    if (!nx0) return;
+    if (!P || L.busy || !Solver.refreshDue(Date.now(), L.lastAt, opts.force)) return;
+    const plan0 = curPlan();
+    if (!plan0) return;
+    const nx0 = plan0.stops.find((s) => !s.status), tid = targetId(plan0);
+    const target = nx0 ? (S.places[nx0.placeId] || P.ctx.places[nx0.placeId]) : P.ctx.end;
+    if (!target) return;
     L.busy = true; L.lastAt = Date.now();
+    const fail = async (reason) => {
+      L.reason = reason;
+      // denied, or a live origin older than 5 min: fall back to the last DONE (a fresher origin may still stand)
+      if (L.origin && (reason === 'denied' || !Solver.originFresh(L.origin, Date.now()))) { L.origin = null; if (S.plan === P) { retimeNow(); await savePlan(); } }
+      if (S.tab === 'route') render();
+    };
     try {
-      const fix = await quickFix();
-      if (fix && fix.denied) { if (L.origin) { L.origin = null; retimeNow(); await savePlan(); if (S.tab === 'route') render(); } return; }
-      const place = S.places[nx0.placeId] || P.ctx.places[nx0.placeId];
-      const o = L.origin && L.origin.placeId === nx0.placeId ? L.origin : null;
-      const verdict = place ? Solver.judgeFix(fix, o && { lat: o.lat, lng: o.lng }, place) : 'ignore';
-      if (verdict === 'ignore' || verdict === 'unmoved') return;
+      const fix = await quickFix(!!opts.prompt);
+      if (S.plan !== P) return;
+      if (!fix.ok) return await fail(fix.code === 'denied' ? 'denied' : 'nofix');
+      const o = L.origin && L.origin.placeId === tid ? L.origin : null;
+      const verdict = Solver.judgeFix(fix, o && { lat: o.lat, lng: o.lng }, target, { force: !!opts.force });
+      if (verdict === 'ignore') return await fail('nofix');
+      if (verdict === 'unmoved') { o.usedAt = Date.now(); L.reason = null; S.timesFrom = o.usedAt; if (S.tab === 'route') render(); return; }
       let dur = 0;
       if (verdict === 'route') {
+        if (navigator.onLine === false) return await fail('offline');
         try {
-          const legs = await Providers.routeLegs([{ lat: fix.lat, lng: fix.lng }, { lat: place.lat, lng: place.lng }], S.settings.tomtomKey);
+          const legs = await Providers.routeLegs([{ lat: fix.lat, lng: fix.lng }, { lat: target.lat, lng: target.lng }], S.settings.tomtomKey);
           if (!legs[0] || legs[0].s == null) throw new Error('no duration');
           dur = legs[0].s;
-        } catch (e) { // offline / provider error: today's re-time, shown as "plan start"
-          if (L.origin) { L.origin = null; retimeNow(); await savePlan(); if (S.tab === 'route') render(); }
-          return;
-        }
+        } catch (e) { return await fail(navigator.onLine === false || /network error/i.test(e.message || '') ? 'offline' : 'routing'); }
       }
-      const cur = curPlan(), nx = cur && cur.stops.find((s) => !s.status);
-      if (!nx || nx.placeId !== nx0.placeId) return; // the plan moved on while we waited
+      const cur = S.plan === P ? curPlan() : null;
+      if (!cur || targetId(cur) !== tid) return; // the plan moved on while we waited
       const hadAlt = !!P.alt, now = Date.now();
-      L.origin = { placeId: nx.placeId, lat: fix.lat, lng: fix.lng, arriveMs: now + dur * 1000, usedAt: now };
+      L.origin = { placeId: tid, lat: fix.lat, lng: fix.lng, arriveMs: now + dur * 1000, usedAt: now };
+      L.reason = null;
       retimeNow();
-      if (hadAlt) computeAvoidLunch(); // the Avoid-lunch delta follows the new times
+      if (hadAlt && cur.stops.some((s) => !s.status)) computeAvoidLunch(); // the Avoid-lunch delta follows the new times
       await savePlan();
       if (S.tab === 'route') render();
     } finally { L.busy = false; }
@@ -764,7 +846,7 @@
     if (['plan', 'route', 'places', 'settings'].includes(snap.tab)) S.tab = snap.tab;
   }
   async function clearPlan() {
-    S.plan = null; S.loc.origin = null; S.timesFrom = null;
+    S.plan = null; S.loc.origin = null; S.loc.reason = null; S.timesFrom = null;
     await WPStore.remove('plan', 'current');
     banner(null);
     render();
@@ -831,11 +913,12 @@
     } catch (e) { /* never break planning */ }
   }
 
+  function coordOf(id, day) { const p = S.places[id] || (S.plan && S.plan.ctx.places[id]) || day.places[id]; return p ? { lat: p.lat, lng: p.lng } : null; }
   function logDone(stop, nowIso) {
     try {
       const nowMs = Date.parse(nowIso), day = dayFor(nowMs, true);
       const groups = DL.doneGroups(day), lastG = groups[groups.length - 1];
-      const coord = (id) => { const p = S.places[id] || (S.plan && S.plan.ctx.places[id]) || day.places[id]; return p ? { lat: p.lat, lng: p.lng } : null; };
+      const coord = (id) => coordOf(id, day);
       const prev = lastG ? coord(lastG.stopId) : (day.planSnapshot && day.planSnapshot.start);
       const to = coord(stop.placeId), plan = curPlan();
       const evs = DL.recordDone(day, { nowIso, stopId: stop.placeId, actions: stop.actions, places: S.places });
@@ -848,18 +931,14 @@
       attachFix(evs, day);
     } catch (e) { /* never break DONE */ }
   }
-  // Geolocation fix for a DONE: only if the permission is ALREADY granted (never prompts), 3 s timeout, fire-and-forget.
+  // Geolocation fix for a DONE / ARRIVED: only if the permission is ALREADY granted (never prompts), shared fix rules,
+  // fire-and-forget (never blocks the tap).
   function attachFix(evs, day) {
-    try {
-      if (!navigator.geolocation || !navigator.permissions || !navigator.permissions.query) return;
-      navigator.permissions.query({ name: 'geolocation' }).then((st) => {
-        if (st.state !== 'granted') return;
-        navigator.geolocation.getCurrentPosition((p) => {
-          evs.forEach((e) => { e.lat = p.coords.latitude; e.lng = p.coords.longitude; e.accuracy = p.coords.accuracy; });
-          bgSaveDay(day);
-        }, () => {}, { timeout: 3000, maximumAge: 60000 });
-      }).catch(() => {});
-    } catch (e) { /* ignore */ }
+    quickFix(false).then((f) => {
+      if (!f.ok) return;
+      evs.forEach((e) => { e.lat = f.lat; e.lng = f.lng; e.accuracy = f.accuracy; });
+      bgSaveDay(day);
+    }).catch(() => {});
   }
 
   // Undo the most recent DONE: the job actions go back to pending, the day log gets an `undo`, the summary recomputes.
@@ -889,6 +968,40 @@
     retimeNow();
     banner(null);
     await savePlan();
+    render();
+    refreshFromLocation({ force: true });
+  }
+
+  // ARRIVED at the end point: a day-log event (+ a never-blocking fix), the final leg for the summary, the Day complete
+  // banner. It does NOT close the day (Close day stays its own tap) and works with stops still undone / skipped.
+  async function markArrivedEnd() {
+    const P = S.plan;
+    if (!P) return;
+    await reopenIfClosed();
+    const nowMs = Date.now(), nowIso = new Date(nowMs).toISOString(), end = P.ctx.end;
+    const day = dayFor(nowMs, true);
+    if (DL.arrivedEnd(day)) return;
+    const ev = DL.recordArrivedEnd(day, { nowIso, endPoint: { lat: end.lat, lng: end.lng, name: end.name || '' } });
+    try { // keep the final leg if the plan's own routing matrices cover that exact pair (else the summary routes it once)
+      const plan = curPlan(), groups = DL.doneGroups(day), lastG = groups[groups.length - 1];
+      const prev = lastG ? coordOf(lastG.stopId, day) : (day.planSnapshot && day.planSnapshot.start);
+      if (plan && prev) {
+        const m = plan.model, pts = [m.start].concat(m.stopIds.map((id) => coordOf(id, day)), [m.end]);
+        if (pts.every(Boolean)) DL.captureLeg(day, prev, { lat: end.lat, lng: end.lng }, m.matrices, pts, nowMs);
+      }
+    } catch (e) { /* the summary falls back to one routing request */ }
+    bgSaveDay(day);
+    attachFix([ev], day);
+    banner('Day complete - view summary', 'info', () => openSummary(day.date));
+    render();
+  }
+  async function undoArrivedEnd() {
+    const day = dayFor(Date.now(), false);
+    if (!day || !DL.arrivedEnd(day)) return;
+    if (day.closed) await reopenDay(day);
+    DL.recordUndoArrivedEnd(day, { nowIso: new Date().toISOString() });
+    bgSaveDay(day);
+    banner(null);
     render();
   }
 
@@ -1088,17 +1201,24 @@
     }
     const plan = r.plans[P.idx];
     const ctx = P.ctx;
-    const totalStops = plan.stops.length;
-    const remaining = plan.stops.filter((s) => !s.status);
+    const now = Date.now();
+    // everything below follows the CURRENT re-timed plan (never the first snapshot); nothing may show a time in the past
+    const view = Solver.liveView(plan, now);
+    const remaining = view.stops.filter((s) => !s.status);
+    const day = dayFor(now, false), arrEv = day ? DL.arrivedEnd(day) : null;
+    const di = lastDoneIdx(plan), lastDoneAt = di >= 0 ? Date.parse(plan.stops[di].doneAt) : null;
+    const departMs = day && day.startedAt ? Date.parse(day.startedAt) : Date.parse(ctx.departAtISO);
 
-    v.append(h('div', { class: 'muted times-from', id: 'timesFrom' }, S.timesFrom ? 'Times from your location, ' + fmt(S.timesFrom) : 'Times from plan start'));
+    // which anchor the times come from (and why not the phone's location); a tap retries at once, bypassing the throttle
+    v.append(h('button', { class: 'times-from', id: 'timesFrom', type: 'button', onclick: () => { if (S.loc.busy) toast('Checking your location…'); else refreshFromLocation({ force: true, prompt: true }); } },
+      Solver.timesLine({ liveAt: S.timesFrom, lastDoneAt, reason: S.loc.reason })));
     v.append(
       h('div', { class: 'card' },
-        h('div', { class: 'totals' },
-          h('div', null, h('b', null, totalStops), h('span', { class: 'muted' }, 'stops')),
-          h('div', null, h('b', null, Solver.formatDuration(plan.totalSec)), h('span', { class: 'muted' }, 'total')),
-          h('div', null, h('b', null, fmt(plan.endArrival)), h('span', { class: 'muted' }, 'arrive ' + (ctx.end.name || 'end')))),
-        h('div', { class: 'muted', style: 'margin-top:8px' }, 'Depart ' + fmt(Date.parse(ctx.departAtISO))),
+        h('div', { class: 'totals', id: 'routeTotals' },
+          h('div', null, h('b', { id: 'stopsLeft' }, view.left), h('span', { class: 'muted' }, 'stops left')),
+          h('div', null, h('b', { id: 'minLeft' }, Solver.formatDuration(view.leftSec)), h('span', { class: 'muted' }, 'left')),
+          h('div', null, h('b', { id: 'endArrive' }, fmt(view.endArrival)), h('span', { class: 'muted' }, 'arrive ' + (ctx.end.name || 'end')))),
+        h('div', { class: 'muted', id: 'departedAt', style: 'margin-top:8px' }, (departMs > now ? 'Departs ' : 'Departed ') + fmt(departMs)),
         P.shiftMs > 60000 ? h('div', { class: 'chip detour' }, 'Running ' + Math.round(P.shiftMs / 60000) + ' min behind plan') : null),
       h('label', { class: 'toggle card' }, h('input', { type: 'checkbox', checked: P.noDetour, onchange: (e) => { P.noDetour = e.target.checked; reSolveFromCache(); } }), 'No detour (urgent deliveries first, nothing else in between)'));
 
@@ -1135,9 +1255,10 @@
 
     // timeline
     const tl = h('div', { class: 'timeline' });
-    plan.stops.forEach((stop, i) => tl.append(stopCard(stop, i)));
+    view.stops.forEach((stop, i) => tl.append(stopCard(stop, i)));
     v.append(tl);
-    v.append(h('div', { class: 'card muted' }, 'Then to ' + (ctx.end.name || 'end') + ', arriving ' + fmt(plan.endArrival) + '.'));
+    v.append(endCard(view.endArrival, arrEv));
+    v.append(h('button', { class: 'end-day', id: 'routeEndDay', onclick: () => { const d = dayFor(Date.now(), false); if (d) openSummary(d.date); else toast('Nothing recorded today yet.'); } }, 'End day'));
     v.append(h('button', { class: 'text-btn', id: 'clearPlan', onclick: () => { if (confirm('Clear the current plan? Stops marked done will be forgotten.')) clearPlan(); } }, 'Clear plan'));
 
     // alternatives
@@ -1170,10 +1291,39 @@
         h('button', { class: 'grow', onclick: dismiss }, 'Keep current')));
   }
 
+  function navButtons(place) { // WAZE / MAPS per the Settings choice (same on stop cards and the end card)
+    const nav = S.settings.nav || 'waze', btns = [];
+    if (nav === 'waze' || nav === 'both') btns.push(h('a', { class: 'btn small', href: wazeUrl(place), target: '_blank', rel: 'noopener' }, 'WAZE'));
+    if (nav === 'google' || nav === 'both') btns.push(h('a', { class: 'btn small', href: gmapsUrl(S.plan.ctx.start, place, []).replace(/origin=[^&]*&/, ''), target: '_blank', rel: 'noopener' }, 'MAPS'));
+    return btns;
+  }
+
+  // The end point is a real card: re-timed arrival, WAZE and ARRIVED (arrived = a day-log event + "arrived HH:MM" with Undo)
+  function endCard(endArrival, arrEv) {
+    const end = S.plan.ctx.end;
+    const arrivedMs = arrEv ? Date.parse(arrEv.t) : null;
+    const btns = navButtons(end);
+    btns.push(arrEv
+      ? h('button', { class: 'small undo', id: 'undoArrived', 'aria-label': 'Undo arrived', onclick: () => undoArrivedEnd() }, 'Undo')
+      : h('button', { class: 'small ok', id: 'arrivedBtn', onclick: () => markArrivedEnd() }, 'ARRIVED'));
+    return h('div', { class: 'card stop endcard' + (arrEv ? ' arrived' : ''), id: 'endCard' },
+      h('div', { class: 'stop-head' },
+        h('span', { class: 'nm' }, dName(end.name || 'End')),
+        h('span', { class: 'times', id: 'endCardTime' }, arrEv ? 'arrived ' + fmt(arrivedMs) : fmt(endArrival))),
+      h('div', { class: 'muted end-label' }, 'End of route'),
+      h('div', { class: 'stop-btns' }, btns));
+  }
+
   function stopCard(stop, i) {
     const P = S.plan;
     const place = S.places[stop.placeId] || P.ctx.places[stop.placeId];
     const st = stop.status;
+    if (st === 'skipped') { // greyed, no ETA (it is out of the re-time chain), Undo skip puts it back
+      return h('div', { class: 'card stop skipped compact' }, h('div', { class: 'row spread' },
+        h('div', { class: 'title' }, (i + 1) + '. ' + dName(place.name)),
+        h('span', { class: 'chip' }, 'Skipped'),
+        h('button', { class: 'small undo', 'aria-label': 'Undo skip', onclick: () => undoSkip(stop, i) }, 'Undo skip')));
+    }
     if (st === 'done') { // done stops collapse to one line: tick, name, actual done time
       const undoable = i === lastDoneIdx(curPlan());
       return h('div', { class: 'card stop done compact' }, h('div', { class: 'row spread' },
@@ -1221,17 +1371,10 @@
     };
     head.onclick = toggle;
     head.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } };
-    const nav = S.settings.nav || 'waze';
-    const btns = [];
-    if (nav === 'waze' || nav === 'both') btns.push(h('a', { class: 'btn small', href: wazeUrl(place), target: '_blank', rel: 'noopener' }, 'WAZE'));
-    if (nav === 'google' || nav === 'both') btns.push(h('a', { class: 'btn small', href: gmapsUrl(P.ctx.start, place, []).replace(/origin=[^&]*&/, ''), target: '_blank', rel: 'noopener' }, 'MAPS'));
+    const btns = navButtons(place);
     if (hasDelivery) btns.push(h('button', { class: 'small', onclick: () => { const m = stopMessage(stop, P.shiftMs); shareMessage(m.place, m.text); } }, 'MSG'));
-    if (!st) {
-      btns.push(h('button', { class: 'small ok', onclick: () => markDone(stop, i) }, 'DONE'));
-      btns.push(h('button', { class: 'small', onclick: () => skipStop(stop, i) }, 'SKIP'));
-    } else {
-      btns.push(h('span', { class: 'chip' }, 'Skipped'));
-    }
+    btns.push(h('button', { class: 'small ok', onclick: () => markDone(stop, i) }, 'DONE'));
+    btns.push(h('button', { class: 'small', onclick: () => skipStop(stop, i) }, 'SKIP'));
     return h('div', { class: 'card stop ' + (st || '') + (stop.detour ? ' detour' : '') },
       head, more,
       lines.length ? h('div', { class: 'stop-acts' }, lines) : null,
@@ -1270,10 +1413,12 @@
     logDone(stop, nowIso); // synchronous, in memory: never delays DONE (save + geolocation fix happen in the background)
     P.alt = null;
     P.result.plans = [P.result.plans[P.idx]]; P.idx = 0; // alternatives pre-date this DONE: drop them
-    await refreshIfStale(P.result.plans[0]);              // travel times older than 30 min are re-fetched first
-    // live re-timing: from this stop, at the current time, order unchanged
+    // live re-timing: from this stop, at the DONE time, order unchanged - shown at once, never waiting for the network
     P.result.plans[0] = Solver.retime(P.result.plans[0], i, nowIso);
     P.shiftMs = 0;
+    render();
+    await refreshIfStale(P.result.plans[0]);              // travel times older than 30 min are re-fetched, then re-timed again
+    P.result.plans[0] = Solver.retime(P.result.plans[0], i, nowIso);
     // offer to send the ETA to the next stop if it is a delivery and has a WhatsApp number
     const plan = P.result.plans[0];
     const next = plan.stops.slice(i + 1).find((s) => !s.status);
@@ -1286,23 +1431,36 @@
     await savePlan();
     render();
     dayCompleteBanner();
-    refreshFromLocation(); // after DONE: ETAs from where we are now (throttled; silent on failure)
+    refreshFromLocation({ force: true }); // after DONE: ETAs from where we are now (a new target, so not throttled; never blocks)
   }
 
-  async function skipStop(stop0, i0) { // actions stay pending; ETAs re-timed from this stop at the current time
+  // A stop becomes skipped ONLY by this explicit tap (nothing else - DONE order, timing, replan - ever sets it).
+  async function skipStop(stop0, i0) { // actions stay pending; skipped stops leave the re-time chain and the header counts
     const P = S.plan;
     const ls = liveStop(stop0, i0);
     if (!ls) return;
-    const stop = ls.stop, i = ls.i;
-    stop.status = 'skipped';
+    ls.stop.status = 'skipped';
     S.loc.origin = null;
     P.alt = null;
     P.result.plans = [P.result.plans[P.idx]]; P.idx = 0;
-    P.result.plans[0] = Solver.retime(P.result.plans[0], i, new Date().toISOString());
-    P.shiftMs = 0;
-    toast('Skipped — actions stay pending. Replan to bring it back.');
+    retimeNow(); // from the last DONE (never from the skipped stop: we did not go there)
+    toast('Skipped — actions stay pending. Undo skip, or replan to bring it back.');
     await savePlan();
     render();
+    refreshFromLocation({ force: true });
+  }
+  async function undoSkip(stop0, i0) { // puts the stop back in the chain and re-times
+    const P = S.plan, cur = curPlan();
+    const stop = cur && cur.stops[i0] && cur.stops[i0].placeId === stop0.placeId ? cur.stops[i0] : null;
+    if (!stop || stop.status !== 'skipped') return;
+    delete stop.status;
+    S.loc.origin = null;
+    P.alt = null;
+    retimeNow();
+    banner(null);
+    await savePlan();
+    render();
+    refreshFromLocation({ force: true });
   }
 
   async function replanFromHere() {
@@ -1356,6 +1514,26 @@
           h('button', { class: 'small danger', 'aria-label': 'Remove window', onclick: () => { w.splice(i, 1); drawW(); } }, '✕')))));
     }
     drawW();
+    // wrong pin? re-take it where you stand (saved at once; the old coordinates are kept so it can be undone once)
+    const adopt = (np) => { Object.keys(p).forEach((k) => { delete p[k]; }); Object.assign(p, np); };
+    const pinInfo = h('div', { class: 'muted', id: 'pinInfo' });
+    const pinMsg = h('div', { class: 'muted', id: 'pinMsg', role: 'status' });
+    const undoLoc = h('button', { class: 'small', id: 'undoLoc', type: 'button', hidden: !p.previousLocation }, 'Undo location update');
+    const updLoc = h('button', { id: 'updateLoc', type: 'button' }, 'Update location to where I am now');
+    const drawPin = () => { pinInfo.textContent = 'Pin: ' + fmtLL(p.lat, p.lng) + (p.accuracy != null ? ' (accuracy about ' + p.accuracy + ' m)' : ''); undoLoc.hidden = !p.previousLocation; };
+    updLoc.onclick = async () => {
+      updLoc.disabled = true; pinMsg.textContent = 'Getting your location…';
+      const f = await Geo.getFix(navigator.geolocation);
+      updLoc.disabled = false;
+      if (!f.ok) { pinMsg.textContent = FIX_MSG[f.code] || FIX_MSG.unavailable; return; }
+      pinMsg.textContent = '';
+      const metres = Math.round(Solver.distanceM({ lat: p.lat, lng: p.lng }, f));
+      if (!confirm('Move the pin of ' + p.name + ' by about ' + metres + ' m? (new fix accurate to about ' + Math.round(f.accuracy) + ' m)')) return;
+      adopt(Geo.moveLocation(p, f, new Date().toISOString()));
+      await savePlace(p); drawPin(); pinMsg.textContent = 'Pin moved ' + metres + ' m.';
+    };
+    undoLoc.onclick = async () => { adopt(Geo.undoMove(p)); await savePlace(p); drawPin(); pinMsg.textContent = 'Back to the old location.'; };
+    drawPin();
     sh.body.append(
       h('label', { class: 'field' }, 'Name'), name, h('label', { class: 'field' }, 'Address'), addr,
       h('label', { class: 'field' }, 'Type'), type, h('label', { class: 'field' }, 'Dwell (minutes)'), dwell,
@@ -1363,6 +1541,7 @@
       h('button', { class: 'small', onclick: () => { w.push({ days: ALL_DAYS.slice(), from: '12:00', to: '13:00' }); drawW(); } }, '+ Add closed window'),
       h('label', { class: 'field' }, 'WhatsApp number'), wa,
       salBox,
+      h('label', { class: 'field' }, 'Location'), pinInfo, h('div', { class: 'row', style: 'margin-top:6px' }, h('div', { class: 'grow' }, updLoc), undoLoc), pinMsg,
       h('div', { class: 'sticky-actions' },
         h('button', { class: 'danger', onclick: async () => {
           const used = S.jobs.some((j) => j.status !== 'done' && (j.deliveryPlaceId === p.id || j.errandPlaceId === p.id || (j.pickups || []).some((x) => x.placeId === p.id)));
@@ -1526,6 +1705,11 @@
       document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') check(); });
     }).catch(() => {});
   }
+
+  // Route tab open: re-render once a minute (NO network call) so no time shown has slipped into the past.
+  setInterval(() => {
+    if (S.tab === 'route' && S.plan && document.visibilityState === 'visible' && !document.querySelector('.backdrop')) render();
+  }, 60000);
 
   load().then(() => {
     if (S.plan && retimeNow()) savePlan(); // restored plan: re-time from the last done stop (or start) at the current time

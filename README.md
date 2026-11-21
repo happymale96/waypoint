@@ -14,10 +14,11 @@ Live: https://happymale96.github.io/waypoint/
 | `storage.js` | Async `get/set/list/remove` over localStorage — swap for a hosted backend later |
 | `messages.js` | WhatsApp text: greeting, ETA rounding, templates, `wa.me` links |
 | `daylog.js` | End-of-day record + `summarise()` (pure: km, hours, collected/delivered, carry-forward, CSV / WhatsApp text, history) |
+| `geo.js` | Pure location helpers: coordinate parsing (manual place entry), the geolocation fix rules, place-record builders, pin move / undo |
 | `sw.js`, `manifest.json`, `icon-*.png` | PWA shell |
 | `tools/make-icons.js` | Builds the 192/512 maskable icons (`npm install` in `tools/` first) |
 | `tools/stamp-sw.js` | Writes the build stamp into `sw.js` and `app.js` — **run before every commit** (see below) |
-| `test/*.test.js` | `node test/solver.test.js && node test/messages.test.js && node test/daylog.test.js && node test/location.test.js` |
+| `test/*.test.js` | `node test/solver.test.js && node test/messages.test.js && node test/daylog.test.js && node test/location.test.js && node test/route.test.js && node test/geo.test.js` |
 
 ## Releases and the build stamp
 The service worker's cache name is `waypoint-<stamp>`. The stamp is an 8-character content hash of the whole app shell (html, css, js, json, icons), written by `tools/stamp-sw.js` into `sw.js` (`BUILD`) and `app.js` (`BUILD_STAMP`, shown in **Settings → build …**).
@@ -58,3 +59,13 @@ TomTom's current docs list `routeSummary.travelTimeInSeconds` (and `trafficDelay
 
 ## ETAs from your location
 On opening the Route tab, returning to the app, and after DONE (at most once per 2 minutes, skipped if you moved under 300 m), the app takes a geolocation fix **only if permission is already granted** (high accuracy, 5 s; accuracy worse than 200 m is ignored). With a good fix it makes ONE TomTom Matrix request (you → next stop, live traffic) and re-times the stops via `Solver.retime(plan, from, now, {durationToNextSec})`: first ETA = now + that duration, later ETAs follow through the existing legs and dwell times; order never changes. Within 150 m of the next stop it counts as arrived (no request). CLOSED / LATE flags and the Avoid-lunch delta follow the new times. The Route tab says "Times from your location, HH:MM" or "Times from plan start" (no fix, denied, offline, provider error).
+
+## Route tab: what the header and status line mean
+- Header = the current re-timed plan: stops left (not done, not skipped), time left to the re-timed end arrival, the end arrival, "Departed HH:MM" (original depart). The Route tab re-renders once a minute (no network call); no stop or end time is ever shown in the past (a past ETA becomes now and later times shift with it).
+- Status line (tap = retry now, bypassing the 2-min / 300 m throttle): "Times from your location, HH:MM", "Times from last DONE, HH:MM" or "Times from plan start"; without a live fix it adds why: location not allowed / no GPS fix / routing failed / offline. A live origin older than 5 min is never reused.
+- Fix rules (everywhere): high accuracy, 10 s timeout, maximumAge 60 s; on timeout one retry at low accuracy, 5 s. Route ETAs accept 200 m or better.
+- SKIP is an explicit tap only; a skipped stop is greyed, has no ETA, is out of the chain and the counts, and has **Undo skip**.
+- The end point is a card (**WAZE**, **ARRIVED**). ARRIVED writes `arrived_end` to the day log (Finished = that time unless edited; the summary adds the last-stop -> end-point leg), shows "Day complete - view summary" and never closes the day. **End day** is also at the bottom of the Route tab.
+
+## Manual places
+In any place picker the last row is **Can't find it? Add manually** (always, also offline / on a failed search): name, type, salutation / language, location from **Use where I am now** or pasted coordinates / a long Google Maps link (short links can't be read), optional address note. Saved with `source: "manual"`; zero Google Places or routing requests. In the place editor, **Update location to where I am now** moves a wrong pin (the old one is kept as `previousLocation` for one undo).

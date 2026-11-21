@@ -5,9 +5,11 @@
  * One record per calendar day (Asia/Kuala_Lumpur, fixed UTC+8, no DST), keyed by the date the day STARTED:
  *   { schemaVersion, date, driverId, startedAt, endedAt, closed, planSnapshot, events[],
  *     jobsSnap{}, places{}, legs{}, routed, edits{}, decisions{}, carried[] }
- *   events: { t (ISO), type: plan|replan|done|undo|endday, jobId, stopId, lat, lng, accuracy, [kind, item, departAt, jobIds, of] }
+ *   events: { t (ISO), type: plan|replan|done|undo|arrived_end|endday, jobId, stopId, lat, lng, accuracy, [kind, item, departAt, jobIds, of] }
  *   startedAt = depart time of the first plan; closedAt = when Close day was tapped (endedAt = same, kept for old records).
- *   Finished / Hours out come from the LAST DONE event (or edits.finishedAt), never from closedAt.
+ *   Finished / Hours out come from the arrived_end event if there is one, else the LAST DONE event (edits.finishedAt beats both),
+ *   never from closedAt. arrived_end {endPoint:{lat,lng,name}} also adds a final leg (last done stop -> end point) to km / drive time;
+ *   it never closes the day. An undo with of:'arrived_end' cancels the latest one.
  *   edits.startedAt / edits.finishedAt = user overrides (ISO) of Started / Finished.
  *   legs  = per-leg metres/seconds already held from routing responses: "lat,lng>lat,lng" -> {m, s}
  *   routed = result of the ONE routing request made at End Day: {key, legs:[{m,s}], at}
@@ -122,6 +124,21 @@
   }
   function recordUndo(day, info) { // info: {nowIso, stopId}
     return appendEvent(day, { t: info.nowIso, type: 'undo', stopId: info.stopId });
+  }
+
+  // ARRIVED at the end point of the route. info: {nowIso, endPoint:{lat,lng,name}}. Never closes the day.
+  function recordArrivedEnd(day, info) {
+    return appendEvent(day, { t: info.nowIso, type: 'arrived_end', endPoint: info.endPoint ? { lat: info.endPoint.lat, lng: info.endPoint.lng, name: info.endPoint.name || '' } : null });
+  }
+  function recordUndoArrivedEnd(day, info) { return appendEvent(day, { t: info.nowIso, type: 'undo', of: 'arrived_end' }); }
+  // the active (not undone) arrived_end event, or null
+  function arrivedEnd(day) {
+    let cur = null;
+    (day.events || []).forEach((e) => {
+      if (e.type === 'arrived_end') cur = e;
+      else if (e.type === 'undo' && e.of === 'arrived_end') cur = null;
+    });
+    return cur;
   }
 
   // Groups of DONE events (one per tap), in tap order, after removing the ones an undo cancelled.
@@ -248,7 +265,8 @@
     // ---- time ----
     const lastDone = groups.reduce((acc, g) => Math.max(acc, g.tMs), -Infinity);
     const startedAt = ms(day.edits.startedAt) != null ? ms(day.edits.startedAt) : (snap ? ms(snap.departAt || snap.t) : null);
-    const finishedAt = ms(day.edits.finishedAt) != null ? ms(day.edits.finishedAt) : (isFinite(lastDone) ? lastDone : null);
+    const arrEv = arrivedEnd(day), arrivedAt = arrEv ? ms(arrEv.t) : null;
+    const finishedAt = ms(day.edits.finishedAt) != null ? ms(day.edits.finishedAt) : arrivedAt != null ? arrivedAt : (isFinite(lastDone) ? lastDone : null);
     const hoursOutMin = startedAt != null && finishedAt != null ? Math.max(0, (finishedAt - startedAt) / 60000) : null;
 
     // ---- distance / drive time over: day start -> stops in the order DONE was tapped ----
@@ -258,6 +276,7 @@
     if (snap && snap.start) pts.push({ lat: snap.start.lat, lng: snap.start.lng });
     let pointsOk = !!(snap && snap.start);
     doneSeq.forEach((id) => { const p = placeOf(id); if (p) pts.push({ lat: p.lat, lng: p.lng }); else pointsOk = false; });
+    if (arrEv && arrEv.endPoint && pointsOk && pts.length) pts.push({ lat: arrEv.endPoint.lat, lng: arrEv.endPoint.lng }); // final leg: last done stop -> end point
     const key = seqKey(pts);
     const routed = day.routed && day.routed.key === key ? day.routed.legs : null;
     let kmM = 0, driveS = 0, mOk = true, sOk = true;
@@ -287,7 +306,7 @@
       date: day.date, driverId: day.driverId, closed: !!day.closed, closedAt: ms(day.closedAt != null ? day.closedAt : day.endedAt),
       jobsDone: rows.filter((r) => r.complete).length, jobsTotal: rows.length,
       stopsVisited: doneSeq.length, doneSeq,
-      km, driveMin, hoursOutMin, atStopsMin, startedAt, finishedAt,
+      km, driveMin, hoursOutMin, atStopsMin, startedAt, finishedAt, arrivedEndAt: arrivedAt,
       startedSource: ms(day.edits.startedAt) != null ? 'edited' : snap ? 'first plan' : '—',
       collected, delivered, errands,
       stillWithYou: rows.filter((r) => r.withYou),
@@ -405,7 +424,7 @@
   return {
     SCHEMA, KEEP_DAYS, REASONS, CSV_HEADER,
     dateKey, fmtDate, fmtTime, fmtDur, fmtKm, addDaysKey, dayStartMs, ageDays,
-    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordUndo, doneGroups, hasActiveDone,
+    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, arrivedEnd, doneGroups, hasActiveDone,
     ptKey, legKey, seqKey, legFromMatrices, captureLeg, plannedFromMatrices,
     summarise, closeDay, reopenDay, pruneDates, weekRange, weekTotals, historyKeys, toCSV, csvCell, toWhatsApp,
   };

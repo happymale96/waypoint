@@ -450,7 +450,8 @@
       t = dep; pos = pi;
       return out;
     });
-    const endMs = t + leg(pos, k + 1, t) * 1000;
+    // every stop done/skipped: the live origin (a fix + one routing request) targets the end point instead
+    const endMs = t + (firstLeft && ov != null ? ov : leg(pos, k + 1, t)) * 1000;
     const out = Object.assign({}, plan, { stops, endArrival: Math.round(endMs), totalSec: Math.round((endMs - m.t0ms) / 1000) });
     if (m.beforeMs) { // window lateness follows the new times (stops still ahead only)
       const violations = []; let lateMs = 0;
@@ -470,22 +471,45 @@
   }
 
   // ---------- live-location rules (pure; the app supplies the clock and the fix) ----------
-  const LOC = { REFRESH_MS: 120000, MOVED_M: 300, ARRIVED_M: 150, MAX_ACCURACY_M: 200 };
+  const LOC = { REFRESH_MS: 120000, MOVED_M: 300, ARRIVED_M: 150, MAX_ACCURACY_M: 200, ORIGIN_MAX_AGE_MS: 300000 };
   function distanceM(a, b) { // haversine, metres
     const R = 6371000, rad = Math.PI / 180;
     const dLat = (b.lat - a.lat) * rad, dLng = (b.lng - a.lng) * rad;
     const x = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLng / 2) ** 2;
     return 2 * R * Math.asin(Math.min(1, Math.sqrt(x)));
   }
-  // at most one location refresh per 2 minutes
-  const refreshDue = (nowMs, lastAtMs) => lastAtMs == null || nowMs - lastAtMs >= LOC.REFRESH_MS;
+  // at most one location refresh per 2 minutes (force = the driver tapped the status line: always due)
+  const refreshDue = (nowMs, lastAtMs, force) => !!force || lastAtMs == null || nowMs - lastAtMs >= LOC.REFRESH_MS;
+  // a live origin older than 5 minutes is never reused (a poor / failed fix must fall back to the last DONE)
+  const originFresh = (o, nowMs) => !!o && nowMs - (o.usedAt || 0) <= LOC.ORIGIN_MAX_AGE_MS;
   // What to do with a fix {lat,lng,accuracy}: 'ignore' (none / accuracy worse than 200 m), 'arrived' (within 150 m of the
   // next stop: no routing request), 'unmoved' (under 300 m from lastFix, the position of the previous refresh), else 'route'.
-  function judgeFix(fix, lastFix, nextStop) {
+  function judgeFix(fix, lastFix, nextStop, opts) {
     if (!fix || fix.lat == null || fix.lng == null || !(fix.accuracy <= LOC.MAX_ACCURACY_M)) return 'ignore';
     if (nextStop && distanceM(fix, nextStop) <= LOC.ARRIVED_M) return 'arrived';
-    if (lastFix && distanceM(fix, lastFix) < LOC.MOVED_M) return 'unmoved';
+    if (!(opts && opts.force) && lastFix && distanceM(fix, lastFix) < LOC.MOVED_M) return 'unmoved';
     return 'route';
+  }
+
+  // ---------- what the Route tab shows (pure; the app supplies the clock) ----------
+  // The header / cards follow the CURRENT re-timed plan, never the first snapshot. No remaining stop and no end arrival
+  // may be in the past: if the next not-done stop's ETA is before `nowMs`, it becomes `nowMs` and every remaining stop
+  // (and the end arrival) shifts by the same amount. The end arrival is never earlier than any remaining stop or now.
+  function liveView(plan, nowMs) {
+    const stops = plan.stops.map((s) => Object.assign({}, s));
+    const left = stops.filter((s) => !s.status);
+    const shiftMs = left.length && left[0].arriveAt < nowMs ? nowMs - left[0].arriveAt : 0;
+    if (shiftMs) left.forEach((s) => { s.arriveAt += shiftMs; s.departAt += shiftMs; });
+    let end = Math.max(plan.endArrival + shiftMs, nowMs);
+    left.forEach((s) => { end = Math.max(end, s.arriveAt, s.departAt); });
+    return { stops, endArrival: end, left: left.length, leftSec: Math.max(0, Math.round((end - nowMs) / 1000)), shiftMs };
+  }
+  const TIMES_REASON = { denied: 'location not allowed', nofix: 'no GPS fix', routing: 'routing failed', offline: 'offline' };
+  // st = {liveAt (ms of the live fix used) | null, lastDoneAt (ms) | null, reason: 'denied'|'nofix'|'routing'|'offline'|null}
+  function timesLine(st) {
+    if (st.liveAt != null) return 'Times from your location, ' + formatETA(st.liveAt);
+    const base = st.lastDoneAt != null ? 'Times from last DONE, ' + formatETA(st.lastDoneAt) : 'Times from plan start';
+    return TIMES_REASON[st.reason] ? base + ' - ' + TIMES_REASON[st.reason] : base;
   }
 
   // Sub-matrices for a smaller problem: keep only the listed point indices, in that order (used to re-solve the
@@ -542,5 +566,5 @@
     return buildPlan(c, orderPlaceIds.map((p) => c.idx[p]));
   }
 
-  return { solve, evaluate, retime, reindexMatrices, distanceM, refreshDue, judgeFix, LOC, isClosedAt, buildStops, pointsFor, formatETA, formatDuration, hmToSec, MAX_STOPS, DEFAULT_DWELL };
+  return { solve, evaluate, retime, reindexMatrices, distanceM, refreshDue, judgeFix, originFresh, liveView, timesLine, LOC, isClosedAt, buildStops, pointsFor, formatETA, formatDuration, hmToSec, MAX_STOPS, DEFAULT_DWELL };
 });
