@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = 'fc6d268d'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '0c53883b'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -1492,7 +1492,8 @@
       const items = Object.values(S.places).filter((p) => !q || (p.name + ' ' + p.address).toLowerCase().includes(q)).sort(byName);
       const none = Object.keys(S.places).length ? 'No places match.' : 'No places yet.';
       list.replaceChildren(...(items.length ? items.map((p) => h('div', { class: 'card', onclick: () => openPlaceEditor(p) },
-        h('div', { class: 'row spread' }, h('div', { class: 'title' }, p.name), h('span', { class: 'chip' }, Messages.typeLabel(p.type))),
+        h('div', { class: 'title place-name' }, p.name),
+        h('div', { class: 'place-tag' }, h('span', { class: 'chip' }, Messages.typeLabel(p.type))),
         h('div', { class: 'muted' }, p.address || (p.lat.toFixed(4) + ', ' + p.lng.toFixed(4))),
         h('div', { class: 'muted' }, 'Dwell ' + p.dwellMin + ' min' + (p.whatsapp ? ' · WA ' + Messages.compactNumber(p.whatsapp) : '') + ((p.closedWindows || []).length ? ' · closed ' + p.closedWindows.map((w) => (daysLabel(w.days) ? daysLabel(w.days) + ' ' : '') + w.from + '–' + w.to).join(', ') : '')))) : [h('div', { class: 'empty card' }, none)]));
     }
