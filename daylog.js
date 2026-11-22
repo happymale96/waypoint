@@ -26,7 +26,7 @@
 
   const SCHEMA = 1;
   const KEEP_DAYS = 120;
-  const REPAIR_VERSION = 1; // one-time history repair (see repairHistory / runRepairOnce)
+  const REPAIR_VERSION = 2; // one-time history repair (see repairHistory / runRepairOnce)
   const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const REASONS = ['Closed', 'Item not ready', 'Ran out of time', 'Customer postponed', 'Other'];
   const CSV_HEADER = ['date', 'driver', 'type', 'item', 'from', 'to', 'done time', 'status', 'reason', 'urgent', 'late'];
@@ -279,9 +279,13 @@
     // ---- distance / drive time over: day start -> stops in the order DONE was tapped ----
     const doneSeq = [];
     groups.forEach((g) => { if (doneSeq.indexOf(g.stopId) < 0) doneSeq.push(g.stopId); });
+    // The chain starts at the plan's start point only if that plan departed BEFORE the first visited stop; otherwise it
+    // starts at the first visited stop (a plan that departed after the first DONE never drove a leg from its start).
     const pts = [];
-    if (snap && snap.start) pts.push({ lat: snap.start.lat, lng: snap.start.lng });
-    let pointsOk = !!(snap && snap.start);
+    const planStartOk = !!(snap && snap.start);
+    const useStart = planStartOk && (planStart == null || !isFinite(firstDone) || planStart < firstDone);
+    if (useStart) pts.push({ lat: snap.start.lat, lng: snap.start.lng });
+    let pointsOk = planStartOk;
     doneSeq.forEach((id) => { const p = placeOf(id); if (p) pts.push({ lat: p.lat, lng: p.lng }); else pointsOk = false; });
     if (arrEv && arrEv.endPoint && pointsOk && pts.length) pts.push({ lat: arrEv.endPoint.lat, lng: arrEv.endPoint.lng }); // final leg: last done stop -> end point
     const key = seqKey(pts);
@@ -320,7 +324,7 @@
       notDone: rows.filter((r) => !r.complete),
       plan: { plannedKm: snap ? snap.plannedKm : null, plannedDriveMin: snap ? snap.plannedDriveMin : null, replans, outOfOrder, stopsDone: doneSeq.length, stopsPlanned: order.length },
       rows,
-      route: { key, points: pts, needs: enough && pointsOk && (!mOk || !sOk) },
+      route: { key, points: pts, needs: enough && pointsOk && (!mOk || !sOk), startDropped: planStartOk && !useStart },
     };
   }
 
@@ -400,9 +404,10 @@
   // 1) remove empty records (0 jobs, 0 stops, no km, no start time);
   // 2) backfill DONEs that never reached the day log (jobs marked done whose doneAt local date has a non-empty record,
   //    and which no record shows as complete) as events at their doneAt. Never removes events, never shrinks a record.
-  // Pure + idempotent: a second run finds nothing to do. Returns {removed:[keys], backfilled:{key:[jobIds]}, changed:[keys]}.
+  // 3) drops the stored route of any day whose km chain starts at its first visited stop instead of the plan start.
+  // Pure + idempotent: a second run finds nothing to do. Returns {removed:[keys], backfilled:{key:[jobIds]}, changed:[keys], routeDropped:[keys]}.
   function repairHistory(days, jobs, places) {
-    const out = { removed: [], backfilled: {}, changed: [] };
+    const out = { removed: [], backfilled: {}, changed: [], routeDropped: [] };
     Object.keys(days).forEach((k) => { if (isEmptyRecord(days[k], jobs, places)) { delete days[k]; out.removed.push(k); } });
     const completeSomewhere = new Set();
     Object.values(days).forEach((d) => summarise(d, jobs, places).rows.forEach((r) => { if (r.complete) completeSomewhere.add(r.jobId); }));
@@ -435,6 +440,15 @@
       if (!evs.length) return;
       (out.backfilled[key] = out.backfilled[key] || []).push(j.id);
       if (out.changed.indexOf(key) < 0) out.changed.push(key);
+    });
+    // 3) km chain rule: a day whose chain no longer starts at the plan's start point (the plan departed after the first
+    //    DONE) loses its stored route, so km is recomputed (tap-to-retry) instead of keeping the never-driven first leg.
+    Object.keys(days).forEach((k) => {
+      const d = days[k];
+      if (!d.routed || !summarise(d, jobs, places).route.startDropped) return;
+      d.routed = null;
+      out.routeDropped.push(k);
+      if (out.changed.indexOf(k) < 0) out.changed.push(k);
     });
     out.changed.forEach((k) => { if (days[k].closed) refreshTotals(days[k], jobs, places); });
     return out;

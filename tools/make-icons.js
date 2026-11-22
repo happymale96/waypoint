@@ -1,58 +1,59 @@
 #!/usr/bin/env node
-/* Generates icon-192.png and icon-512.png (maskable: logo centred with ~15% padding on white).
- *   node tools/make-icons.js            -> downloads the L-Tech logo (or uses ./logo.png if present)
- *   node tools/make-icons.js logo.png   -> uses that file
- * If no logo can be obtained, a plain "W" icon is generated and a note is printed.
+/* Generates icon-192.png, icon-512.png and icon-512-maskable.png from the real L-Tech artwork in logo.png
+ * (the only logo source in the repo, 614 x 133 px).
+ *
+ * Layout: the logo symbol centred and large, the "L-TECH" wordmark beneath it, smaller, on white.
+ * The registration-number line under the wordmark is cropped away. Nothing is redrawn or re-typeset:
+ * the symbol and the wordmark are cropped out of logo.png and only scaled.
+ *
+ *   cd tools && npm install && cd ..
+ *   node tools/make-icons.js [logo.png]
  */
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
-const sharp = require('sharp');
+const sharp = require(path.join(__dirname, 'node_modules', 'sharp'));
 
 const ROOT = path.resolve(__dirname, '..');
-const LOGO_URL = 'https://cdn1.npcdn.net/images/1fb05166c9f8ef42e9358761f98b0ca6.png';
-const NAVY = '#00243c';
+// Regions of logo.png (found by column/row ink analysis; the gaps between them are fully transparent).
+const SYMBOL = { left: 0, top: 0, width: 189, height: 106 };       // the two interlocking shapes
+const WORDMARK = { left: 222, top: 0, width: 392, height: 106 };   // "L-TECH" (registration line sits below row 111)
+const BG = { r: 255, g: 255, b: 255, alpha: 1 };
 
-function download(url, dest) {
-  return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) return resolve(download(res.headers.location, dest));
-      if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode));
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => { const b = Buffer.concat(chunks); fs.writeFileSync(dest, b); resolve(b); });
-    }).on('error', reject);
-  });
+// layout: symbol width, wordmark width, gap, all as a fraction of the icon size
+const NORMAL = { symbol: 0.72, word: 0.50, gap: 0.075 };
+const MASKABLE = { symbol: 0.58, word: 0.40, gap: 0.06 }; // everything inside the central safe circle (r = 40%)
+
+async function trimmed(buf, region) {
+  const crop = await sharp(buf).extract(region).png().toBuffer();
+  return sharp(crop).trim({ threshold: 1 }).png().toBuffer(); // trims transparent margin only
 }
 
-async function logoIcon(buf, size, out) {
-  const inner = Math.round(size * 0.70); // 15% padding each side
-  const logo = await sharp(buf).resize({ width: inner, height: inner, fit: 'inside' }).png().toBuffer();
-  await sharp({ create: { width: size, height: size, channels: 4, background: '#ffffff' } })
-    .composite([{ input: logo, gravity: 'centre' }]).png().toFile(out);
-}
-async function wIcon(size, out) {
-  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + size + '" height="' + size + '"><rect width="100%" height="100%" fill="#fff"/>' +
-    '<text x="50%" y="50%" dy=".35em" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-weight="700" font-size="' + Math.round(size * 0.55) + '" fill="' + NAVY + '">W</text></svg>';
-  await sharp(Buffer.from(svg)).png().toFile(out);
+async function build(buf, size, lay, out) {
+  const sym = await trimmed(buf, SYMBOL);
+  const word = await trimmed(buf, WORDMARK);
+  const symR = await sharp(sym).resize({ width: Math.round(size * lay.symbol), kernel: 'lanczos3' }).png().toBuffer();
+  const wordR = await sharp(word).resize({ width: Math.round(size * lay.word), kernel: 'lanczos3' }).png().toBuffer();
+  const sm = await sharp(symR).metadata();
+  const wm = await sharp(wordR).metadata();
+  const gap = Math.round(size * lay.gap);
+  const total = sm.height + gap + wm.height;
+  const top = Math.round((size - total) / 2);
+  await sharp({ create: { width: size, height: size, channels: 4, background: BG } })
+    .composite([
+      { input: symR, left: Math.round((size - sm.width) / 2), top },
+      { input: wordR, left: Math.round((size - wm.width) / 2), top: top + sm.height + gap },
+    ]).png().toFile(out);
+  return { sym: [sm.width, sm.height], word: [wm.width, wm.height], top, total };
 }
 
 (async () => {
-  const arg = process.argv[2];
-  const logoPath = arg ? path.resolve(process.cwd(), arg) : path.join(ROOT, 'logo.png');
-  let buf = null;
-  if (fs.existsSync(logoPath)) buf = fs.readFileSync(logoPath);
-  else {
-    try { buf = await download(LOGO_URL, logoPath); } catch (e) { console.log('Logo download failed: ' + e.message); }
-  }
-  let usedLogo = false;
-  for (const size of [192, 512]) {
-    const out = path.join(ROOT, 'icon-' + size + '.png');
-    if (buf) {
-      try { await logoIcon(buf, size, out); usedLogo = true; continue; } catch (e) { console.log('Logo unreadable: ' + e.message); buf = null; }
-    }
-    await wIcon(size, out);
-  }
-  console.log(usedLogo ? 'Icons written from the L-Tech logo.' : 'Plain "W" icons written (no logo available).');
-  if (!usedLogo) console.log('NOTE: Calvin, please drop logo.png into the waypoint folder and run `node tools/make-icons.js logo.png`.');
+  const src = path.resolve(process.argv[2] || path.join(ROOT, 'logo.png'));
+  const buf = fs.readFileSync(src);
+  // 512 masters are built directly from the source; the 192 is a downscale of the 512 (Lanczos).
+  const n512 = await build(buf, 512, NORMAL, path.join(ROOT, 'icon-512.png'));
+  const m512 = await build(buf, 512, MASKABLE, path.join(ROOT, 'icon-512-maskable.png'));
+  await sharp(path.join(ROOT, 'icon-512.png')).resize(192, 192, { kernel: 'lanczos3' }).png().toFile(path.join(ROOT, 'icon-192.png'));
+  console.log('icon-512', n512);
+  console.log('icon-512-maskable', m512);
+  console.log('icon-192 written. Source:', path.basename(src));
 })();

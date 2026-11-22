@@ -66,14 +66,29 @@
     });
   }
 
-  // Malaysian numbers: strip spaces/dashes/+; leading 0 -> 60.
+  // Digits-only international form. Strips spaces, dashes, brackets, dots and the +, so "+60194347041" and
+  // "+60 11-2618 6640" both work. Malaysian rules: leading 0 -> 60; bare 1xxxxxxxx -> 601xxxxxxxx; "+60 0..." -> "60...".
   function normaliseNumber(n) {
-    let d = String(n == null ? '' : n).replace(/[^\d]/g, '');
+    const raw = String(n == null ? '' : n).trim();
+    let d = raw.replace(/[^\d]/g, '');
     if (!d) return '';
-    if (d.startsWith('0')) d = '60' + d.slice(1);
-    else if (d.startsWith('1') && !d.startsWith('60')) d = '60' + d; // 123456789 -> 60123456789
+    if (d.startsWith('00')) d = d.slice(2); // 0060... international prefix
+    if (d.startsWith('600')) d = '60' + d.slice(3); // "+60 012-..." (trunk 0 kept by mistake)
+    else if (d.startsWith('0')) d = '60' + d.slice(1);
+    else if (d.startsWith('1') && !raw.startsWith('+')) d = '60' + d; // 123456789 -> 60123456789
     return d;
   }
+
+  // The compact "+60..." form the place form saves. Applied when a stored number is READ (display, form, link);
+  // stored values are never rewritten in bulk.
+  function compactNumber(n) {
+    const d = normaliseNumber(n);
+    return d ? '+' + d : '';
+  }
+
+  // Place type as shown to the user. The stored value stays "factory" (saved places, dwell defaults and exports key on it).
+  const TYPE_LABELS = { factory: 'customer factory' };
+  function typeLabel(t) { return TYPE_LABELS[t] || String(t == null ? '' : t); }
 
   // Returns the wa.me link, or null when there is no number (caller copies text to clipboard).
   function waLink(number, text) {
@@ -82,5 +97,5 @@
     return 'https://wa.me/' + n + '?text=' + encodeURIComponent(text);
   }
 
-  return { DEFAULT_TEMPLATES, greeting, etaText, fill, langFor, buildMessage, normaliseNumber, waLink };
+  return { DEFAULT_TEMPLATES, greeting, etaText, fill, langFor, buildMessage, normaliseNumber, compactNumber, typeLabel, waLink };
 });

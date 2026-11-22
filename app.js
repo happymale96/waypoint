@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '600e6ef8'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = 'e18d1ee2'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -198,7 +198,7 @@
       const q0 = input.value.trim();
       // optional fixed rows (e.g. "Use my location" for the start chip) shown while the box is empty
       const kids = (extras && !q0 ? extras.map((x) => row(x.label, '', () => { sh.close(); x.fn(); })) : [])
-        .concat(localMatches(q0).map((p) => row(p.name, p.type + (p.address ? ' · ' + p.address : ''), () => choose(p))));
+        .concat(localMatches(q0).map((p) => row(p.name, Messages.typeLabel(p.type) + (p.address ? ' · ' + p.address : ''), () => choose(p))));
       if (g.state === 'done' && g.results.length) {
         kids.push(h('div', { class: 'divider' }, 'Google'));
         g.results.forEach((r) => kids.push(row(r.name, r.address, async () => {
@@ -263,7 +263,7 @@
     let loc = null; // {lat, lng, accuracy|null}
     const name = h('input', { id: 'manualName', value: prefill || '', placeholder: 'Place name', autocomplete: 'off' });
     const addr = h('input', { id: 'manualAddr', placeholder: 'Optional - shown only, never looked up', autocomplete: 'off' });
-    const type = h('select', { id: 'manualType', onchange: () => { salBox.hidden = type.value === 'supplier'; } }, TYPES.map((t) => h('option', { value: t, selected: t === 'other' }, t)));
+    const type = h('select', { id: 'manualType', onchange: () => { salBox.hidden = type.value === 'supplier'; } }, TYPES.map((t) => h('option', { value: t, selected: t === 'other' }, Messages.typeLabel(t))));
     const sal = h('select', { id: 'manualSal' }, ['Encik', 'Puan', 'Cik'].map((t) => h('option', { value: t }, t)));
     const lang = h('select', { id: 'manualLang' }, [['default', 'Default (' + S.settings.defaultLang + ')'], ['ms', 'Bahasa Malaysia'], ['en', 'English']].map(([val, lab]) => h('option', { value: val }, lab)));
     const salBox = h('div', null, h('label', { class: 'field' }, 'Salutation'), sal, h('label', { class: 'field' }, 'Message language'), lang);
@@ -1492,9 +1492,9 @@
       const items = Object.values(S.places).filter((p) => !q || (p.name + ' ' + p.address).toLowerCase().includes(q)).sort(byName);
       const none = Object.keys(S.places).length ? 'No places match.' : 'No places yet.';
       list.replaceChildren(...(items.length ? items.map((p) => h('div', { class: 'card', onclick: () => openPlaceEditor(p) },
-        h('div', { class: 'row spread' }, h('div', { class: 'title' }, p.name), h('span', { class: 'chip' }, p.type)),
+        h('div', { class: 'row spread' }, h('div', { class: 'title' }, p.name), h('span', { class: 'chip' }, Messages.typeLabel(p.type))),
         h('div', { class: 'muted' }, p.address || (p.lat.toFixed(4) + ', ' + p.lng.toFixed(4))),
-        h('div', { class: 'muted' }, 'Dwell ' + p.dwellMin + ' min' + (p.whatsapp ? ' · WA ' + p.whatsapp : '') + ((p.closedWindows || []).length ? ' · closed ' + p.closedWindows.map((w) => (daysLabel(w.days) ? daysLabel(w.days) + ' ' : '') + w.from + '–' + w.to).join(', ') : '')))) : [h('div', { class: 'empty card' }, none)]));
+        h('div', { class: 'muted' }, 'Dwell ' + p.dwellMin + ' min' + (p.whatsapp ? ' · WA ' + Messages.compactNumber(p.whatsapp) : '') + ((p.closedWindows || []).length ? ' · closed ' + p.closedWindows.map((w) => (daysLabel(w.days) ? daysLabel(w.days) + ' ' : '') + w.from + '–' + w.to).join(', ') : '')))) : [h('div', { class: 'empty card' }, none)]));
     }
     v.append(h('div', { class: 'row' }, h('div', { class: 'grow' }, input), h('button', { class: 'primary', onclick: () => openPlacePicker((p) => openPlaceEditor(p), 'Add place') }, '+ Add')), list);
     drawList();
@@ -1506,8 +1506,8 @@
     const name = h('input', { value: p.name });
     const addr = h('input', { value: p.address });
     const dwell = h('input', { type: 'number', inputmode: 'numeric', min: '0', value: String(p.dwellMin) });
-    const type = h('select', { onchange: (e) => { dwell.value = String(S.settings.dwellDefaults[e.target.value] != null ? S.settings.dwellDefaults[e.target.value] : 10); syncType(); } }, TYPES.map((t) => h('option', { value: t, selected: p.type === t }, t)));
-    const wa = h('input', { type: 'tel', inputmode: 'tel', value: p.whatsapp || '', placeholder: '012-345 6789' });
+    const type = h('select', { onchange: (e) => { dwell.value = String(S.settings.dwellDefaults[e.target.value] != null ? S.settings.dwellDefaults[e.target.value] : 10); syncType(); } }, TYPES.map((t) => h('option', { value: t, selected: p.type === t }, Messages.typeLabel(t))));
+    const wa = h('input', { type: 'tel', inputmode: 'tel', value: Messages.compactNumber(p.whatsapp), placeholder: '+60123456789' });
     const sal = h('select', null, ['Encik', 'Puan', 'Cik'].map((t) => h('option', { value: t, selected: (p.salutation || 'Encik') === t }, t)));
     const lang = h('select', null, [['default', 'Default (' + S.settings.defaultLang + ')'], ['ms', 'Bahasa Malaysia'], ['en', 'English']].map(([val, lab]) => h('option', { value: val, selected: (p.lang || 'default') === val }, lab)));
     // suppliers are collected from, never messaged: hide salutation + language for them (WhatsApp stays)
@@ -1567,7 +1567,7 @@
         h('button', { onclick: sh.close }, 'Cancel'),
         h('button', { class: 'primary', onclick: async () => {
           if (!name.value.trim()) { toast('Name is required'); return; }
-          Object.assign(p, { name: name.value.trim(), address: addr.value.trim(), type: type.value, dwellMin: Number(dwell.value) || 0, closedWindows: w.filter((x) => x.from && x.to && x.days.length), whatsapp: wa.value.trim(), salutation: sal.value, lang: lang.value });
+          Object.assign(p, { name: name.value.trim(), address: addr.value.trim(), type: type.value, dwellMin: Number(dwell.value) || 0, closedWindows: w.filter((x) => x.from && x.to && x.days.length), whatsapp: Messages.compactNumber(wa.value), salutation: sal.value, lang: lang.value });
           await savePlace(p); sh.close(); render();
         } }, 'Save')));
   }
@@ -1593,7 +1593,7 @@
     const dd = TYPES.map((t) => {
       const inp = h('input', { type: 'number', inputmode: 'numeric', min: '0', value: String(s.dwellDefaults[t]) });
       inp.addEventListener('change', () => { s.dwellDefaults[t] = Number(inp.value) || 0; saveSettings(); });
-      return h('div', { class: 'grow' }, h('label', { class: 'field' }, t), inp);
+      return h('div', { class: 'grow' }, h('label', { class: 'field' }, Messages.typeLabel(t)), inp);
     });
     const fileIn = h('input', { type: 'file', accept: 'application/json,.json', hidden: true, onchange: (e) => importJson(e.target.files[0]) });
     v.append(
