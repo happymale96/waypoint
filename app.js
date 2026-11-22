@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '6b25149e'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = 'fc6d268d'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 

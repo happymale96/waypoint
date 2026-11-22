@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /* Verifies the app icons against the pre-rendered icon pack.
- *   node tools/verify-icons.js <folder containing the unzipped pack and its SHA256SUMS.txt>
+ *   node tools/verify-icons.js [folder containing the unzipped pack and its SHA256SUMS.txt]
+ * Without the pack folder the SHA-256-against-pack check is skipped (the derived-file and structural checks still run).
  * Exits non-zero unless:
  *   - every icon file referenced by manifest.json and index.html exists
  *   - each PNG's IHDR width/height match its declared size (manifest "sizes", <link sizes>, or the size in the name)
@@ -17,8 +18,8 @@ let failures = 0;
 const ok = (c, m) => { if (c) console.log('  ok   ' + m); else { failures++; console.log('  FAIL ' + m); } };
 const sha = (f) => crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');
 
-if (!packDir || !fs.existsSync(path.join(packDir, 'SHA256SUMS.txt'))) {
-  console.error('usage: node tools/verify-icons.js <icon pack folder containing SHA256SUMS.txt>');
+if (packDir && !fs.existsSync(path.join(packDir, 'SHA256SUMS.txt'))) {
+  console.error('no SHA256SUMS.txt in ' + packDir);
   process.exit(2);
 }
 
@@ -55,9 +56,9 @@ refs.forEach((px, f) => {
   ok(sz && want && sz.w === want && sz.h === want, f + ' is ' + (sz ? sz.w + 'x' + sz.h : 'not a PNG') + ', declared ' + want + 'x' + want);
 });
 
-console.log('SHA-256 against pack SHA256SUMS.txt');
+console.log('SHA-256 against pack SHA256SUMS.txt' + (packDir ? '' : ' (skipped: no pack folder given)'));
 const sums = new Map();
-fs.readFileSync(path.join(packDir, 'SHA256SUMS.txt'), 'utf8').split(/\r?\n/).forEach((l) => {
+if (packDir) fs.readFileSync(path.join(packDir, 'SHA256SUMS.txt'), 'utf8').split(/\r?\n/).forEach((l) => {
   const m = /^([0-9a-f]{64})\s+\*?(.+)$/i.exec(l.trim());
   if (m) sums.set(m[2].trim(), m[1].toLowerCase());
 });
@@ -69,11 +70,22 @@ const MAP = {
   'favicon.svg': 'favicon.svg', 'icon-maskable.svg': 'icon-maskable.svg', 'icon-rounded.svg': 'icon-rounded.svg',
   'symbol-on-light.svg': 'symbol-on-light.svg', 'symbol-on-dark.svg': 'symbol-on-dark.svg',
 };
-Object.entries(MAP).forEach(([repoFile, packFile]) => {
+if (packDir) Object.entries(MAP).forEach(([repoFile, packFile]) => {
   const want = sums.get(packFile);
   const p = path.join(ROOT, repoFile);
   ok(!!want && fs.existsSync(p) && sha(p) === want, repoFile + ' matches pack ' + packFile);
 });
+
+console.log('derived header symbol');
+{
+  // symbol-header-onlight.svg = official symbol-on-light.svg with ONLY the light lobe fill (#aec0ce) changed to #ffffff
+  const a = path.join(ROOT, 'symbol-on-light.svg'), b = path.join(ROOT, 'symbol-header-onlight.svg');
+  ok(fs.existsSync(b), 'symbol-header-onlight.svg exists');
+  if (fs.existsSync(a) && fs.existsSync(b)) {
+    const want = fs.readFileSync(a, 'utf8').replace('fill: #aec0ce;', 'fill: #ffffff;');
+    ok(fs.readFileSync(b, 'utf8') === want, 'symbol-header-onlight.svg differs from symbol-on-light.svg only by the light lobe fill (#ffffff)');
+  }
+}
 
 console.log('manifest purposes');
 ['any', 'maskable'].forEach((purpose) => [192, 512].forEach((px) => {
