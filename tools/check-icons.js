@@ -15,7 +15,7 @@ function pngSize(f) {
   return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) };
 }
 
-const EXPECT = [['icon-192.png', 192, 'any'], ['icon-512.png', 512, 'any'], ['icon-512-maskable.png', 512, 'maskable']];
+const EXPECT = [['icon-192.png', 192, 'any'], ['icon-512.png', 512, 'any'], ['maskable-192.png', 192, 'maskable'], ['icon-512-maskable.png', 512, 'maskable']];
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
 const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
 const sw = fs.readFileSync(path.join(ROOT, 'sw.js'), 'utf8');
@@ -28,9 +28,9 @@ EXPECT.forEach(([f, px, purpose]) => {
   ok(entry && entry.sizes === px + 'x' + px && String(entry.purpose).split(' ').includes(purpose), 'manifest references ' + f + ' as ' + px + 'x' + px + ' "' + purpose + '"');
   ok(sw.includes("'" + f + "'"), 'service worker precaches ' + f);
 });
-ok(/rel="icon" href="icon-192\.png"/.test(html), 'favicon uses icon-192.png');
-ok(/rel="apple-touch-icon" href="icon-192\.png"/.test(html), 'apple-touch-icon uses icon-192.png');
-ok(/<header class="topbar"><img src="icon-192\.png"/.test(html), 'header thumbnail uses icon-192.png');
+ok(/rel="icon" href="favicon\.svg"/.test(html) && /rel="icon" href="favicon-48\.png"/.test(html), 'favicons use favicon.svg / favicon-48.png');
+ok(/rel="apple-touch-icon" href="apple-touch-icon-180\.png"/.test(html), 'apple-touch-icon uses apple-touch-icon-180.png');
+ok(/<header class="topbar"><picture>.*symbol-on-dark\.svg/.test(html), 'header uses the symbol-only SVG');
 
 (async () => {
   // maskable safe zone: every non-background pixel inside the central 80% square (and the inscribed 80% circle)

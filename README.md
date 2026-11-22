@@ -16,7 +16,7 @@ Live: https://happymale96.github.io/waypoint/
 | `daylog.js` | End-of-day record + `summarise()` (pure: km, hours, collected/delivered, carry-forward, CSV / WhatsApp text, history). One record per device-local date (a plan run keeps its depart date past midnight); End day closes the open day and never creates an empty record; activity on a closed date merges into it. One-time repair on load (`runRepairOnce`, flag `meta:daylogRepair`, backup `backup:daylogs-repair-1`). Export/Import JSON carry `dayLog` + `dayHistory` |
 | `geo.js` | Pure location helpers: coordinate parsing (manual place entry), the geolocation fix rules, place-record builders, pin move / undo |
 | `sw.js`, `manifest.json`, `icon-*.png` | PWA shell |
-| `tools/make-icons.js` | Builds the 192/512 maskable icons (`npm install` in `tools/` first) |
+| `tools/verify-icons.js` | `node tools/verify-icons.js <icon-pack folder>`: checks icon references, PNG sizes and the pack's SHA-256s. The icon PNGs/SVGs are a pre-rendered pack from the official vector logo; never regenerate or resize them |
 | `tools/stamp-sw.js` | Writes the build stamp into `sw.js` and `app.js` — **run before every commit** (see below) |
 | `test/*.test.js` | `TZ=Asia/Kuala_Lumpur sh -c "node test/solver.test.js && node test/messages.test.js && node test/daylog.test.js && node test/location.test.js && node test/route.test.js && node test/geo.test.js && node test/endday.test.js && node test/changes.test.js && node tools/check-icons.js"` (day keys are the device's local date) |
 
