@@ -421,19 +421,37 @@
       const v = best.m[a][b];
       return (v == null || !isFinite(v) || v < 0) ? BIG : v;
     };
+    // Fuel stop (s.fuel): not a model point. Its legs come from model.fuelT, a table keyed by rounded coordinates:
+    //   {lat, lng, pid2key:{placeId:key}, ll:{key:{lat,lng}}, slices:[{at, to:{key:sec}, from:{key:sec}}]}  (to = point -> fuel)
+    // pos / pi === FUEL means "at / going to the fuel station". Without a table the stop is left untouched.
+    const FUEL = -1, fz = m.fuelT || null;
+    const ck = (p) => Number(p.lat).toFixed(5) + ',' + Number(p.lng).toFixed(5);
+    const keyOfIdx = (i) => (i === 0 ? ck(m.start) : i === k + 1 ? ck(m.end) : (fz && fz.pid2key ? fz.pid2key[m.stopIds[i - 1]] : null));
+    const fuelLeg = (a, b, ms) => {
+      if (a === b) return 0;
+      let best = null, bd = Infinity;
+      fz.slices.forEach((s) => { const d = Math.abs(s.at - ms); if (d < bd) { bd = d; best = s; } });
+      const other = a === FUEL ? b : a, key = keyOfIdx(other);
+      const v = best && key != null ? (a === FUEL ? best.from : best.to)[key] : null;
+      if (v != null && isFinite(v) && v >= 0) return v;
+      const ll = key != null && fz.ll ? fz.ll[key] : null; // no table cell: straight line at 35 km/h x 1.4
+      return ll ? Math.round(distanceM(ll, fz) / 1000 * 1.4 / 35 * 3600) : BIG;
+    };
+    const legAny = (a, b, ms) => (a === FUEL || b === FUEL ? fuelLeg(a, b, ms) : leg(a, b, ms));
     let pos = 0; // point index 0 = start. A stop that is not in the model (e.g. done before a re-solve) = the model's start.
     if (fromStopIndex >= 0 && plan.stops[fromStopIndex]) {
-      const p = pidx(plan.stops[fromStopIndex].placeId);
-      pos = p == null ? 0 : p;
+      const fs = plan.stops[fromStopIndex];
+      if (fs.fuel && fz) pos = FUEL;
+      else { const p = pidx(fs.placeId); pos = p == null ? 0 : p; }
     }
     const ov = origin && origin.durationToNextSec != null && isFinite(origin.durationToNextSec) ? Math.max(0, Number(origin.durationToNextSec)) : null;
     let firstLeft = true;
     let t = nowMs;
     const stops = plan.stops.map((s) => {
       if (s.status === 'done' || s.status === 'skipped') return Object.assign({}, s);
-      const pi = pidx(s.placeId);
+      const pi = s.fuel ? (fz ? FUEL : null) : pidx(s.placeId);
       if (pi == null) return Object.assign({}, s);
-      const legSec = firstLeft && ov != null ? ov : leg(pos, pi, t);
+      const legSec = firstLeft && ov != null ? ov : legAny(pos, pi, t);
       firstLeft = false;
       const arrive0 = t + legSec * 1000;
       let arrive = arrive0;
@@ -451,7 +469,7 @@
       return out;
     });
     // every stop done/skipped: the live origin (a fix + one routing request) targets the end point instead
-    const endMs = t + (firstLeft && ov != null ? ov : leg(pos, k + 1, t)) * 1000;
+    const endMs = t + (firstLeft && ov != null ? ov : legAny(pos, k + 1, t)) * 1000;
     const out = Object.assign({}, plan, { stops, endArrival: Math.round(endMs), totalSec: Math.round((endMs - m.t0ms) / 1000) });
     if (m.beforeMs) { // window lateness follows the new times (stops still ahead only)
       const violations = []; let lateMs = 0;

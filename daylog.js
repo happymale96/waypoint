@@ -125,6 +125,14 @@
     snapPlace(day, info.places, info.stopId);
     return info.actions.map((a) => appendEvent(day, { t: info.nowIso, type: 'done', jobId: a.jobId || null, stopId: info.stopId, kind: a.kind, item: a.item || '' }));
   }
+  // The fuel stop: recorded as a stop with its done time (kind 'fuel', no job). It is never a job: job counts ignore it and
+  // closeDay never carries it forward. info: {nowIso, stopId, name, places{}}
+  const FUEL_KIND = 'fuel';
+  function recordFuel(day, info) {
+    snapPlace(day, info.places, info.stopId);
+    return appendEvent(day, { t: info.nowIso, type: 'done', jobId: null, stopId: info.stopId, kind: FUEL_KIND, item: info.name || '' });
+  }
+  const isFuelGroup = (g) => g.events.some((e) => e.kind === FUEL_KIND);
   function recordUndo(day, info) { // info: {nowIso, stopId}
     return appendEvent(day, { t: info.nowIso, type: 'undo', stopId: info.stopId });
   }
@@ -279,6 +287,11 @@
     // ---- distance / drive time over: day start -> stops in the order DONE was tapped ----
     const doneSeq = [];
     groups.forEach((g) => { if (doneSeq.indexOf(g.stopId) < 0) doneSeq.push(g.stopId); });
+    // the fuel stop is driven to (so it stays in the km chain) but is neither a job nor a planned stop
+    const fuelIds = new Set(groups.filter(isFuelGroup).map((g) => g.stopId));
+    const fuelGroup = groups.filter(isFuelGroup).pop() || null;
+    const fuel = fuelGroup ? { place: (fuelGroup.events[0] && fuelGroup.events[0].item) || nameOf(fuelGroup.stopId), t: fuelGroup.tMs } : null;
+    const visitSeq = doneSeq.filter((id) => !fuelIds.has(id));
     // The chain starts at the plan's start point only if that plan departed BEFORE the first visited stop; otherwise it
     // starts at the first visited stop (a plan that departed after the first DONE never drove a leg from its start).
     const pts = [];
@@ -307,7 +320,7 @@
 
     // ---- plan vs actual ----
     const order = snap ? snap.stopOrder : [];
-    const ranks = doneSeq.map((id) => order.indexOf(id));
+    const ranks = visitSeq.map((id) => order.indexOf(id));
     const inPlan = ranks.filter((r) => r >= 0);
     const outOfOrder = ranks.length - lis(inPlan);
     const firstPlanIdx = day.events.findIndex((e) => e.type === 'plan' || e.type === 'replan');
@@ -316,13 +329,13 @@
     return {
       date: day.date, driverId: day.driverId, closed: !!day.closed, closedAt: ms(day.closedAt != null ? day.closedAt : day.endedAt),
       jobsDone: rows.filter((r) => r.complete).length, jobsTotal: rows.length,
-      stopsVisited: doneSeq.length, doneSeq,
+      stopsVisited: visitSeq.length, doneSeq, fuel,
       km, driveMin, hoursOutMin, atStopsMin, startedAt, finishedAt, arrivedEndAt: arrivedAt,
       startedSource: ms(day.edits.startedAt) != null ? 'edited' : snap ? 'first plan' : '—',
       collected, delivered, errands,
       stillWithYou: rows.filter((r) => r.withYou),
       notDone: rows.filter((r) => !r.complete),
-      plan: { plannedKm: snap ? snap.plannedKm : null, plannedDriveMin: snap ? snap.plannedDriveMin : null, replans, outOfOrder, stopsDone: doneSeq.length, stopsPlanned: order.length },
+      plan: { plannedKm: snap ? snap.plannedKm : null, plannedDriveMin: snap ? snap.plannedDriveMin : null, replans, outOfOrder, stopsDone: visitSeq.length, stopsPlanned: order.length },
       rows,
       route: { key, points: pts, needs: enough && pointsOk && (!mOk || !sOk), startDropped: planStartOk && !useStart },
     };
@@ -555,6 +568,7 @@
     L.push('Est. km (road route between stops, not odometer): ' + (sum.km.status === 'ok' ? sum.km.value.toFixed(1) : sum.km.status === 'none' ? '0.0' : 'unavailable'));
     L.push('Hours out: ' + (sum.hoursOutMin == null ? '—' : fmtDur(sum.hoursOutMin)) + (sum.startedAt != null && sum.finishedAt != null ? ' (' + t(sum.startedAt) + '-' + t(sum.finishedAt) + ')' : ''));
     L.push('Drive (est.): ' + fmtDur(sum.driveMin) + ' | At stops/other: ' + fmtDur(sum.atStopsMin));
+    if (sum.fuel) L.push('Fuel: ' + sum.fuel.place + ' ' + t(sum.fuel.t));
     const sec = (title, lines) => { if (lines.length) L.push('', '*' + title + '*', ...lines); };
     sec('Collected', sum.collected.map((c) => '- ' + t(c.t) + ' ' + c.item + ' - ' + c.place));
     sec('Delivered', sum.delivered.map((d) => '- ' + t(d.t) + ' ' + d.item + ' - ' + d.place + (d.urgent ? ' [URGENT]' : '') + (d.late ? ' [LATE]' : '')));
@@ -567,7 +581,7 @@
   return {
     SCHEMA, KEEP_DAYS, REASONS, CSV_HEADER,
     dateKey, fmtDate, fmtTime, fmtDur, fmtKm, addDaysKey, dayStartMs, ageDays,
-    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, arrivedEnd, doneGroups, hasActiveDone,
+    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordFuel, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, arrivedEnd, doneGroups, hasActiveDone,
     ptKey, legKey, seqKey, legFromMatrices, captureLeg, plannedFromMatrices,
     summarise, closeDay, reopenDay, refreshTotals, recordFor, activityKey, hasActivity, isEmptyRecord, openDayKey, endDay,
     REPAIR_VERSION, repairHistory, runRepairOnce, exportPayload, importPayload, pruneDates, weekRange, weekTotals, historyKeys, toCSV, csvCell, toWhatsApp,

@@ -18,9 +18,11 @@
   }
 
   // ---------- Google Places (New) ----------
-  async function searchGoogle(query, key, onCall) {
+  // opts.bias = {lat, lng, radius (m)}: bias the search to that circle (default: Klang Valley, 50 km).
+  async function searchGoogle(query, key, onCall, opts) {
     if (!key) throw new ProviderError('Google Places', 'API key missing — add it in Settings.');
     if (!query || !query.trim()) return [];
+    const bias = Object.assign({ lat: 3.1, lng: 101.6, radius: 50000 }, (opts && opts.bias) || {});
     let res;
     try {
       res = await fetch('https://places.googleapis.com/v1/places:searchText', {
@@ -28,12 +30,12 @@
         headers: {
           'Content-Type': 'application/json',
           'X-Goog-Api-Key': key,
-          'X-Goog-FieldMask': 'places.displayName,places.formattedAddress,places.location',
+          'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location',
         },
         body: JSON.stringify({
           textQuery: query,
           regionCode: 'MY',
-          locationBias: { circle: { center: { latitude: 3.1, longitude: 101.6 }, radius: 50000 } },
+          locationBias: { circle: { center: { latitude: bias.lat, longitude: bias.lng }, radius: bias.radius } },
         }),
       });
     } catch (e) {
@@ -47,6 +49,7 @@
       throw new ProviderError('Google Places', msg);
     }
     return (body.places || []).map((p) => ({
+      id: p.id || null,
       name: (p.displayName && p.displayName.text) || '',
       address: p.formattedAddress || '',
       lat: p.location && p.location.latitude,

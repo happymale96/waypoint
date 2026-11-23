@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '57b4f817'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '9de7266a'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -34,6 +34,7 @@
     tab: 'plan', places: {}, jobs: [], settings: null,
     startSel: 'gps', endSel: 'home', departTime: '',
     plan: null, busy: false, days: {}, loc: { lastAt: null, origin: null, busy: false, reason: null }, timesFrom: null,
+    fuelStations: [], // permanent station memory (see FUEL STOP below); in Export / Import, never shown in the Places tab
   };
 
   function defaultSettings() {
@@ -42,6 +43,7 @@
       templates: Object.assign({}, Messages.DEFAULT_TEMPLATES),
       etaPaddingMin: 15, dwellDefaults: Object.assign({}, DEFAULT_DWELL),
       placesCallsToday: { date: todayStr(), count: 0 }, nav: 'waze', seeded: false, driverName: 'Calvin',
+      fuelBrand: 'Caltex', fuelDwellMin: 7, fuelMaxSearches: 50,
     };
   }
   const saveSettings = () => WPStore.set('settings', 'main', S.settings);
@@ -54,6 +56,8 @@
     s.dwellDefaults = Object.assign({}, DEFAULT_DWELL, stored.dwellDefaults || {});
     s.templates = Object.assign({}, Messages.DEFAULT_TEMPLATES, stored.templates || {});
     S.settings = s;
+    const fm = await WPStore.get('meta', 'fuelStations');
+    S.fuelStations = fm && Array.isArray(fm.list) ? fm.list : [];
     (await WPStore.list('places')).forEach((p) => { S.places[p.id] = p; });
     if (!s.seeded && !Object.keys(S.places).length) {
       await savePlace(newPlace({ id: 'home', name: 'Home (Bloomsvale)', address: 'Bloomsvale', lat: 3.0757673, lng: 101.6609445, type: 'home' }));
@@ -307,7 +311,7 @@
   }
 
   // ---------- job helpers ----------
-  const pName = (id) => (S.places[id] ? S.places[id].name : '(deleted place)');
+  const pName = (id) => (S.places[id] ? S.places[id].name : (S.plan && S.plan.ctx.places[id]) ? S.plan.ctx.places[id].name : '(deleted place)');
   const openStops = new Set(); // place ids of expanded Route cards (in memory only, not persisted)
   // DISPLAY-only: drop a trailing company suffix (Sdn Bhd / Sdn. Bhd. / S/B / Bhd, any case, dots optional). Stored names are untouched.
   const SUFFIX_RE = /[\s,]+(?:sdn\.?\s*bhd\.?|s\/b\.?|bhd\.?)\s*$/i;
@@ -577,13 +581,17 @@
       const got = await Providers.getMatrices(points, input.departAtISO, s.tomtomKey, { force: replan });
       const prevNoDetour = S.plan ? S.plan.noDetour : false;
       const prevPlan = replan ? curPlan() : null; // a replan keeps the stops already done on top
+      const prevCtxPlaces = replan && S.plan ? S.plan.ctx.places : null; // (the fuel station lives there)
       // the run's day = local date it departed; a replan stays in its run's day (even past midnight)
       const dayKey = replan && planDayKey() ? planDayKey() : DL.dateKey(departAt.getTime());
       const fetchedAt = new Date().toISOString();
       got.matrices.forEach((x) => { if (!x.fetchedAt) x.fetchedAt = fetchedAt; });
       S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices, dayKey }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial } };
       solveFresh();
-      if (prevPlan) S.plan.result.plans = S.plan.result.plans.map((p) => compose(prevPlan, p));
+      if (prevPlan) {
+        S.plan.result.plans = S.plan.result.plans.map((p) => compose(prevPlan, p));
+        await keepFuelAfterReplan(prevPlan, prevCtxPlaces, points); // silent: the chosen station only, no Places calls
+      }
       banner('Travel times: TomTom live traffic — ' + (got.fromCache ? 'from session cache (0 calls)' : got.calls + ' calls') + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
       S.loc.origin = null; S.loc.lastAt = null; S.loc.reason = null;
       logPlan(replan, { start, departAt, places, points, matrices: got.matrices, jobs: Solver.buildStops(jobs, places).jobs });
@@ -606,9 +614,9 @@
   const iso = (ms) => new Date(ms).toISOString();
   const STALE_MS = 30 * 60000; // travel times older than this are re-fetched at a DONE
 
-  function lastDoneIdx(plan) { // stop most recently marked done; -1 = none yet (= the start point)
+  function lastDoneIdx(plan, skipFuel) { // stop most recently marked done; -1 = none yet (= the start point)
     let best = -1, bt = -1;
-    plan.stops.forEach((s, i) => { if (s.status === 'done') { const t = Date.parse(s.doneAt) || 0; if (t >= bt) { bt = t; best = i; } } });
+    plan.stops.forEach((s, i) => { if (s.status === 'done' && !(skipFuel && s.fuel)) { const t = Date.parse(s.doneAt) || 0; if (t >= bt) { bt = t; best = i; } } });
     return best;
   }
 
@@ -635,7 +643,7 @@
   function resolveRemaining(opts) {
     opts = opts || {}; // opts.shiftMs: start the re-solve later/earlier (live-location offset)
     const P = S.plan, plan = curPlan(), m = plan.model;
-    const from = lastDoneIdx(plan);
+    const from = lastDoneIdx(plan, true); // the fuel stop has no row in the matrices: anchor at the last real stop
     const live = new Set(plan.stops.filter((s) => !s.status).map((s) => s.placeId));
     const inModel = new Set(m.stopIds);
     let aIdx = 0, anchor = { lat: m.start.lat, lng: m.start.lng }; // where we are: last done stop, else the start
@@ -664,6 +672,7 @@
     P.result = { plans: r.res.plans.map((p) => compose(old, p)), error: null, stats: r.res.stats, stopIds: r.res.stopIds };
     P.idx = 0; P.alt = null; P.shiftMs = 0;
     P.ctx = Object.assign({}, P.ctx, { start: r.anchor, jobs: r.jobs, matrices: r.matrices, departAtISO: r.departAtISO });
+    P.result.plans = P.result.plans.map((p) => carryFuel(old, p)); // the fuel stop (if any) survives a re-solve from the cache
   }
 
   async function reSolveFromCache() { // No-detour toggle
@@ -798,7 +807,7 @@
 
   // "Avoid lunch": re-solve what is left with closed windows respected (arrival inside a window waits it out)
   function computeAvoidLunch() {
-    const P = S.plan, cur = curPlan();
+    const P = S.plan, cur = stripFuel(curPlan()); // compare like with like: the alternative is solved without the fuel stop
     const from0 = lastDoneIdx(cur), at0 = from0 >= 0 ? Date.now() : Math.max(Date.now(), Date.parse(P.ctx.departAtISO));
     const org = originFor(cur, at0);
     const base = Solver.retime(cur, from0, iso(at0), org); // current plan, timed from the same place and moment (live origin included)
@@ -912,6 +921,7 @@
     } catch (e) { /* never break planning */ }
   }
 
+  const coordPlace = (id) => S.places[id] || (S.plan && S.plan.ctx.places[id]) || null;
   function coordOf(id, day) { const p = S.places[id] || (S.plan && S.plan.ctx.places[id]) || day.places[id]; return p ? { lat: p.lat, lng: p.lng } : null; }
   function logDone(stop, nowIso) {
     try {
@@ -920,7 +930,9 @@
       const coord = (id) => coordOf(id, day);
       const prev = lastG ? coord(lastG.stopId) : (day.planSnapshot && day.planSnapshot.start);
       const to = coord(stop.placeId), plan = curPlan();
-      const evs = DL.recordDone(day, { nowIso, stopId: stop.placeId, actions: stop.actions, places: S.places });
+      const evs = stop.fuel // the fuel stop is logged as a stop (kind 'fuel'), never as a job action
+        ? [DL.recordFuel(day, { nowIso, stopId: stop.placeId, name: (coordPlace(stop.placeId) || {}).name || '', places: Object.assign({}, S.plan && S.plan.ctx.places, S.places) })]
+        : DL.recordDone(day, { nowIso, stopId: stop.placeId, actions: stop.actions, places: S.places });
       if (plan && prev && to) { // keep the leg just driven if the plan's own routing matrices cover that exact pair
         const m = plan.model;
         const pts = [m.start].concat(m.stopIds.map(coord), [m.end]);
@@ -1084,6 +1096,7 @@
       const delivered = sec('Delivered', 'deliver', s.delivered.map((d) => line(h('span', null, d.item || '(item)', ' - ', d.place), hm(d.t),
         [d.urgent ? urgentChip.cloneNode(true) : null, d.late ? lateChip.cloneNode(true) : null].filter(Boolean))), 'Nothing delivered');
       const errands = sec('Errands done', 'errand', s.errands.map((e) => line(h('span', null, e.item, ' - ', e.place), hm(e.t))), 'No errands');
+      const fuelLine = s.fuel ? h('div', { class: 'card sum-sec fuel', id: 'sumFuel' }, line('Fuel: ' + s.fuel.place + ' ' + hm(s.fuel.t))) : null;
       const withYou = sec('Still with you', 'inhand', s.stillWithYou.map((r) => line(h('span', null, r.item || '(item)', ' → ', r.to), null, r.urgent ? [urgentChip.cloneNode(true)] : null)), 'Nothing in the van');
 
       const notDone = sec('Not done', 'notdone', s.notDone.map((r) => {
@@ -1123,7 +1136,7 @@
         } }, 'Close day');
       sh.body.replaceChildren(
         h('div', { class: 'muted sum-sub' }, day.driverId + ' · ' + (day.closed ? 'closed ' + (day.endedAt ? DL.fmtDate(DL.dateKey(Date.parse(day.endedAt))) + ' ' + hm(Date.parse(day.endedAt)) : '') : 'open') + (ro() ? ' · read-only' : '')),
-        tiles, timeRow, collected, delivered, errands, withYou, notDone, planVs,
+        tiles, timeRow, collected, delivered, errands, fuelLine, withYou, notDone, planVs,
         h('div', { class: 'sum-actions' }, h('div', { class: 'row' }, copyBtn, csvBtn), h('div', { class: 'row' }, main, h('button', { onclick: sh.close }, 'Back'))));
     }
     draw();
@@ -1236,12 +1249,16 @@
         h('a', { class: 'btn primary grow', href: gmapsUrl(wps[half - 1], ctx.end, wps.slice(half)), target: '_blank', rel: 'noopener' }, 'Google Maps — Leg 2'));
     }
     navRow.append(h('button', { class: 'grow', onclick: () => replanFromHere() }, 'Replan from here'));
+    const fuelNow = plan.stops.find((s) => s.fuel);
+    if (!(fuelNow && fuelNow.status === 'done')) { // one fuel stop per plan; once it is done there is nothing to add or change
+      navRow.append(h('button', { class: 'grow', id: 'fuelBtn', onclick: () => fuelTap() }, fuelNow ? 'Change fuel stop' : 'Add fuel stop'));
+    }
     // a CLOSED stop still ahead: offer the closed-windows-respected alternative (re-solved from the cached matrices)
     if (!P.alt && remaining.some((s) => s.closedWarning)) navRow.append(h('button', { class: 'grow', id: 'avoidLunch', onclick: () => { computeAvoidLunch(); render(); } }, 'Avoid lunch'));
     v.append(navRow);
     if (P.alt) v.append(altCard(P));
 
-    if (view.left > 0 && plan.stops.some((s) => s.status === 'skipped')) v.append(h('div', { class: 'prompt' }, 'A stop was skipped. ', h('button', { class: 'small', onclick: () => replanFromHere() }, 'Replan from here')));
+    if (view.left > 0 && plan.stops.some((s) => s.status === 'skipped' && !s.fuel)) v.append(h('div', { class: 'prompt' }, 'A stop was skipped. ', h('button', { class: 'small', onclick: () => replanFromHere() }, 'Replan from here')));
     if (P.prompt) {
       const stop = plan.stops.find((s) => s.placeId === P.prompt.placeId);
       const place = S.places[P.prompt.placeId];
@@ -1318,19 +1335,21 @@
     const P = S.plan;
     const place = S.places[stop.placeId] || P.ctx.places[stop.placeId];
     const st = stop.status;
+    const tag = stop.fuel ? 'Fuel · ' : '';
     if (st === 'skipped') { // greyed, no ETA (it is out of the re-time chain), Undo skip puts it back
       return h('div', { class: 'card stop skipped compact' }, h('div', { class: 'row spread' },
-        h('div', { class: 'title' }, (i + 1) + '. ' + dName(place.name)),
+        h('div', { class: 'title' }, (i + 1) + '. ' + tag + dName(place.name)),
         h('span', { class: 'chip' }, 'Skipped'),
         h('button', { class: 'small undo', 'aria-label': 'Undo skip', onclick: () => undoSkip(stop, i) }, 'Undo skip')));
     }
     if (st === 'done') { // done stops collapse to one line: tick, name, actual done time
       const undoable = i === lastDoneIdx(curPlan());
       return h('div', { class: 'card stop done compact' }, h('div', { class: 'row spread' },
-        h('div', { class: 'title' }, '✓ ' + (i + 1) + '. ' + dName(place.name)),
+        h('div', { class: 'title' }, '✓ ' + (i + 1) + '. ' + tag + dName(place.name)),
         h('div', { class: 'muted times' }, 'done ' + fmt(Date.parse(stop.doneAt))),
         undoable ? h('button', { class: 'small undo', 'aria-label': 'Undo done', onclick: () => undoDone(stop, i) }, 'Undo') : null));
     }
+    if (stop.fuel) return fuelCard(stop, i, place);
     const hasDelivery = stop.actions.some((a) => a.kind === 'deliver');
     // Actions as boxes (same tokens as the Plan cards): COLLECT "item → customer", DELIVER items, ERRAND.
     const jobOf = (id) => (P.ctx.jobs || []).find((x) => x.id === id) || S.jobs.find((x) => x.id === id);
@@ -1443,7 +1462,7 @@
     P.alt = null;
     P.result.plans = [P.result.plans[P.idx]]; P.idx = 0;
     retimeNow(); // from the last DONE (never from the skipped stop: we did not go there)
-    toast('Skipped — actions stay pending. Undo skip, or replan to bring it back.');
+    toast(ls.stop.fuel ? 'Fuel stop skipped. Undo skip to bring it back.' : 'Skipped — actions stay pending. Undo skip, or replan to bring it back.');
     await savePlan();
     render();
     refreshFromLocation({ force: true });
@@ -1465,6 +1484,314 @@
   async function replanFromHere() {
     if (!pendingJobs().length) { toast('Nothing left to plan.'); return; }
     await doPlan({ replan: true });
+  }
+
+  // ---------- FUEL STOP ----------
+  // "Add fuel stop": the station of the chosen brand, and the place in today's remaining route, that adds the fewest minutes.
+  // The maths lives in fuel.js. The stop is a normal plan stop with stop.fuel = true and placeId FUEL_ID; its place sits in the
+  // plan's ctx.places (never in S.places, so it is not in the Places tab) and its travel times in plan.model.fuelT (see
+  // Solver.retime). Nothing is ever added without the tap on "Add".
+  const FUEL_ID = Fuel.FUEL_ID;
+  const FUEL_RADIUS_M = 3000;
+  let fuelBusy = false;
+  let fuelRun = null; // {key, at, searched}: the last finished search; reused for 10 minutes for the same remaining route
+  let forgetAsk = false;
+  const llKey = (p) => Number(p.lat).toFixed(5) + ',' + Number(p.lng).toFixed(5);
+  const saveStations = () => WPStore.set('meta', 'fuelStations', { list: S.fuelStations });
+  const fuelBrand = () => (S.settings.fuelBrand || '').trim() || 'Caltex';
+  const fuelDwell = () => { const d = Number(S.settings.fuelDwellMin); return isFinite(d) && d >= 0 ? d : 7; };
+  const keyed = (pts) => pts.map((p) => Object.assign({}, p, { key: llKey(p) }));
+  const estimateSec = (a, b) => Math.round(Fuel.haversineKm(a, b) * 1.4 / 35 * 3600); // last resort: 35 km/h x 1.4
+  const stripFuel = (plan) => (plan.stops.some((s) => s.fuel && s.status !== 'done')
+    ? Object.assign({}, plan, { stops: plan.stops.filter((s) => !(s.fuel && s.status !== 'done')) }) : plan);
+  const urgentHere = (stop) => stop.actions.some((a) => {
+    if (a.kind !== 'deliver') return false;
+    const j = S.jobs.find((x) => x.id === a.jobId) || ((S.plan && S.plan.ctx.jobs) || []).find((x) => x.id === a.jobId);
+    return !!(j && j.urgent);
+  });
+  const nearestSlice = (slices, ms, at) => slices.reduce((b, s) => (b == null || Math.abs(at(s) - ms) < Math.abs(at(b) - ms) ? s : b), null);
+
+  // The remaining route for the fuel maths: origin (live fix if fresh, else the last done stop, else the plan origin),
+  // each stop not done / skipped (urgent = an urgent delivery still pending there), the end point. The fuel stop itself is left out.
+  function fuelRouteOf(plan) {
+    const P = S.plan, m = plan.model, now = Date.now();
+    const placeOf = (id) => S.places[id] || P.ctx.places[id];
+    let origin = null;
+    const lo = S.loc.origin;
+    if (lo && Solver.originFresh(lo, now)) origin = { lat: lo.lat, lng: lo.lng, id: 'live', name: 'your location' };
+    if (!origin) {
+      const di = lastDoneIdx(plan), ds = di >= 0 ? plan.stops[di] : null;
+      const pl = ds && (ds.fuel || m.stopIds.indexOf(ds.placeId) >= 0) ? placeOf(ds.placeId) : null;
+      origin = pl ? { lat: pl.lat, lng: pl.lng, id: ds.placeId, name: dName(pl.name) } : { lat: m.start.lat, lng: m.start.lng, id: 'start', name: 'the start' };
+    }
+    const stops = plan.stops.filter((s) => !s.fuel).map((s) => {
+      const pl = placeOf(s.placeId) || {};
+      return { id: s.placeId, name: dName(pl.name || ''), lat: pl.lat, lng: pl.lng, status: s.status, urgent: urgentHere(s) };
+    }).filter((s) => s.lat != null);
+    const e = P.ctx.end;
+    return { origin, stops, end: { lat: e.lat, lng: e.lng, id: 'end', name: dName(e.name || 'the end') } };
+  }
+
+  // seconds between two model points of the plan (nearest time slice), or null when either is not one of its points
+  function planLegSec(plan, a, b, nowMs) {
+    const m = plan.model;
+    if (!m || !m.matrices || !m.matrices.length) return null;
+    const idx = new Map([[llKey(m.start), 0]]);
+    m.stopIds.forEach((id, i) => { const pl = S.places[id] || S.plan.ctx.places[id]; if (pl && !idx.has(llKey(pl))) idx.set(llKey(pl), i + 1); });
+    if (!idx.has(llKey(m.end))) idx.set(llKey(m.end), m.stopIds.length + 1);
+    const ia = idx.get(a.key), ib = idx.get(b.key);
+    if (ia == null || ib == null) return null;
+    const sl = nearestSlice(m.matrices, nowMs, (s) => Date.parse(s.departAt));
+    const v = sl && sl.m[ia] ? sl.m[ia][ib] : null;
+    return v == null || !isFinite(v) ? null : v;
+  }
+  const fuelCellSec = (fz, a, b, nowMs) => { // a or b is the station
+    const other = a.fuel ? b : a, sl = nearestSlice(fz.slices, nowMs, (s) => s.at);
+    const v = sl ? (a.fuel ? sl.from : sl.to)[other.key] : null;
+    return v == null || !isFinite(v) ? null : v;
+  };
+  // travel minutes for Fuel.pickInsertion. t(A,B): the plan's own matrices where both are its points, else the fresh table.
+  function makeTT(plan, nowMs, fzOf, tableGet) {
+    return (a, b) => {
+      if (a.key === b.key) return 0;
+      let sec;
+      if (a.fuel || b.fuel) { const fz = fzOf(a.fuel ? a : b); sec = fz ? fuelCellSec(fz, a, b, nowMs) : null; }
+      else { sec = planLegSec(plan, a, b, nowMs); if (sec == null && tableGet) sec = tableGet(a.key, b.key, nowMs); }
+      return (sec == null ? estimateSec(a, b) : sec) / 60;
+    };
+  }
+  // ONE existing TomTom lookup (+ its cache) over the plan's points, the route's points and the stations
+  async function fuelTable(extra, plan) {
+    const m = plan.model, P = S.plan;
+    const all = [m.start].concat(m.stopIds.map((id) => S.places[id] || P.ctx.places[id]).filter(Boolean), [m.end], extra);
+    const idx = new Map(), points = [];
+    all.forEach((p) => { const k = llKey(p); if (!idx.has(k)) { idx.set(k, points.length); points.push({ lat: p.lat, lng: p.lng }); } });
+    const got = await Providers.getMatrices(points, new Date().toISOString(), S.settings.tomtomKey);
+    return { points, idx, matrices: got.matrices };
+  }
+  const tableGetOf = (t) => (ka, kb, ms) => {
+    const ia = t.idx.get(ka), ib = t.idx.get(kb);
+    if (ia == null || ib == null) return null;
+    const sl = nearestSlice(t.matrices, ms, (s) => Date.parse(s.departAt));
+    const v = sl ? sl.m[ia][ib] : null;
+    return v == null || !isFinite(v) ? null : v;
+  };
+  // the station's times to / from every point of the table, keyed by coordinates (what Solver.retime reads)
+  function makeFuelT(st, table, plan) {
+    const P = S.plan, sIdx = table.idx.get(llKey(st));
+    const ll = {}, pid2key = {};
+    table.points.forEach((p) => { ll[llKey(p)] = { lat: p.lat, lng: p.lng }; });
+    plan.model.stopIds.forEach((id) => { const pl = S.places[id] || P.ctx.places[id]; if (pl) pid2key[id] = llKey(pl); });
+    const slices = table.matrices.map((sl) => {
+      const to = {}, from = {};
+      table.points.forEach((p, i) => {
+        if (i === sIdx) return;
+        const k = llKey(p);
+        if (sl.m[i][sIdx] != null) to[k] = sl.m[i][sIdx];
+        if (sl.m[sIdx][i] != null) from[k] = sl.m[sIdx][i];
+      });
+      return { at: Date.parse(sl.departAt), to, from };
+    });
+    return { lat: st.lat, lng: st.lng, pid2key, ll, slices };
+  }
+  // the plan with the fuel stop put in front of point b (b = the leg's destination; the end point = after the last stop)
+  function withFuel(plan, b, fz, place) {
+    let idx = b && b.role === 'stop' ? plan.stops.findIndex((s) => s.placeId === b.id && !s.status) : -1;
+    if (idx < 0) idx = plan.stops.length;
+    const stop = { placeId: FUEL_ID, fuel: true, arriveAt: 0, departAt: 0, waitSec: 0, actions: [], detour: false, closedWarning: false };
+    const stops = plan.stops.slice(); stops.splice(idx, 0, stop);
+    const m = plan.model;
+    const model = Object.assign({}, m, { fuelT: fz, dwellSec: Object.assign({}, m.dwellSec, { [FUEL_ID]: (place.dwellMin || 0) * 60 }), names: Object.assign({}, m.names, { [FUEL_ID]: place.name }) });
+    return Object.assign({}, plan, { stops, model });
+  }
+  function retimeLocal(plan) { // like retimeNow(), for a plan that is not (yet) the current one
+    const P = S.plan, from = lastDoneIdx(plan), now = Date.now();
+    return Solver.retime(plan, from, iso(from < 0 ? Math.max(now, Date.parse(P.ctx.departAtISO)) : now));
+  }
+  // the already chosen station put back by the same rule (lowest detour over the allowed legs), from its stored times only
+  function insertBestFuel(plan, fz, place) {
+    const route = fuelRouteOf(plan), pts = keyed(Fuel.remainingPoints(route)), legs = Fuel.allowedLegs(route);
+    const st = { placeId: FUEL_ID, name: place.name, lat: place.lat, lng: place.lng, fuel: true, key: llKey(place) };
+    const sorted = Fuel.pickInsertion(legs.map((l) => ({ station: st, a: pts[l.from], b: pts[l.to], legIndex: l.index })), makeTT(plan, Date.now(), () => fz, null));
+    return sorted.length ? withFuel(plan, sorted[0].b, fz, place) : plan;
+  }
+  // after a re-solve from the cache (No detour / Avoid lunch): carry the fuel times and put a pending fuel stop back
+  function carryFuel(old, p) {
+    const fz = old && old.model && old.model.fuelT, place = S.plan.ctx.places[FUEL_ID];
+    if (!fz) return p;
+    let q = Object.assign({}, p, { model: Object.assign({}, p.model, { fuelT: fz }) });
+    if (place && old.stops.some((s) => s.fuel && !s.status)) q = retimeLocal(insertBestFuel(q, fz, place));
+    return q;
+  }
+  // Replan from here: keep the fuel stop, silently re-placed (fresh times for the chosen station only; no Places calls)
+  async function keepFuelAfterReplan(prevPlan, prevPlaces, points) {
+    const P = S.plan, place = prevPlaces && prevPlaces[FUEL_ID], fz0 = prevPlan.model && prevPlan.model.fuelT;
+    if (!place || !fz0) return;
+    P.ctx.places = Object.assign({}, P.ctx.places, { [FUEL_ID]: place });
+    const pending = prevPlan.stops.some((s) => s.fuel && !s.status);
+    let fz = fz0;
+    if (pending && S.settings.tomtomKey) {
+      try {
+        const base = P.result.plans[0], st = { lat: place.lat, lng: place.lng };
+        fz = makeFuelT(st, await fuelTable([st], base), base);
+      } catch (e) { fz = fz0; } // keep the stored times (anything not in them is estimated)
+    }
+    P.result.plans = P.result.plans.map((p) => {
+      const q = Object.assign({}, p, { model: Object.assign({}, p.model, { fuelT: fz }) });
+      return pending ? retimeLocal(insertBestFuel(q, fz, place)) : q;
+    });
+  }
+
+  async function fuelTap() {
+    if (fuelBusy) return;
+    const P = S.plan, plan0 = curPlan();
+    banner(null);
+    if (!P || !plan0) { toast('Make a plan first, then add a fuel stop.'); return; }
+    const s = S.settings, brand = fuelBrand();
+    const base = stripFuel(plan0); // a stop being replaced is not part of the route we plan around
+    const route = fuelRouteOf(base);
+    const pts = keyed(Fuel.remainingPoints(route));
+    const legs = Fuel.allowedLegs(route);
+    if (!legs.length) { banner('No part of the route can take a fuel stop right now.', 'error'); return; }
+    if (!s.tomtomKey) { banner('TomTom API key missing — add it in Settings. (The fuel stop is chosen by travel time.)', 'error'); return; }
+    fuelBusy = true;
+    let cancelled = false;
+    const sh = openSheet(plan0.stops.some((x) => x.fuel) ? 'Change fuel stop' : 'Add fuel stop', () => { cancelled = true; fuelBusy = false; });
+    const status = h('div', { class: 'muted', id: 'fuelStatus', role: 'status' }, 'Starting…');
+    sh.body.append(status, h('div', { class: 'sticky-actions' }, h('button', { onclick: sh.close }, 'Cancel')));
+    const fail = (msg) => { sh.close(); banner(msg, 'error'); };
+    try {
+      // --- 4b: search the whole remaining route (unless a search of this same route finished under 10 minutes ago) ---
+      const samples = Fuel.samplePoints(pts, 4, 50);
+      const maxPerTap = Math.min(50, Math.max(1, Math.round(Number(s.fuelMaxSearches)) || 50));
+      const budget = Fuel.searchBudget(samples.length, maxPerTap, placesCallsToday());
+      const limited = budget < Math.min(samples.length, maxPerTap);
+      const rkey = brand.toLowerCase() + '|' + Fuel.sameRouteKey(pts);
+      const reuse = !!(fuelRun && fuelRun.key === rkey && Date.now() - fuelRun.at < Fuel.REUSE_MS);
+      let searched = reuse ? fuelRun.searched : 0, rememberedOnly = false, failNote = '';
+      if (!reuse) {
+        if (!s.googleKey || navigator.onLine === false || budget < 1) rememberedOnly = true;
+        else {
+          const targets = Fuel.evenIndices(samples.length, budget).map((i) => samples[i]);
+          const found = [];
+          const run = await Fuel.mapLimit(targets, 5, async (pt) => {
+            const res = await Providers.searchGoogle(brand, s.googleKey, bumpPlacesCalls, { bias: { lat: pt.lat, lng: pt.lng, radius: FUEL_RADIUS_M } });
+            res.filter((r) => Fuel.nameHasBrand(r.name, brand)).forEach((r) => found.push({ placeId: r.id || ('ll:' + llKey(r)), name: r.name, address: r.address, lat: r.lat, lng: r.lng, brand }));
+          }, (d, n) => { status.textContent = 'Searching ' + d + ' of ' + n + '…'; }, () => cancelled);
+          if (cancelled) return;
+          if (run.errors.length >= targets.length) { rememberedOnly = true; failNote = 'Google search failed (' + (run.errors[0].message || 'error') + ')'; }
+          else fuelRun = { key: rkey, at: Date.now(), searched: targets.length };
+          searched = targets.length;
+          S.fuelStations = Fuel.mergeStations(S.fuelStations, found);
+          await saveStations();
+        }
+      }
+      // --- 4c: shortlist from the whole memory, then real travel times ---
+      status.textContent = 'Getting travel times…';
+      const known = Fuel.stationsOfBrand(S.fuelStations, brand);
+      if (!known.length) { fail('No ' + brand + ' found near this route.'); return; }
+      const short = Fuel.shortlist(pts, known, legs, 5);
+      const stationPts = short.map((r) => Object.assign({}, r.station, { fuel: true, key: llKey(r.station) }));
+      let table;
+      try { table = await fuelTable(pts.concat(stationPts), base); } catch (e) { if (!cancelled) fail('Could not get travel times: ' + (e.message || e)); return; }
+      if (cancelled) return;
+      const fzs = {};
+      const fzOf = (st) => fzs[st.placeId] || (fzs[st.placeId] = makeFuelT(st, table, base));
+      const cands = [];
+      short.forEach((r, i) => r.legs.forEach((l) => cands.push({ station: stationPts[i], a: pts[l.from], b: pts[l.to], legIndex: l.index })));
+      const sorted = Fuel.pickInsertion(cands, makeTT(base, Date.now(), fzOf, tableGetOf(table)));
+      if (!sorted.length) { fail('Could not work out travel times to the ' + brand + ' stations.'); return; }
+      // --- 4d: preview ---
+      let cur = 0;
+      const draw = () => {
+        const c = sorted[cur], mins = Math.max(0, Math.round(c.detourMin));
+        sh.body.replaceChildren(
+          h('div', { class: 'title', id: 'fuelName' }, c.station.name),
+          c.station.address ? h('div', { class: 'muted', id: 'fuelAddr' }, c.station.address) : null,
+          h('div', { class: 'fuel-detour', id: 'fuelDetour' }, '+' + mins + ' min · between ' + (c.a.name || 'here') + ' and ' + (c.b.name || 'the end')),
+          h('div', { class: 'muted fuel-small', id: 'fuelSearched' }, 'Searched ' + searched + ' points · ' + S.fuelStations.length + ' stations remembered' + (reuse ? ' (recent search reused)' : '')),
+          rememberedOnly ? h('div', { class: 'muted fuel-small', id: 'fuelNote' }, (failNote ? failNote + ' - ' : '') + 'Using remembered stations only') : null,
+          limited && !reuse ? h('div', { class: 'muted fuel-small', id: 'fuelLimited' }, 'Search limited today (Places daily guard) - result may not be the best') : null,
+          h('div', { class: 'sticky-actions' },
+            h('button', { class: 'primary', id: 'fuelAdd', onclick: async () => { const pick = sorted[cur]; sh.close(); await commitFuel(pick, fzOf(pick.station)); } }, 'Add'),
+            h('button', { id: 'fuelNext', disabled: sorted.length < 2, onclick: () => { cur = (cur + 1) % sorted.length; draw(); } }, 'Next best'),
+            h('button', { id: 'fuelCancel', onclick: sh.close }, 'Cancel')));
+      };
+      draw();
+    } catch (e) {
+      if (!cancelled) fail(e.message || String(e));
+    }
+  }
+
+  // --- 4e: the tap on "Add": insert, re-time with the existing logic (LATE / lunch warnings follow), persist ---
+  async function commitFuel(c, fz) {
+    const P = S.plan, cur = curPlan();
+    if (!P || !cur) return;
+    const st = c.station;
+    const place = { id: FUEL_ID, name: st.name, address: st.address || '', lat: st.lat, lng: st.lng, type: 'fuel', dwellMin: fuelDwell(), closedWindows: [], placeId: st.placeId };
+    P.ctx = Object.assign({}, P.ctx, { places: Object.assign({}, P.ctx.places, { [FUEL_ID]: place }) });
+    P.result.plans = [withFuel(stripFuel(cur), c.b, fz, place)]; P.idx = 0; // alternatives pre-date the fuel stop: dropped (as at DONE)
+    P.alt = null; S.loc.origin = null;
+    retimeNow();
+    toast('Fuel stop added: ' + dName(st.name));
+    await savePlan();
+    render();
+    refreshFromLocation({ force: true });
+  }
+  async function removeFuel() {
+    const P = S.plan, cur = curPlan();
+    if (!P || !cur) return;
+    const next = stripFuel(cur);
+    if (!next.stops.some((s) => s.fuel)) { // none left (a done one would stay): forget its place and times
+      const places = Object.assign({}, P.ctx.places); delete places[FUEL_ID];
+      P.ctx = Object.assign({}, P.ctx, { places });
+      const model = Object.assign({}, next.model); delete model.fuelT;
+      next.model = model;
+    }
+    P.result.plans = [next]; P.idx = 0; P.alt = null; S.loc.origin = null;
+    retimeNow();
+    toast('Fuel stop removed.');
+    await savePlan();
+    render();
+    refreshFromLocation({ force: true });
+  }
+
+  function fuelCard(stop, i, place) { // fuel tag, station, ETA, navigation, DONE / SKIP / REMOVE (no WhatsApp message)
+    const btns = navButtons(place);
+    btns.push(h('button', { class: 'small ok', onclick: () => markDone(stop, i) }, 'DONE'));
+    btns.push(h('button', { class: 'small', onclick: () => skipStop(stop, i) }, 'SKIP'));
+    btns.push(h('button', { class: 'small danger', 'aria-label': 'Remove fuel stop', onclick: () => removeFuel() }, 'REMOVE'));
+    return h('div', { class: 'card stop fuel' },
+      h('div', { class: 'stop-head' }, h('span', { class: 'num' }, (i + 1) + '.'), h('span', { class: 'nm' }, dName(place.name)), h('span', { class: 'pill fuel' }, 'FUEL'), h('span', { class: 'times' }, fmt(stop.arriveAt))),
+      place.address ? h('div', { class: 'muted fuel-addr' }, place.address) : null,
+      h('div', { class: 'stop-btns' }, btns));
+  }
+
+  function fuelSettingsCard(s, field) {
+    const brand = h('input', { id: 'fuelBrand', value: s.fuelBrand || '', autocomplete: 'off' });
+    brand.addEventListener('change', () => { s.fuelBrand = brand.value.trim() || 'Caltex'; brand.value = s.fuelBrand; saveSettings(); });
+    const num = (id, key, min, max, def) => {
+      const el = h('input', { id, type: 'number', inputmode: 'numeric', min: String(min), max: max != null ? String(max) : null, value: String(s[key]) });
+      el.addEventListener('change', () => {
+        let v = Math.round(Number(el.value));
+        if (!isFinite(v)) v = def;
+        v = Math.max(min, max != null ? Math.min(max, v) : v);
+        s[key] = v; el.value = String(v); saveSettings();
+      });
+      return el;
+    };
+    const n = S.fuelStations.length;
+    const forget = forgetAsk
+      ? h('div', { class: 'row', id: 'forgetConfirm', style: 'margin-top:8px' }, h('span', { class: 'grow' }, 'Forget ' + n + ' remembered stations?'),
+        h('button', { class: 'small', id: 'forgetNo', onclick: () => { forgetAsk = false; render(); } }, 'Cancel'),
+        h('button', { class: 'small danger', id: 'forgetYes', onclick: async () => { S.fuelStations = []; fuelRun = null; await saveStations(); forgetAsk = false; toast('Stations forgotten'); render(); } }, 'Forget'))
+      : h('button', { id: 'forgetBtn', style: 'margin-top:8px', disabled: !n, onclick: () => { forgetAsk = true; render(); } }, 'Forget stations');
+    return h('div', { class: 'card', id: 'fuelCard' }, h('h2', { style: 'margin-top:0' }, 'Fuel'),
+      field('Fuel brand', brand),
+      field('Fuel stop dwell (minutes)', num('fuelDwell', 'fuelDwellMin', 0, null, 7)),
+      field('Max searches per tap', num('fuelMax', 'fuelMaxSearches', 1, 50, 50)),
+      h('div', { class: 'muted', id: 'fuelCount' }, n + ' stations remembered'),
+      forget);
   }
 
   // ---------- PLACES tab ----------
@@ -1618,6 +1945,7 @@
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Default dwell (minutes) for new places'), h('div', { class: 'row' }, dd)),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Navigation'),
         field('Per-stop navigation button', bind(h('select', null, [['waze', 'Waze'], ['google', 'Google Maps'], ['both', 'Both']].map(([val, lab]) => h('option', { value: val, selected: s.nav === val }, lab))), 'nav'))),
+      fuelSettingsCard(s, field),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Data'),
         h('div', { class: 'row' }, h('button', { class: 'grow', onclick: exportJson }, 'Export JSON'), h('button', { class: 'grow', onclick: () => fileIn.click() }, 'Import JSON'), fileIn),
         h('button', { style: 'margin-top:8px', onclick: () => { Providers.clearCache(); toast('Travel-time cache cleared'); } }, 'Clear travel-time cache')),
@@ -1645,7 +1973,7 @@
 
   function exportJson() {
     const settings = Object.assign({}, S.settings); delete settings.googleKey; delete settings.tomtomKey;
-    const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), places: Object.values(S.places), jobs: S.jobs, settings },
+    const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), places: Object.values(S.places), jobs: S.jobs, settings, fuelStations: S.fuelStations },
       DL.exportPayload(S.days, S.jobs, S.places)); // + dayLog (records) and dayHistory (per-day totals); keys never included
     const a = h('a', { href: URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })), download: 'waypoint-' + new Date().toISOString().slice(0, 10) + '.json' });
     document.body.append(a); a.click(); a.remove();
@@ -1670,6 +1998,11 @@
         const keep = { googleKey: S.settings.googleKey, tomtomKey: S.settings.tomtomKey, placesCallsToday: S.settings.placesCallsToday };
         S.settings = Object.assign(defaultSettings(), data.settings, keep);
         await saveSettings();
+      }
+      if (Array.isArray(data.fuelStations)) { // older exports have none: the current memory is kept
+        S.fuelStations = data.fuelStations.filter((x) => x && x.placeId != null && x.lat != null && x.lng != null);
+        fuelRun = null;
+        await saveStations();
       }
       S.plan = null;
       toast('Imported.');
