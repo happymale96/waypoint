@@ -3,9 +3,11 @@
  *   node tools/smoke-reached.js
  * Serves the app from this repo on a free local port, drives a headless Chrome / Edge over the DevTools protocol, and mocks
  * TomTom, geolocation (position, accuracy and time), page visibility, window.open / the clipboard and the clock inside the
- * page. Seeds a 3-stop plan, then walks: one REACHED button, auto-reach at 80 m, Undo (no re-stamp), the 500 ms double-tap
- * guard, REACHED -> DONE with a re-time, the double-tap on leaving (estimated split), the setting off, and the End day
- * summary. The server and the browser are always shut down. Exit 1 on failure.
+ * page. Seeds a 3-stop plan, then walks: one REACHED button, auto-reach from a GPS-watch update 80 m away (no reload), Undo
+ * (no re-stamp), page hidden -> clearWatch / visible -> one fresh fix and exactly one watch, the 500 ms double-tap guard,
+ * REACHED -> DONE with a re-time, the navigation tap on stop 2 (navStartedAt in the plan and the day log), the setting off,
+ * the double-tap on leaving (estimated split), the watch cleared with nothing pending, and the End day summary (Driving /
+ * On site / Between stops). The server and the browser are always shut down. Exit 1 on failure.
  * Needs Node 22+ (global WebSocket / fetch) and Chrome or Edge (set CHROME=<path> to choose one).
  */
 'use strict';
@@ -54,9 +56,17 @@ const INIT = `(() => {
   window.__hidden = false;
   Object.defineProperty(document, 'visibilityState', { configurable: true, get() { return window.__hidden ? 'hidden' : 'visible'; } });
   window.__gps = ${JSON.stringify(GPS_FAR)};
+  // getCurrentPosition answers with window.__gps; watchPosition only delivers what the smoke fires (window.__watchFire)
+  window.__gcp = []; window.__watches = {}; window.__watchSeq = 0; window.__watchCalls = 0; window.__clearCalls = 0;
   Object.defineProperty(navigator, 'geolocation', { configurable: true, value: {
-    getCurrentPosition(ok) { setTimeout(() => ok({ coords: { latitude: window.__gps.lat, longitude: window.__gps.lng, accuracy: window.__gps.accuracy }, timestamp: Date.now() }), 0); },
+    getCurrentPosition(ok, err, opts) { window.__gcp.push(Object.assign({ t: Date.now() }, opts || {})); setTimeout(() => ok({ coords: { latitude: window.__gps.lat, longitude: window.__gps.lng, accuracy: window.__gps.accuracy }, timestamp: Date.now() }), 0); },
+    watchPosition(ok, err, opts) { const id = ++window.__watchSeq; window.__watchCalls++; window.__watches[id] = { ok, err, opts: opts || {} }; return id; },
+    clearWatch(id) { window.__clearCalls++; delete window.__watches[id]; },
   } });
+  window.__watchFire = (p) => { const ws = Object.values(window.__watches); ws.forEach((w) => w.ok({ coords: { latitude: p.lat, longitude: p.lng, accuracy: p.accuracy }, timestamp: Date.now() })); return ws.length; };
+  // navigation links (WAZE / MAPS) never leave the page; the app's own click handler still runs
+  window.__navClicks = 0;
+  document.addEventListener('click', (e) => { const a = e.target && e.target.closest && e.target.closest('a[target="_blank"]'); if (a) { e.preventDefault(); window.__navClicks++; } }, true);
   try { navigator.permissions.query = async () => ({ state: 'granted', addEventListener() {} }); } catch (e) { /* ignore */ }
   window.__opened = 0; window.__copied = 0;
   window.open = () => { window.__opened++; return null; };
@@ -179,10 +189,19 @@ async function main() {
     check(await ev('[...' + card(0) + '.querySelectorAll(".stop-btns > *")].map((b) => b.textContent).join()') !== '', 'the buttons sit in the usual button row');
     const h0 = await ev(card(0) + '.getBoundingClientRect().height');
 
-    console.log('2. auto-reach: GPS 80 m from stop 1, page visible');
-    await gpsNear(ids[0], 80);
-    await visible();
+    console.log('2. auto-reach from the GPS watch: loaded FAR from stop 1, then (no reload) a watch update 80 m from it');
+    await waitFor('Object.keys(window.__watches).length === 1', 'the GPS watch to start');
+    const w0 = await ev('(() => { const w = Object.values(window.__watches)[0]; return { n: Object.keys(window.__watches).length, calls: window.__watchCalls, opts: w.opts }; })()');
+    check(w0.n === 1 && w0.calls === 1, 'exactly one watchPosition running after load', w0);
+    check(w0.opts.enableHighAccuracy === true && w0.opts.maximumAge === 10000 && w0.opts.timeout === 20000, 'watch options: high accuracy, maximumAge 10 s, timeout 20 s', w0.opts);
+    check(await ev(planStop(ids[0]) + '.reachedAt == null'), 'loaded far from stop 1: not reached');
+    const near1 = await ev('(() => { const p = WaypointDebug.S.places[' + JSON.stringify(ids[0]) + ']; return { lat: p.lat + 80 / 111190, lng: p.lng, accuracy: 20 }; })()');
+    const gcpBefore = await ev('window.__gcp.length');
+    const fired = await ev('window.__watchFire(' + JSON.stringify(near1) + ')'); // getCurrentPosition still answers FAR: only the watch is near
+    check(fired === 1, 'the watch update reached one watch');
     await waitFor(planStop(ids[0]) + '.reachedAt', 'the auto-stamp on stop 1');
+    check(await ev('window.__gcp.length') === gcpBefore, 'the stamp came from the watch update (no getCurrentPosition in between)');
+    await gpsNear(ids[0], 80);
     const a1 = await ev('(() => { const s = ' + planStop(ids[0]) + '; return { src: s.reachedSource, at: s.reachedAt, line: ' + card(0) + '.querySelector(".reached-line").textContent, btns: [...' + card(0) + '.querySelectorAll(".stop-btns button.ok")].map((b) => b.textContent), toast: document.getElementById("toast").hidden ? "" : document.getElementById("toast").textContent, status: document.getElementById("timesFrom").textContent }; })()');
     check(a1.src === 'auto' && /^Reached \d\d:\d\d · auto\s*Undo$/.test(a1.line), 'stop 1 shows "Reached hh:mm · auto" with a small Undo', a1.line);
     check(a1.btns.length === 1 && a1.btns[0] === 'DONE', 'its one primary button now reads DONE', a1.btns);
@@ -206,6 +225,23 @@ async function main() {
     await sleep(700);
     check(await ev(planStop(ids[0]) + '.reachedAt == null'), 'more GPS updates near stop 1 do NOT re-stamp it');
     check(/^REACHED$/.test(await text('.timeline .card.stop .stop-btns button.ok')), 'the button still reads REACHED');
+    await ev('window.__watchFire(' + JSON.stringify(near1) + ')');
+    await sleep(300);
+    check(await ev(planStop(ids[0]) + '.reachedAt == null'), 'a watch update near stop 1 does NOT re-stamp it either');
+
+    console.log('3b. page hidden -> clearWatch; visible -> one fresh fix and exactly one watch');
+    const clr0 = await ev('window.__clearCalls');
+    await ev('(() => { window.__hidden = true; document.dispatchEvent(new Event("visibilitychange")); return true; })()');
+    await sleep(200);
+    const hid = await ev('({ n: Object.keys(window.__watches).length, clr: window.__clearCalls })');
+    check(hid.n === 0 && hid.clr === clr0 + 1, 'hidden: clearWatch called, no watch running', hid);
+    const gcp0 = await ev('window.__gcp.length'), calls0 = await ev('window.__watchCalls');
+    await ev('(() => { window.__hidden = false; document.dispatchEvent(new Event("visibilitychange")); return true; })()');
+    await waitFor('Object.keys(window.__watches).length === 1', 'the watch to restart');
+    await sleep(400);
+    const vis = await ev('({ n: Object.keys(window.__watches).length, calls: window.__watchCalls, fresh: window.__gcp.slice(' + gcp0 + ').filter((o) => o.maximumAge === 0).length })');
+    check(vis.n === 1 && vis.calls === calls0 + 1, 'visible: exactly one watch running (one new watchPosition)', vis);
+    check(vis.fresh >= 1, 'visible: a fresh fix was requested (maximumAge 0)', vis);
 
     console.log('4. tap REACHED, then a second tap 100 ms later (500 ms guard)');
     const guard = await ev(`(async () => { const b = () => ${card(0)}.querySelector(".stop-btns button.ok"); b().click(); await new Promise((r) => setTimeout(r, 100)); const mid = b().textContent; b().click();
@@ -228,23 +264,41 @@ async function main() {
     check(eta2After !== eta2Before && eta2After > Date.parse(log1.t), 'later ETAs moved: now timed from the DONE time (stop 2 ' + Math.round((eta2After - eta2Before) / 60000) + ' min)', { eta2Before, eta2After });
     check(await ev('window.__opened === 0 && window.__copied === 0'), 'still no WhatsApp message copied or opened (no number seeded)');
 
-    console.log('5. stop 2: REACHED, 2 s, DONE (double-tap on leaving)');
-    await advanceMin(25); // the drive to stop 2
-    check((await primaries(1)).join() === 'REACHED', 'stop 2 (first pending) reads REACHED', await primaries(1));
+    console.log('5. stop 2: tap its navigation button, 20 min, REACHED, 15 min, DONE');
+    const stopName2 = await ev('WaypointDebug.S.places[' + JSON.stringify(ids[1]) + '].name');
+    await advanceMin(5); // loading up after stop 1
     const stopCardIdx = await ev('[...document.querySelectorAll(".timeline .card.stop")].findIndex((c) => !c.classList.contains("done") && !c.classList.contains("skipped"))');
+    check((await primaries(stopCardIdx)).join() === 'REACHED', 'stop 2 (first pending) reads REACHED', await primaries(stopCardIdx));
+    const navBtn = (n) => card(n) + '.querySelector(".stop-btns a.nav-btn")';
+    check(await ev(navBtn(stopCardIdx) + '.textContent') === 'WAZE', 'stop 2 has its WAZE button (Navigation setting: Waze)');
+    const navClicks0 = await ev('window.__navClicks');
+    await ev(navBtn(stopCardIdx) + '.click()');
+    const navAt = await ev('Date.now()');
+    check(await ev('window.__navClicks') === navClicks0 + 1, 'the tap went to the navigation link');
+    check(Math.abs(await ev(planStop(ids[1]) + '.navStartedAt') - navAt) < 2000, 'stop 2: navStartedAt = the tap time');
+    await advanceMin(1);
+    await ev(navBtn(stopCardIdx) + '.click()'); // a second tap does not move it
+    check(Math.abs(await ev(planStop(ids[1]) + '.navStartedAt') - navAt) < 2000, 'a second tap keeps the first navStartedAt');
+    await ev('document.querySelector("#view a.btn.primary") && document.querySelector("#view a.btn.primary").click()'); // whole-route "Open in Google Maps"
+    check(Math.abs(await ev(planStop(ids[2]) + '.navStartedAt || 0') - 0) < 1, 'the whole-route Google Maps button sets no navStartedAt');
+    check(await ev('JSON.parse(localStorage.getItem("waypoint:plan:current")).plan.stops.find((s) => s.placeId === ' + JSON.stringify(ids[1]) + ').navStartedAt') === await ev(planStop(ids[1]) + '.navStartedAt'), 'navStartedAt is persisted with the plan');
+    await advanceMin(19); // 20 min after the tap
     await clickPrimary(stopCardIdx);
     await waitFor(planStop(ids[1]) + '.reachedAt', 'stop 2 to be reached');
-    await advanceMs(2000);
+    await ev(navBtn(stopCardIdx) + '.click()'); // a tap after Reached is ignored for timing
+    check(Math.abs(await ev(planStop(ids[1]) + '.navStartedAt') - navAt) < 2000, 'a tap after Reached changes nothing');
+    await advanceMin(15);
     await clickPrimary(stopCardIdx);
     await waitFor(planStop(ids[1]) + '.status === "done"', 'stop 2 to be done');
-    const split = await ev(`(() => { const S = WaypointDebug.S, d = Object.values(S.days)[0], sum = DayLog.summarise(d, S.jobs, S.places), sp = Reached.splitOfSummary(sum);
-      const v = sum.visits.find((x) => x.stopId === ${JSON.stringify(ids[1])}), r = sp.stops.find((x) => x.stopId === ${JSON.stringify(ids[1])});
-      return { est: r.estimated, onSite: r.onSiteMin, dwell: v.dwellMin, gapMs: v.doneAt - v.reachedAt, any: sp.totals.anyEstimated }; })()`);
-    check(split.gapMs >= 1500 && split.gapMs < 10000, 'stop 2: Reached and Done were about 2 s apart', split);
-    check(split.est === true && split.any === true, 'stop 2: its split is flagged estimated', split);
-    check(split.dwell > 0 && Math.abs(split.onSite - split.dwell) < 0.01, 'stop 2: on-site time is the planned dwell (' + split.dwell + ' min), not ~0', split);
+    const nav2 = await ev(`(() => { const S = WaypointDebug.S, d = Object.values(S.days)[0], e = d.events.filter((x) => x.type === "done" && x.stopId === ${JSON.stringify(ids[1])});
+      const sp = Reached.splitOfSummary(DayLog.summarise(d, S.jobs, S.places), Date.now()), r = sp.stops.find((x) => x.stopId === ${JSON.stringify(ids[1])});
+      return { nav: e[0] && e[0].navStartedAt, v: sp.v, between: r.betweenMin, drive: r.driveMin, onSite: r.onSiteMin, est: r.splitEstimated }; })()`);
+    check(nav2.nav != null && Math.abs(nav2.nav - navAt) < 2000, 'the day log has navStartedAt for stop 2', nav2);
+    check(nav2.v === 2 && Math.abs(nav2.drive - 20) < 0.1 && Math.abs(nav2.onSite - 15) < 0.1 && Math.abs(nav2.between - 5) < 0.1 && nav2.est === false,
+      'stop 2 split: between 5 min, driving 20 min, on site 15 min, not estimated', nav2);
 
     console.log('6. setting off, GPS near stop 3');
+    await advanceMin(25); // the drive to stop 3
     await click('#tabs button[data-tab="settings"]');
     await waitFor('document.querySelector("#autoReach")', 'the Reached card in Settings');
     check((await text('#reachedCard label')).trim() === "Mark Reached automatically when I'm within 150 m (app open)", 'the checkbox label', await text('#reachedCard label'));
@@ -266,19 +320,30 @@ async function main() {
     await visible();
     await waitFor(planStop(ids[2]) + '.reachedAt', 'the control auto-stamp with the setting back on');
     check(await ev(planStop(ids[2]) + '.reachedSource === "auto"'), 'control: with the setting back on, the same position does stamp stop 3');
-    await advanceMin(10);
+    console.log('6b. stop 3: DONE 2 s after Reached (double-tap on leaving)');
+    await advanceMs(2000);
     const idx3 = await ev('[...document.querySelectorAll(".timeline .card.stop")].findIndex((c) => !c.classList.contains("done"))');
     await clickPrimary(idx3);
     await waitFor(planStop(ids[2]) + '.status === "done"', 'stop 3 to be done');
+    const split = await ev(`(() => { const S = WaypointDebug.S, d = Object.values(S.days)[0], sum = DayLog.summarise(d, S.jobs, S.places), sp = Reached.splitOfSummary(sum, Date.now());
+      const v = sum.visits.find((x) => x.stopId === ${JSON.stringify(ids[2])}), r = sp.stops.find((x) => x.stopId === ${JSON.stringify(ids[2])});
+      return { est: r.estimated, onSite: r.onSiteMin, dwell: v.dwellMin, gapMs: v.doneAt - v.reachedAt, any: sp.totals.anySplitEstimated }; })()`);
+    check(split.gapMs >= 1500 && split.gapMs < 10000, 'stop 3: Reached and Done were about 2 s apart', split);
+    check(split.est === true && split.any === true, 'stop 3: its arrival is flagged estimated', split);
+    check(split.dwell > 0 && Math.abs(split.onSite - split.dwell) < 0.01, 'stop 3: on-site time is the planned dwell (' + split.dwell + ' min), not ~0', split);
+    await waitFor('Object.keys(window.__watches).length === 0', 'the watch to stop (no pending stop left)');
+    check(await ev('Object.keys(window.__watches).length') === 0, 'every stop done: the GPS watch is cleared');
 
     console.log('7. End day summary');
     await click('#routeEndDay');
-    await waitFor('document.querySelector("#sumSplitLine")', 'the Driving / On site line');
+    await waitFor('document.querySelector("#sumSplitLine")', 'the Driving / On site / Between stops line');
     const sumLine = await text('#sumSplitLine');
-    check(/^Driving (\d+ h \d\d min|\d+ min) · On site (\d+ h \d\d min|\d+ min) \(part estimated\)$/.test(sumLine), 'summary: "Driving … · On site … (part estimated)"', sumLine);
+    const D = '(\\d+ h \\d\\d min|\\d+ min)';
+    check(new RegExp('^Driving ' + D + ' · On site ' + D + ' · Between stops ' + D + ' \\(part estimated\\)$').test(sumLine), 'summary: "Driving … · On site … · Between stops … (part estimated)"', sumLine);
     const rows = await ev('[...document.querySelectorAll("#sumSplit .sum-line")].map((r) => r.textContent)');
-    check(rows.length === 3 && rows.every((r) => /arr ~?\d\d:\d\d · left \d\d:\d\d/.test(r)), 'per stop "arr hh:mm · left hh:mm" (3 rows)', rows);
+    check(rows.length === 3 && rows.every((r) => /left prev \d\d:\d\d( · nav \d\d:\d\d)? · arr ~?\d\d:\d\d · done \d\d:\d\d$/.test(r)), 'per stop "left prev · [nav ·] arr · done" (3 rows)', rows);
     check(rows.filter((r) => /arr ~/.test(r)).length === 1, 'exactly the double-tapped stop shows its arrival as "~hh:mm"', rows);
+    check(rows.filter((r) => / · nav \d\d:\d\d · /.test(r)).length === 1 && / · nav /.test(rows.find((r) => r.includes(stopName2)) || ''), 'only stop 2 (navigation tapped) shows "nav hh:mm"', rows);
     check(await ev('!!document.querySelector(".sheet.summary .tiles")') && /3 of 3/.test(await text('.sheet.summary .tile.jobs')), 'the existing tiles are still there (jobs 3 of 3)', await text('.sheet.summary .tile.jobs'));
     await click('.sheet.summary .sum-actions .row:last-child button:last-child');
 

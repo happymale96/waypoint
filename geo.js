@@ -55,7 +55,9 @@
   // ---------- geolocation fix rules ----------
   // High accuracy, 10 s timeout, maximumAge 60 s; on a TIMEOUT retry once with low accuracy and a 5 s timeout.
   // geo = navigator.geolocation (or a mock). Resolves {ok:true, lat, lng, accuracy} | {ok:false, code:'denied'|'timeout'|'unavailable'}.
-  function getFix(geo) {
+  // o.fresh = never a cached position (maximumAge 0): the "back in the foreground" fix that auto-reach is evaluated on.
+  function getFix(geo, o) {
+    const maxAge = o && o.fresh ? 0 : 60000;
     const attempt = (opts) => new Promise((resolve) => {
       try {
         geo.getCurrentPosition(
@@ -65,8 +67,8 @@
       } catch (e) { resolve({ ok: false, code: 'unavailable' }); }
     });
     if (!geo || typeof geo.getCurrentPosition !== 'function') return Promise.resolve({ ok: false, code: 'unavailable' });
-    return attempt({ enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 })
-      .then((r) => (!r.ok && r.code === 'timeout' ? attempt({ enableHighAccuracy: false, timeout: 5000, maximumAge: 60000 }) : r));
+    return attempt({ enableHighAccuracy: true, timeout: 10000, maximumAge: maxAge })
+      .then((r) => (!r.ok && r.code === 'timeout' ? attempt({ enableHighAccuracy: false, timeout: 5000, maximumAge: maxAge }) : r));
   }
 
   // ---------- place records ----------

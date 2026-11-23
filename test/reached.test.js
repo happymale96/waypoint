@@ -195,6 +195,7 @@ console.log('day log: Reached fields and the summary split');
   const old = DL.newDay({ date: '2030-01-14' });
   DL.recordPlan(old, { nowIso: new Date(T).toISOString(), start: { lat: 0, lng: 0 }, departAtIso: new Date(T).toISOString(), jobs, places, stopOrder: ['A'] });
   DL.recordDone(old, { nowIso: iso(T + 40 * MIN), stopId: 'A', actions: [{ jobId: 'j1', kind: 'deliver', item: 'x' }], places });
+  delete old.timeSplitV; // a record written before the navigation-tap timing has no version mark
   const so = DL.summarise(old, jobs, places);
   ok(Reached.splitOfSummary(so) === null, 'a day closed before this feature (no reachedAt anywhere): no split line');
   ok(so.visits[0].reachedAt === null && so.jobsDone === 1, 'old events summarise exactly as before');
@@ -216,6 +217,55 @@ console.log('day log: Reached fields and the summary split');
   // undo of DONE removes the group (and its reached data) from the summary
   DL.recordUndo(day, { nowIso: iso(T + 131 * MIN), stopId: '__fuel__' });
   ok(DL.summarise(day, jobs, places).visits.length === 2, 'undo of DONE removes that visit');
+}
+
+console.log('GPS watch: shouldWatch and the 30 s re-time throttle');
+{
+  ok(Reached.shouldWatch({ visible: true, hasPendingStop: true, dayClosed: false }) === true, 'visible + a pending stop + day open: watch');
+  ok(Reached.shouldWatch({ visible: false, hasPendingStop: true, dayClosed: false }) === false, 'page hidden: no watch (never in the background)');
+  ok(Reached.shouldWatch({ visible: true, hasPendingStop: false, dayClosed: false }) === false, 'no pending stop left: no watch');
+  ok(Reached.shouldWatch({ visible: true, hasPendingStop: true, dayClosed: true }) === false, 'day closed: no watch');
+  ok(Reached.shouldWatch({}) === false && Reached.shouldWatch(null) === false, 'missing state: no watch');
+  ok(Reached.WATCH_OPTS.enableHighAccuracy === true && Reached.WATCH_OPTS.maximumAge === 10000 && Reached.WATCH_OPTS.timeout === 20000, 'watch options: high accuracy, maximumAge 10 s, timeout 20 s');
+  ok(Reached.retimeDue(null, T) === true, 'throttle: the first update re-times');
+  ok(Reached.retimeDue(T, T + 29999) === false, 'throttle: 29.999 s later: not yet');
+  ok(Reached.retimeDue(T, T + 30000) === true, 'throttle: 30 s later: due');
+  ok(Reached.retimeDue(T, T + 5000, 5000) === true && Reached.retimeDue(T, T + 4999, 5000) === false, 'throttle: the interval can be passed');
+  // a stream of updates every 7 s for 2 minutes re-times at most once per 30 s
+  let last = null, n = 0;
+  for (let t = T; t <= T + 120000; t += 7000) if (Reached.retimeDue(last, t)) { last = t; n++; }
+  ok(n === 4, 'throttle: updates every 7 s for 2 min -> 4 re-times', n);
+}
+
+console.log('navigation tap (navStartedAt)');
+{
+  const s0 = { placeId: 'A', actions: [] };
+  const a = Reached.stampNav(s0, at(13, 52), at(13, 40));
+  ok(a.navStartedAt === at(13, 52) && s0.navStartedAt === undefined, 'first tap after the previous departure stamps navStartedAt (input untouched)');
+  ok(Reached.stampNav(a, at(13, 58), at(13, 40)) === a, 'a second tap keeps the first');
+  const stale = Object.assign({}, s0, { navStartedAt: at(13, 30) });
+  ok(Reached.stampNav(stale, at(13, 50), at(13, 40)).navStartedAt === at(13, 50), 'a tap stored before the previous departure is replaced');
+  ok(Reached.stampNav(Reached.stampReached(s0, at(14, 0), 'tap'), at(14, 5), at(13, 40)).navStartedAt === undefined, 'a tap after Reached is ignored');
+  ok(Reached.stampNav(Object.assign({}, s0, { status: 'done' }), at(14, 5), at(13, 40)).navStartedAt === undefined, 'a tap on a done stop is ignored');
+  ok(!('navStartedAt' in Reached.carryForward(a)), 'carry-forward clears navStartedAt');
+}
+
+console.log('fuel stop: reached state kept when Replan re-inserts it');
+{
+  const iso = (ms) => new Date(ms).toISOString();
+  const oldStops = [
+    { placeId: 'A', status: 'done', doneAt: iso(T + 30 * MIN), reachedAt: T + 20 * MIN },
+    { placeId: '__fuel__', fuel: true, reachedAt: T + 45 * MIN, reachedSource: 'auto', navStartedAt: T + 35 * MIN },
+    { placeId: 'B', noAutoReach: true },
+  ];
+  // the re-solved plan: done stop on top, a FRESH fuel stop object (as insertion makes it), B again
+  const fresh = [{ placeId: 'A', status: 'done', doneAt: iso(T + 30 * MIN) }, { placeId: '__fuel__', fuel: true, arriveAt: 0, departAt: 0, actions: [] }, { placeId: 'B' }];
+  const kept = Reached.keepStateOf(oldStops, fresh);
+  ok(kept[1].reachedAt === T + 45 * MIN && kept[1].reachedSource === 'auto' && kept[1].navStartedAt === T + 35 * MIN, 'the re-inserted fuel stop is still reached (time, source, nav tap)', kept[1]);
+  ok(Reached.buttonLabel(kept[1]) === 'DONE' && Reached.onSiteStop(kept).placeId === '__fuel__', 'its button reads DONE and it is the on-site stop');
+  ok(kept[2].noAutoReach === true && kept[0].reachedAt === undefined, 'other pending stops keep their flags; done stops are untouched');
+  ok(fresh[1].reachedAt === undefined, 'inputs untouched');
+  ok(Reached.keptState({ placeId: 'X', status: 'done', reachedAt: 1 }) === null && Reached.keptState({ placeId: 'X' }) === null, 'nothing to keep from a done stop or a plain one');
 }
 
 console.log('\n' + passes + ' passed, ' + failures + ' failed');

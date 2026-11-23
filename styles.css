@@ -178,6 +178,14 @@ a.btn.small { min-height: 40px; padding: 0 10px; font-size: 14px; }
 button.link-undo { min-height: 0; height: auto; padding: 0 8px; border: 0; background: none; color: inherit; font-size: 14px; line-height: 1.3; font-weight: 700; text-decoration: underline; }
 button.toast-undo { min-height: 28px; padding: 0 6px; border: 0; background: none; color: inherit; font-size: 14px; font-weight: 700; text-decoration: underline; }
 .sum-split { font-weight: 700; margin-bottom: 4px; }
+/* the driver's lunch break: a slim bar above the stop list (never a modal) */
+.lunch-bar { display: flex; align-items: center; gap: 8px; margin: 8px 0; padding: 6px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); font-size: 14px; }
+.lunch-bar.active { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+.lunch-bar .lunch-start { flex: 1; min-height: 36px; }
+button.link-btn { min-height: 36px; height: auto; padding: 0 6px; border: 0; background: none; color: inherit; font-size: 14px; font-weight: 700; text-decoration: underline; }
+.lunch-skipped { font-size: 13px; margin-top: 4px; }
+.lunch-skipped button.link-undo { font-size: 13px; }
+.lunch-marker { font-size: 13px; padding: 2px 4px 2px 12px; border-left: 3px dashed var(--border); margin: 2px 0; }
 .stop-btns { display: flex; flex-wrap: nowrap; gap: 6px; margin-top: 6px; }
 .card.stop .stop-btns > * { flex: 1 1 0; min-width: 0; height: 36px; min-height: 36px; padding: 0 6px; font-size: 13px; line-height: 1; text-transform: uppercase; letter-spacing: .03em; border-radius: 10px; }
 .card.stop .stop-btns > .chip { display: inline-flex; align-items: center; justify-content: center; margin: 0; border-radius: 10px; }

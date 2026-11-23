@@ -76,6 +76,7 @@
   function appendEvent(day, ev) {
     const e = Object.assign({ t: new Date().toISOString(), type: '', jobId: null, stopId: null, lat: null, lng: null, accuracy: null }, ev);
     day.events.push(e);
+    day.timeSplitV = TIME_SPLIT_V; // recorded with the navigation-tap timing (days closed before it keep the old split)
     return e;
   }
 
@@ -128,7 +129,12 @@
   const reachedFields = (info) => ({
     reachedAt: info.reachedAt != null ? info.reachedAt : null, reachedSource: info.reachedAt != null ? (info.reachedSource || 'tap') : null,
     dwellMin: info.dwellMin != null ? info.dwellMin : null,
+    navStartedAt: info.navStartedAt != null ? info.navStartedAt : null, // first tap on the stop's navigation button (ms)
   });
+  const TIME_SPLIT_V = 2;
+  // The driver's lunch break (Route tab bar): the real interval, on the day record. An assumed break never started is not logged.
+  function recordBreakStart(day, info) { day.breakStartedAt = info.nowIso; day.breakEndedAt = null; day.timeSplitV = TIME_SPLIT_V; }
+  function recordBreakEnd(day, info) { if (day.breakStartedAt) day.breakEndedAt = info.nowIso; }
   function recordDone(day, info) { // info: {nowIso, stopId, actions:[{jobId,kind,item}], places{}, reachedAt?, reachedSource?, dwellMin?}
     snapPlace(day, info.places, info.stopId);
     return info.actions.map((a) => appendEvent(day, Object.assign({ t: info.nowIso, type: 'done', jobId: a.jobId || null, stopId: info.stopId, kind: a.kind, item: a.item || '' }, reachedFields(info))));
@@ -147,7 +153,8 @@
 
   // ARRIVED at the end point of the route. info: {nowIso, endPoint:{lat,lng,name}}. Never closes the day.
   function recordArrivedEnd(day, info) {
-    return appendEvent(day, { t: info.nowIso, type: 'arrived_end', endPoint: info.endPoint ? { lat: info.endPoint.lat, lng: info.endPoint.lng, name: info.endPoint.name || '' } : null });
+    return appendEvent(day, { t: info.nowIso, type: 'arrived_end', endPoint: info.endPoint ? { lat: info.endPoint.lat, lng: info.endPoint.lng, name: info.endPoint.name || '' } : null,
+      navStartedAt: info.navStartedAt != null ? info.navStartedAt : null });
   }
   function recordUndoArrivedEnd(day, info) { return appendEvent(day, { t: info.nowIso, type: 'undo', of: 'arrived_end' }); }
   // the active (not undone) arrived_end event, or null
@@ -338,11 +345,14 @@
     const visits = groups.map((g) => {
       const e0 = g.events[0] || {};
       return { stopId: g.stopId, name: isFuelGroup(g) ? 'Fuel: ' + (e0.item || nameOf(g.stopId)) : nameOf(g.stopId), fuel: isFuelGroup(g), doneAt: g.tMs,
-        reachedAt: e0.reachedAt != null ? e0.reachedAt : null, reachedSource: e0.reachedSource || null, dwellMin: e0.dwellMin != null ? e0.dwellMin : null };
+        reachedAt: e0.reachedAt != null ? e0.reachedAt : null, reachedSource: e0.reachedSource || null, dwellMin: e0.dwellMin != null ? e0.dwellMin : null,
+        navStartedAt: e0.navStartedAt != null ? e0.navStartedAt : null };
     });
 
     return {
-      visits,
+      visits, timeSplitV: day.timeSplitV || 1,
+      arrivedEndNavAt: arrEv && arrEv.navStartedAt != null ? arrEv.navStartedAt : null,
+      breakStartedAt: ms(day.breakStartedAt || null), breakEndedAt: ms(day.breakEndedAt || null),
       date: day.date, driverId: day.driverId, closed: !!day.closed, closedAt: ms(day.closedAt != null ? day.closedAt : day.endedAt),
       jobsDone: rows.filter((r) => r.complete).length, jobsTotal: rows.length,
       stopsVisited: visitSeq.length, doneSeq, fuel,
@@ -597,7 +607,7 @@
   return {
     SCHEMA, KEEP_DAYS, REASONS, CSV_HEADER,
     dateKey, fmtDate, fmtTime, fmtDur, fmtKm, addDaysKey, dayStartMs, ageDays,
-    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordFuel, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, arrivedEnd, doneGroups, hasActiveDone,
+    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordFuel, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, recordBreakStart, recordBreakEnd, TIME_SPLIT_V, arrivedEnd, doneGroups, hasActiveDone,
     ptKey, legKey, seqKey, legFromMatrices, captureLeg, plannedFromMatrices,
     summarise, closeDay, reopenDay, refreshTotals, recordFor, activityKey, hasActivity, isEmptyRecord, openDayKey, endDay,
     REPAIR_VERSION, repairHistory, runRepairOnce, exportPayload, importPayload, pruneDates, weekRange, weekTotals, historyKeys, toCSV, csvCell, toWhatsApp,

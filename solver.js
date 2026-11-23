@@ -472,22 +472,29 @@
     });
     // every stop done/skipped: the live origin (a fix + one routing request) targets the end point instead
     const endMs = t + (firstLeft && ov != null ? ov : legAny(pos, k + 1, t)) * 1000;
-    const out = Object.assign({}, plan, { stops, endArrival: Math.round(endMs), totalSec: Math.round((endMs - m.t0ms) / 1000) });
-    if (m.beforeMs) { // window lateness follows the new times (stops still ahead only)
-      const violations = []; let lateMs = 0;
-      stops.forEach((s) => {
-        if (s.status) return;
-        s.late = false;
-        (m.beforeMs[s.placeId] || []).forEach((tg) => {
-          if (s.arriveAt > tg.ms + 1) {
-            s.late = true; lateMs += s.arriveAt - tg.ms;
-            violations.push('Arrive-before missed at ' + ((m.names || {})[s.placeId] || s.placeId) + ': arrives ' + formatETA(s.arriveAt) + ', must be before ' + formatETA(tg.ms) + ' (job ' + tg.jobId + ')');
-          }
-        });
-      });
-      out.violations = violations; out.lateSec = Math.round(lateMs / 1000);
-    }
+    // departFromMs = when the walk leaves the current point (the lunch break's "start of the route" departure)
+    const out = Object.assign({}, plan, { stops, endArrival: Math.round(endMs), totalSec: Math.round((endMs - m.t0ms) / 1000), departFromMs: nowMs });
+    markLate(out);
     return out;
+  }
+  // Window lateness follows the plan's current times (stops still ahead only): sets stop.late, plan.violations, plan.lateSec.
+  // In place on `plan` (a fresh copy made by the caller).
+  function markLate(plan) {
+    const m = plan.model;
+    if (!m || !m.beforeMs) return plan;
+    const violations = []; let lateMs = 0;
+    plan.stops.forEach((s) => {
+      if (s.status) return;
+      s.late = false;
+      (m.beforeMs[s.placeId] || []).forEach((tg) => {
+        if (s.arriveAt > tg.ms + 1) {
+          s.late = true; lateMs += s.arriveAt - tg.ms;
+          violations.push('Arrive-before missed at ' + ((m.names || {})[s.placeId] || s.placeId) + ': arrives ' + formatETA(s.arriveAt) + ', must be before ' + formatETA(tg.ms) + ' (job ' + tg.jobId + ')');
+        }
+      });
+    });
+    plan.violations = violations; plan.lateSec = Math.round(lateMs / 1000);
+    return plan;
   }
 
   // ---------- live-location rules (pure; the app supplies the clock and the fix) ----------
@@ -596,5 +603,5 @@
     return buildPlan(c, orderPlaceIds.map((p) => c.idx[p]));
   }
 
-  return { solve, evaluate, retime, reindexMatrices, distanceM, refreshDue, judgeFix, originFresh, liveView, timesLine, LOC, isClosedAt, buildStops, pointsFor, formatETA, formatDuration, hmToSec, MAX_STOPS, DEFAULT_DWELL };
+  return { solve, evaluate, retime, markLate, normWindows, pushPastClosed, reindexMatrices, distanceM, refreshDue, judgeFix, originFresh, liveView, timesLine, LOC, isClosedAt, buildStops, pointsFor, formatETA, formatDuration, hmToSec, MAX_STOPS, DEFAULT_DWELL };
 });

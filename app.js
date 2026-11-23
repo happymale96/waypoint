@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '623ec7e3'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '2f72fca4'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -35,6 +35,7 @@
     startSel: 'gps', endSel: 'home', departTime: '',
     plan: null, busy: false, days: {}, loc: { lastAt: null, origin: null, busy: false, reason: null }, timesFrom: null,
     fuelStations: [], // permanent station memory (see FUEL STOP below); in Export / Import, never shown in the Places tab
+    lunch: null, // today's lunch-break state {date, startedAt, endedAt, skipped} (LUNCH BREAK below); stored as meta:lunchBreak
   };
 
   function defaultSettings() {
@@ -45,6 +46,8 @@
       placesCallsToday: { date: todayStr(), count: 0 }, nav: 'waze', seeded: false, driverName: 'Calvin',
       fuelBrand: 'Caltex', fuelDwellMin: 7, fuelMaxSearches: 50,
       autoReach: true, // mark Reached automatically within 150 m (app open); stored on the device, in Export / Import
+      // the driver's lunch break (Settings -> Lunch break; device-stored, in Export / Import)
+      lunchBreakOn: LunchBreak.DEFAULTS.lunchBreakOn, lunchBreakFrom: LunchBreak.DEFAULTS.lunchBreakFrom, lunchBreakMin: LunchBreak.DEFAULTS.lunchBreakMin,
     };
   }
   const saveSettings = () => WPStore.set('settings', 'main', S.settings);
@@ -71,6 +74,7 @@
     await runMigrations();
     await loadDays();
     await restorePlan(); // the Route tab comes back exactly as it was left
+    try { S.lunch = LunchBreak.forDay(await WPStore.get('meta', 'lunchBreak'), lunchDayKey()); } catch (e) { S.lunch = LunchBreak.fresh(lunchDayKey()); }
   }
 
   // ---------- closed windows: {days:[1..7] (ISO, Mon=1), from, to} ----------
@@ -595,6 +599,7 @@
       }
       banner('Travel times: TomTom live traffic — ' + (got.fromCache ? 'from session cache (0 calls)' : got.calls + ' calls') + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
       S.loc.origin = null; S.loc.lastAt = null; S.loc.reason = null;
+      retimeNow(); // the shared timing path (the lunch break included)
       logPlan(replan, { start, departAt, places, points, matrices: got.matrices, jobs: Solver.buildStops(jobs, places).jobs });
       S.tab = 'route';
       await savePlan(); // after the tab switch, so a restore reopens the Route tab
@@ -623,10 +628,10 @@
 
   // done/skipped stops stay at the top (old order); the freshly solved stops follow
   function compose(oldPlan, plan0) {
-    // a stop reached (or flagged "no auto-reach") but not done keeps that state through a re-solve
-    const keep = {};
-    if (oldPlan) oldPlan.stops.forEach((s) => { if (!s.status && (s.reachedAt != null || s.noAutoReach)) keep[s.placeId] = { reachedAt: s.reachedAt != null ? s.reachedAt : null, reachedSource: s.reachedSource || null, noAutoReach: !!s.noAutoReach }; });
-    const plan = Object.keys(keep).length ? Object.assign({}, plan0, { stops: plan0.stops.map((s) => (keep[s.placeId] ? Object.assign({}, s, keep[s.placeId]) : s)) }) : plan0;
+    // a stop reached (or flagged "no auto-reach", or with a navigation tap) but not done keeps that state through a re-solve;
+    // so does the end point's navigation tap
+    let plan = oldPlan ? Object.assign({}, plan0, { stops: Reached.keepStateOf(oldPlan.stops, plan0.stops) }) : plan0;
+    if (oldPlan && oldPlan.endNavStartedAt != null) plan = Object.assign({}, plan, { endNavStartedAt: oldPlan.endNavStartedAt });
     const hist = oldPlan ? oldPlan.stops.filter((s) => s.status) : [];
     if (!hist.length) return plan;
     const t0 = oldPlan.model.t0ms;
@@ -683,7 +688,7 @@
   async function reSolveFromCache() { // No-detour toggle
     const r = resolveRemaining({});
     if (r.res.error) banner(r.res.error, 'error');
-    else { adoptResult(r); S.loc.origin = null; banner('Re-solved from cached travel times — 0 API calls.', 'info'); await logReplanVia('no-detour'); }
+    else { adoptResult(r); S.loc.origin = null; retimeNow(); banner('Re-solved from cached travel times — 0 API calls.', 'info'); await logReplanVia('no-detour'); }
     await savePlan();
     render();
   }
@@ -698,13 +703,18 @@
     if (!o || o.placeId !== targetId(plan) || at > now || !Solver.originFresh(o, now)) return null;
     return { durationToNextSec: Math.max(0, (o.arriveMs - at) / 1000) };
   }
+  // The ONE timing path: Solver.retime, then the driver's lunch break (assumed or real; LunchBreak.applyBreak), so the Route
+  // ETAs, LATE, the end arrival and the WhatsApp ETA all see it.
+  function timedPlan(plan, from, atIso, org) {
+    return LunchBreak.applyBreak(Solver.retime(plan, from, atIso, org), curLunch(), S.settings, Date.now());
+  }
   function retimeNow() { // also with nothing left to visit: the end arrival is then re-timed (from the last done stop, or the live origin)
     const P = S.plan, plan = curPlan();
     if (!plan) return false;
     const from = lastDoneIdx(plan), now = Date.now();
     const at = from < 0 ? Math.max(now, Date.parse(P.ctx.departAtISO)) : now; // before the planned departure: keep the planned times
     const org = originFor(plan, at);
-    P.result.plans[P.idx] = Solver.retime(plan, from, iso(at), org);
+    P.result.plans[P.idx] = timedPlan(plan, from, iso(at), org);
     S.timesFrom = org ? S.loc.origin.usedAt : null;
     P.alt = null; P.shiftMs = 0;
     return true;
@@ -713,14 +723,14 @@
   // ---------- ETAs from the current location ----------
   // Geolocation fix under the shared rules (Geo.getFix). Without `prompt` it NEVER asks for permission (only if already
   // granted); a tap on the status line passes prompt. Returns {ok:true, lat, lng, accuracy} | {ok:false, code}.
-  async function quickFix(prompt) {
+  async function quickFix(prompt, fresh) { // fresh = no cached position (maximumAge 0)
     try {
       if (!navigator.geolocation) return { ok: false, code: 'unavailable' };
       if (navigator.permissions && navigator.permissions.query) {
         const st = await navigator.permissions.query({ name: 'geolocation' });
         if (st.state === 'denied' || (st.state !== 'granted' && !prompt)) return { ok: false, code: 'denied' };
       } else if (!prompt) return { ok: false, code: 'denied' };
-      return await Geo.getFix(navigator.geolocation);
+      return await Geo.getFix(navigator.geolocation, { fresh: !!fresh });
     } catch (e) { return { ok: false, code: 'unavailable' }; }
   }
   // Fix -> ONE routing request (fix -> next not-done stop, or the end point when every stop is done / skipped; live
@@ -745,10 +755,10 @@
       if (S.tab === 'route') render();
     };
     try {
-      const fix = await quickFix(!!opts.prompt);
+      const fix = opts.fix || await quickFix(!!opts.prompt); // opts.fix = a position the GPS watch / the foreground fix already took
       if (S.plan !== P) return;
       if (!fix.ok) return await fail(fix.code === 'denied' ? 'denied' : 'nofix');
-      autoReachCheck(fix); // every GPS update: auto-Reached when the rules in Reached.autoReachTarget hold
+      if (!opts.fix) autoReachCheck(fix); // every GPS update: auto-Reached when the rules in Reached.autoReachTarget hold (takeFix did it already)
       { const c0 = curPlan(), n0 = c0 && c0.stops.find((s) => !s.status); if (n0 && n0.reachedAt != null) { L.reason = null; L.origin = null; S.timesFrom = null; return; } } // on site: no routing to where we already are
       const o = L.origin && L.origin.placeId === tid ? L.origin : null;
       const verdict = Solver.judgeFix(fix, o && { lat: o.lat, lng: o.lng }, target, { force: !!opts.force });
@@ -791,6 +801,8 @@
   }
   // The status line: "On site at <name> since 14:10" while a stop is reached and not done, else where the times come from.
   function timesLineFor(plan) {
+    const lb = curLunch();
+    if (LunchBreak.phase(lb, S.settings, Date.now()) === 'active') return 'Lunch break until ' + fmt(LunchBreak.untilMs(lb, S.settings));
     const os = Reached.onSiteStop(plan.stops);
     if (os) return 'On site at ' + dName(((S.places[os.placeId] || (S.plan && S.plan.ctx.places[os.placeId])) || {}).name || '') + ' since ' + fmt(os.reachedAt);
     const di = lastDoneIdx(plan);
@@ -823,14 +835,14 @@
     const P = S.plan, cur = stripFuel(curPlan()); // compare like with like: the alternative is solved without the fuel stop
     const from0 = lastDoneIdx(cur), at0 = from0 >= 0 ? Date.now() : Math.max(Date.now(), Date.parse(P.ctx.departAtISO));
     const org = originFor(cur, at0);
-    const base = Solver.retime(cur, from0, iso(at0), org); // current plan, timed from the same place and moment (live origin included)
+    const base = timedPlan(cur, from0, iso(at0), org); // current plan, timed from the same place and moment (live origin included)
     let shiftMs = 0;
     if (org) { // the alternative is solved from the last done stop: shift it by what the live fix changed for the next stop
-      const b0 = Solver.retime(cur, from0, iso(at0)), n0 = b0.stops.find((s) => !s.status), n1 = base.stops.find((s) => !s.status);
+      const b0 = timedPlan(cur, from0, iso(at0)), n0 = b0.stops.find((s) => !s.status), n1 = base.stops.find((s) => !s.status);
       if (n0 && n1) shiftMs = n1.arriveAt - n0.arriveAt;
     }
     const r = resolveRemaining({ respect: true, shiftMs });
-    const alt = r.res.plans && r.res.plans[0];
+    const alt = r.res.plans && r.res.plans[0] && LunchBreak.applyBreak(r.res.plans[0], curLunch(), S.settings, Date.now()); // the same lunch break as the current plan
     if (r.res.error || !alt) { P.alt = { ok: false, message: 'No feasible alternative: ' + (r.res.error || 'nothing left to re-plan') + '.' }; return; }
     if (alt.violations.length) { P.alt = { ok: false, message: 'No feasible alternative: avoiding the closed windows would break a time window (' + alt.violations[0] + ').' }; return; }
     P.alt = { ok: true, r, plan: alt, deltaMs: alt.endArrival - base.endArrival, baseEnd: base.endArrival };
@@ -838,6 +850,7 @@
   async function useAlt() {
     adoptResult(S.plan.alt.r);
     S.loc.origin = null;
+    retimeNow();
     await logReplanVia('avoid-lunch');
     await savePlan();
     banner('Using the avoid-lunch plan (closed windows respected).', 'info');
@@ -865,6 +878,7 @@
     snap.plan.model.matrices = snap.ctx.matrices;
     if (snap.savedAt && DayLog.dateKey(Date.parse(snap.savedAt)) !== DayLog.dateKey(Date.now())) { // a plan carried over to another day starts fresh
       snap.plan.stops = snap.plan.stops.map((s) => (s.status ? s : Reached.carryForward(s)));
+      delete snap.plan.endNavStartedAt; // the end point's navigation tap belongs to that day too
     }
     S.plan = {
       ctx: snap.ctx, noDetour: !!snap.noDetour, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: snap.provider || null,
@@ -947,7 +961,7 @@
       const prev = lastG ? coord(lastG.stopId) : (day.planSnapshot && day.planSnapshot.start);
       const to = coord(stop.placeId), plan = curPlan();
       const dsec = plan && plan.model && plan.model.dwellSec ? plan.model.dwellSec[stop.placeId] : null; // planned dwell, for the on-site split
-      const rch = { reachedAt: stop.reachedAt != null ? stop.reachedAt : null, reachedSource: stop.reachedSource || null,
+      const rch = { reachedAt: stop.reachedAt != null ? stop.reachedAt : null, reachedSource: stop.reachedSource || null, navStartedAt: stop.navStartedAt != null ? stop.navStartedAt : null,
         dwellMin: dsec != null ? dsec / 60 : ((coordPlace(stop.placeId) || {}).dwellMin != null ? coordPlace(stop.placeId).dwellMin : null) };
       const evs = stop.fuel // the fuel stop is logged as a stop (kind 'fuel'), never as a job action
         ? [DL.recordFuel(day, Object.assign({ nowIso, stopId: stop.placeId, name: (coordPlace(stop.placeId) || {}).name || '', places: Object.assign({}, S.plan && S.plan.ctx.places, S.places) }, rch))]
@@ -1010,7 +1024,8 @@
     const nowMs = Date.now(), nowIso = new Date(nowMs).toISOString(), end = P.ctx.end;
     const day = dayFor(nowMs, true);
     if (DL.arrivedEnd(day)) return;
-    const ev = DL.recordArrivedEnd(day, { nowIso, endPoint: { lat: end.lat, lng: end.lng, name: end.name || '' } });
+    const cp = curPlan();
+    const ev = DL.recordArrivedEnd(day, { nowIso, endPoint: { lat: end.lat, lng: end.lng, name: end.name || '' }, navStartedAt: cp && cp.endNavStartedAt != null ? cp.endNavStartedAt : null });
     try { // keep the final leg if the plan's own routing matrices cover that exact pair (else the summary routes it once)
       const plan = curPlan(), groups = DL.doneGroups(day), lastG = groups[groups.length - 1];
       const prev = lastG ? coordOf(lastG.stopId, day) : (day.planSnapshot && day.planSnapshot.start);
@@ -1111,10 +1126,14 @@
         h('button', { class: 'small grow', disabled: ro(), onclick: () => editTime('finishedAt', s.finishedAt) }, 'Finished ' + (s.finishedAt != null ? hm(s.finishedAt) : '—') + (ro() ? '' : ' ✎')));
 
       // driving vs on site: only for days where a stop has a Reached time (days closed before this feature show nothing, nothing is backfilled)
-      const sp = Reached.splitOfSummary(s);
-      const splitCard = sp ? h('div', { class: 'card sum-sec split', id: 'sumSplit' }, h('div', { class: 'eyebrow' }, 'Driving vs on site'),
-        h('div', { class: 'sum-split', id: 'sumSplitLine' }, 'Driving ' + DL.fmtDur(sp.totals.driveMin) + ' · On site ' + DL.fmtDur(sp.totals.onSiteMin) + (sp.totals.anyEstimated ? ' (part estimated)' : '')),
-        sp.stops.filter((x) => !x.skipped).map((x) => line(h('span', null, x.name), 'arr ' + (x.estimated ? '~' : '') + hm(x.arrivalMs) + ' · left ' + hm(x.departMs)))) : null;
+      // days recorded with the navigation-tap timing (v2): driving / on site / between stops (+ lunch), per stop
+      // "left prev · nav · arr · done"; days closed before it keep the old driving-vs-on-site card (v1)
+      const sp = Reached.splitOfSummary(s, Date.now());
+      const ae = DL.arrivedEnd(day), endName = (ae && ae.endPoint && ae.endPoint.name) || 'End';
+      const endLine = sp && sp.v === 2 && sp.totals.end ? line(h('span', null, dName(endName)), Reached.stopLine(sp.totals.end, 2, hm)) : null;
+      const splitCard = sp ? h('div', { class: 'card sum-sec split', id: 'sumSplit' }, h('div', { class: 'eyebrow' }, sp.v === 2 ? 'Time split' : 'Driving vs on site'),
+        h('div', { class: 'sum-split', id: 'sumSplitLine' }, Reached.splitLine(sp, DL.fmtDur)),
+        sp.stops.filter((x) => !x.skipped).map((x) => line(h('span', null, x.name), Reached.stopLine(x, sp.v, hm))), endLine) : null;
 
       const urgentChip = h('span', { class: 'chip urgent' }, 'URGENT'), lateChip = h('span', { class: 'chip late' }, 'LATE');
       const collected = sec('Collected', 'collect', s.collected.map((c) => line(h('span', null, c.item || '(item)', ' - ', c.place), hm(c.t))), 'Nothing collected');
@@ -1256,7 +1275,8 @@
           h('div', null, h('b', { id: 'minLeft' }, Solver.formatDuration(view.leftSec)), h('span', { class: 'muted' }, 'left')),
           h('div', null, h('b', { id: 'endArrive' }, fmt(view.endArrival)), h('span', { class: 'muted' }, 'arrive ' + (ctx.end.name || 'end')))),
         h('div', { class: 'muted', id: 'departedAt', style: 'margin-top:8px' }, (departMs > now ? 'Departs ' : 'Departed ') + fmt(departMs)),
-        P.shiftMs > 60000 ? h('div', { class: 'chip detour' }, 'Running ' + Math.round(P.shiftMs / 60000) + ' min behind plan') : null),
+        P.shiftMs > 60000 ? h('div', { class: 'chip detour' }, 'Running ' + Math.round(P.shiftMs / 60000) + ' min behind plan') : null,
+        lunchSkippedLine()),
       h('label', { class: 'toggle card' }, h('input', { type: 'checkbox', checked: P.noDetour, onchange: (e) => { P.noDetour = e.target.checked; reSolveFromCache(); } }), 'No detour (urgent deliveries first, nothing else in between)'));
 
     if (plan.violations.length) v.append(h('div', { class: 'violations' }, h('b', null, 'No plan meets every time window:'), plan.violations.map((t) => h('div', null, '• ' + t))));
@@ -1295,8 +1315,12 @@
     }
 
     // timeline
+    const lbar = lunchBar(plan);
+    if (lbar) v.append(lbar); // above the stop list, never over a card
     const tl = h('div', { class: 'timeline' });
-    view.stops.forEach((stop, i) => tl.append(stopCard(stop, i)));
+    const lm = lunchMarker(plan), lmBefore = plan.lunch ? plan.lunch.beforePlaceId : null;
+    view.stops.forEach((stop, i) => { if (lm && lmBefore != null && !stop.status && stop.placeId === lmBefore) tl.append(lm); tl.append(stopCard(stop, i)); });
+    if (lm && lmBefore == null) tl.append(lm); // the break is after the last stop (before the end point)
     v.append(tl);
     v.append(endCard(view.endArrival, arrEv));
     v.append(h('button', { class: 'end-day', id: 'routeEndDay', onclick: endDayTap }, 'End day'));
@@ -1332,18 +1356,49 @@
         h('button', { class: 'grow', onclick: dismiss }, 'Keep current')));
   }
 
-  function navButtons(place) { // WAZE / MAPS per the Settings choice (same on stop cards and the end card)
+  // WAZE / MAPS per the Settings choice (same on stop cards and the end card). onTap = stamps the stop's navStartedAt
+  // (the whole-route "Open in Google Maps" button has none: it never starts a stop's travel time).
+  function navButtons(place, onTap) {
     const nav = S.settings.nav || 'waze', btns = [];
-    if (nav === 'waze' || nav === 'both') btns.push(h('a', { class: 'btn small', href: wazeUrl(place), target: '_blank', rel: 'noopener' }, 'WAZE'));
-    if (nav === 'google' || nav === 'both') btns.push(h('a', { class: 'btn small', href: gmapsUrl(S.plan.ctx.start, place, []).replace(/origin=[^&]*&/, ''), target: '_blank', rel: 'noopener' }, 'MAPS'));
+    if (nav === 'waze' || nav === 'both') btns.push(h('a', { class: 'btn small nav-btn', href: wazeUrl(place), target: '_blank', rel: 'noopener', onclick: onTap || null }, 'WAZE'));
+    if (nav === 'google' || nav === 'both') btns.push(h('a', { class: 'btn small nav-btn', href: gmapsUrl(S.plan.ctx.start, place, []).replace(/origin=[^&]*&/, ''), target: '_blank', rel: 'noopener', onclick: onTap || null }, 'MAPS'));
     return btns;
+  }
+  // The previous departure for travel timing: the last done stop's done time, else the day's start / the plan's departure.
+  function prevDepartureMs(plan) {
+    const di = lastDoneIdx(plan);
+    if (di >= 0) return Date.parse(plan.stops[di].doneAt);
+    const day = dayFor(Date.now(), false);
+    return day && day.startedAt ? Date.parse(day.startedAt) : Date.parse(S.plan.ctx.departAtISO);
+  }
+  // A tap on a stop's own WAZE / MAPS: the FIRST one after the previous departure is that stop's navStartedAt (the link
+  // still opens). Later taps, and taps on a reached / done / skipped stop, change nothing (Reached.stampNav).
+  function navTap(stop0, i0) {
+    try {
+      const ls = liveStop(stop0, i0);
+      if (!ls) return;
+      const cur = curPlan(), next = Reached.stampNav(ls.stop, Date.now(), prevDepartureMs(cur));
+      if (next === ls.stop) return;
+      ls.stop.navStartedAt = next.navStartedAt;
+      savePlan();
+    } catch (e) { /* never block the navigation link */ }
+  }
+  function navTapEnd() {
+    try {
+      const cur = curPlan(), day = dayFor(Date.now(), false);
+      if (!cur || (day && DL.arrivedEnd(day))) return; // after ARRIVED: ignored
+      const next = Reached.stampNav({ navStartedAt: cur.endNavStartedAt }, Date.now(), prevDepartureMs(cur));
+      if (next.navStartedAt === cur.endNavStartedAt) return;
+      cur.endNavStartedAt = next.navStartedAt;
+      savePlan();
+    } catch (e) { /* never block the navigation link */ }
   }
 
   // The end point is a real card: re-timed arrival, WAZE and ARRIVED (arrived = a day-log event + "arrived HH:MM" with Undo)
   function endCard(endArrival, arrEv) {
     const end = S.plan.ctx.end;
     const arrivedMs = arrEv ? Date.parse(arrEv.t) : null;
-    const btns = navButtons(end);
+    const btns = navButtons(end, () => navTapEnd());
     btns.push(arrEv
       ? h('button', { class: 'small undo', id: 'undoArrived', 'aria-label': 'Undo arrived', onclick: () => undoArrivedEnd() }, 'Undo')
       : h('button', { class: 'small ok', id: 'arrivedBtn', onclick: () => markArrivedEnd() }, 'ARRIVED'));
@@ -1414,7 +1469,7 @@
     };
     head.onclick = toggle;
     head.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } };
-    const btns = navButtons(place);
+    const btns = navButtons(place, () => navTap(stop, i));
     if (hasDelivery) btns.push(h('button', { class: 'small', onclick: () => { const m = stopMessage(stop, P.shiftMs); shareMessage(m.place, m.text); } }, 'MSG'));
     btns.push(primaryBtn(stop, i)); // REACHED, then DONE: one button, the place and size DONE always had
     btns.push(h('button', { class: 'small', onclick: () => skipStop(stop, i) }, 'SKIP'));
@@ -1488,11 +1543,135 @@
       return true;
     } catch (e) { return false; }
   }
-  async function autoReachNow() { // page became visible: one GPS read (never prompts), then the same rules
-    const plan = curPlan();
-    if (!S.plan || !plan || S.settings.autoReach === false || !plan.stops.some((s) => !s.status)) return;
-    const fix = await quickFix(false);
-    if (fix.ok) autoReachCheck(fix);
+  // ---------- GPS WATCH: auto-reach while the app stays open ----------
+  // Before this, positions came only from one-off getCurrentPosition calls (Route tab opened, launch, back in the foreground,
+  // DONE / SKIP / Undo, status-line tap; at most one per 2 min) and the minute tick only repainted, so with the app left
+  // open no new fix arrived and auto-reach never re-ran. Now ONE navigator.geolocation.watchPosition runs while the page is
+  // visible, a stop is pending and the day is open (Reached.shouldWatch), and is cleared otherwise: never in the background,
+  // never two. It starts only when the location permission is already granted (it never prompts). Every position takes
+  // the same path as any fix (takeFix): stored with its time, auto-reach evaluated at once, the route re-timed at most
+  // once per 30 s (an auto-reach re-times at once). Errors never toast: denied / unavailable stop it until the next
+  // visibility change; a timeout leaves it running (the platform keeps trying).
+  const W = { id: null, starting: false, blocked: false, lastRetimeAt: null };
+  function watchWanted() {
+    const day = S.plan ? S.days[planDayKey()] : null;
+    return Reached.shouldWatch({ visible: document.visibilityState === 'visible', hasPendingStop: hasPendingStop(curPlan()), dayClosed: !!(day && day.closed) });
+  }
+  function stopWatch() {
+    if (W.id == null) return;
+    try { navigator.geolocation.clearWatch(W.id); } catch (e) { /* ignore */ }
+    W.id = null;
+  }
+  async function syncWatch() {
+    try {
+      const geo = navigator.geolocation;
+      if (!watchWanted()) { stopWatch(); return; }
+      if (W.id != null || W.starting || W.blocked || !geo || typeof geo.watchPosition !== 'function') return;
+      W.starting = true;
+      let granted = false;
+      try { granted = !!(navigator.permissions && navigator.permissions.query) && (await navigator.permissions.query({ name: 'geolocation' })).state === 'granted'; } catch (e) { granted = false; }
+      W.starting = false;
+      if (!granted || W.id != null || !watchWanted()) return;
+      W.id = geo.watchPosition(onWatchPosition, onWatchError, Reached.WATCH_OPTS);
+    } catch (e) { W.starting = false; }
+  }
+  function onWatchPosition(p) {
+    try {
+      if (W.id == null || !watchWanted() || !p || !p.coords) return; // a late callback after clearWatch
+      takeFix({ ok: true, lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy, at: p.timestamp != null ? p.timestamp : Date.now() }, 'watch');
+    } catch (e) { /* never break the page */ }
+  }
+  function onWatchError(e) {
+    const code = e && e.code;
+    if (code === 3) return; // TIMEOUT: the watch keeps trying by itself
+    stopWatch(); W.blocked = true; // denied / unavailable: retried on the next visibility change
+    const reason = code === 1 ? 'denied' : 'nofix';
+    if (S.loc.reason !== reason) { S.loc.reason = reason; paintTimesLine(); } // the status line says why, as before (no toast)
+  }
+  // One fix (watch update, or the fresh foreground fix): store it, auto-reach, then re-time (throttled for the watch).
+  function takeFix(fix, src) {
+    S.loc.lastFix = fix;
+    const now = Date.now();
+    if (autoReachCheck(fix)) { W.lastRetimeAt = now; return; } // auto-reach re-times at once (afterReachChange)
+    if (src === 'watch') {
+      if (!Reached.retimeDue(W.lastRetimeAt, now)) return;
+      W.lastRetimeAt = now;
+      if (S.plan && retimeNow()) { savePlan(); if (S.tab === 'route' && !document.querySelector('.backdrop')) render(); }
+    }
+    refreshFromLocation({ fix }); // the usual live-origin path (its own 2-min / 300 m throttle on routing requests)
+  }
+  // Back in the foreground: one immediate FRESH fix (no cached position); auto-reach is evaluated when it arrives.
+  async function freshFixNow() {
+    const P = S.plan;
+    if (!P) return;
+    const fix = await quickFix(false, true);
+    if (S.plan !== P) return;
+    if (fix.ok) takeFix(fix, 'visible'); else refreshFromLocation({ fix });
+  }
+
+  // ---------- LUNCH BREAK (the driver's; the rules live in lunchbreak.js) ----------
+  // Today's state {date, startedAt, endedAt, skipped} survives reloads (meta:lunchBreak). The day log gets the REAL break
+  // only (breakStartedAt / breakEndedAt on the day record); an assumed break that never started is not logged.
+  function lunchDayKey() { return planDayKey() || DL.dateKey(Date.now()); }
+  function curLunch() {
+    const k = lunchDayKey();
+    if (!S.lunch || S.lunch.date !== k) S.lunch = LunchBreak.forDay(S.lunch, k);
+    return S.lunch;
+  }
+  const saveLunch = () => WPStore.set('meta', 'lunchBreak', S.lunch).catch(() => {});
+  const hasPendingStop = (plan) => !!(plan && plan.stops.some((s) => !s.status));
+  async function lunchChanged() { // re-time from now with the new break state, repaint, save
+    retimeNow(); // a live origin stays valid: the break only moves the departure
+    await saveLunch();
+    await savePlan();
+    if (S.tab === 'route') render();
+  }
+  async function lunchStart() {
+    const st = curLunch(), now = Date.now();
+    if (LunchBreak.phase(st, S.settings, now) !== 'assumed') return;
+    S.lunch = LunchBreak.start(st, now);
+    try { const d = dayFor(now, true); DL.recordBreakStart(d, { nowIso: iso(now) }); bgSaveDay(d); } catch (e) { /* never break the bar */ }
+    await lunchChanged();
+  }
+  async function lunchEnd(auto) { // End break (or the length elapsed: auto)
+    const st = curLunch(), now = Date.now();
+    if (st.startedAt == null || st.endedAt != null) return;
+    S.lunch = auto ? LunchBreak.autoEnd(st, S.settings, now) : LunchBreak.end(st, S.settings, now);
+    if (S.lunch.endedAt == null) return;
+    try { const d = dayFor(st.startedAt, false) || dayFor(now, true); DL.recordBreakEnd(d, { nowIso: iso(S.lunch.endedAt) }); bgSaveDay(d); } catch (e) { /* ignore */ }
+    await lunchChanged();
+  }
+  async function lunchSkip() { S.lunch = LunchBreak.skip(curLunch()); await lunchChanged(); }
+  async function lunchUndoSkip() { S.lunch = LunchBreak.unskip(curLunch()); await lunchChanged(); }
+  // once a minute, on launch and back in the foreground: a break whose length elapsed ends by itself
+  function lunchTick() {
+    const st = curLunch();
+    if (st.startedAt != null && st.endedAt == null && LunchBreak.phase(st, S.settings, Date.now()) === 'taken') lunchEnd(true);
+  }
+  // The slim bar above the stop list (never a modal): Start / Skip today, then "Lunch until 13:20 · End break".
+  function lunchBar(plan) {
+    const b = LunchBreak.bar(curLunch(), S.settings, Date.now(), hasPendingStop(plan));
+    if (!b || b.kind === 'skipped') return null;
+    if (b.kind === 'active') {
+      return h('div', { class: 'lunch-bar active', id: 'lunchBar' }, h('span', { class: 'lunch-text' }, 'Lunch until ' + fmt(b.untilMs)),
+        ' · ', h('button', { class: 'link-btn', type: 'button', id: 'lunchEnd', onclick: () => lunchEnd(false) }, 'End break'));
+    }
+    return h('div', { class: 'lunch-bar', id: 'lunchBar' },
+      h('button', { class: 'small lunch-start', type: 'button', id: 'lunchStart', onclick: () => lunchStart() }, b.label),
+      h('button', { class: 'link-btn', type: 'button', id: 'lunchSkip', onclick: () => lunchSkip() }, 'Skip today'));
+  }
+  // "Lunch skipped · Undo" in the Route header area, until End day closes the day
+  function lunchSkippedLine() {
+    const day = S.days[lunchDayKey()];
+    if (LunchBreak.phase(curLunch(), S.settings, Date.now()) !== 'skipped' || (day && day.closed)) return null;
+    return h('div', { class: 'muted lunch-skipped', id: 'lunchSkipped' }, 'Lunch skipped · ',
+      h('button', { class: 'link-undo', type: 'button', id: 'lunchUndoSkip', 'aria-label': 'Undo lunch skipped', onclick: () => lunchUndoSkip() }, 'Undo'));
+  }
+  // where the break sits in the timeline (assumed: "Lunch break ~12:40–13:40"; real: "Lunch break until 13:20")
+  function lunchMarker(plan) {
+    const L = plan && plan.lunch;
+    if (!L) return null;
+    return h('div', { class: 'muted lunch-marker', id: 'lunchMarker' }, L.kind === 'active' ? 'Lunch break until ' + fmt(L.endMs) : 'Lunch break ~' + fmt(L.startMs) + '–' + fmt(L.endMs));
   }
 
   // the stop object a button was rendered with may belong to an older plan object (re-timing replaces them): re-find it
@@ -1527,11 +1706,11 @@
     P.alt = null;
     P.result.plans = [P.result.plans[P.idx]]; P.idx = 0; // alternatives pre-date this DONE: drop them
     // live re-timing: from this stop, at the DONE time, order unchanged - shown at once, never waiting for the network
-    P.result.plans[0] = Solver.retime(P.result.plans[0], i, nowIso);
+    P.result.plans[0] = timedPlan(P.result.plans[0], i, nowIso);
     P.shiftMs = 0;
     render();
     await refreshIfStale(P.result.plans[0]);              // travel times older than 30 min are re-fetched, then re-timed again
-    P.result.plans[0] = Solver.retime(P.result.plans[0], i, nowIso);
+    P.result.plans[0] = timedPlan(P.result.plans[0], i, nowIso);
     // offer to send the ETA to the next stop if it is a delivery and has a WhatsApp number
     const plan = P.result.plans[0];
     const next = plan.stops.slice(i + 1).find((s) => !s.status);
@@ -1701,7 +1880,7 @@
   }
   function retimeLocal(plan) { // like retimeNow(), for a plan that is not (yet) the current one
     const P = S.plan, from = lastDoneIdx(plan), now = Date.now();
-    return Solver.retime(plan, from, iso(from < 0 ? Math.max(now, Date.parse(P.ctx.departAtISO)) : now));
+    return timedPlan(plan, from, iso(from < 0 ? Math.max(now, Date.parse(P.ctx.departAtISO)) : now));
   }
   // the already chosen station put back by the same rule (lowest detour over the allowed legs), from its stored times only
   function insertBestFuel(plan, fz, place) {
@@ -1715,8 +1894,19 @@
     const fz = old && old.model && old.model.fuelT, place = S.plan.ctx.places[FUEL_ID];
     if (!fz) return p;
     let q = Object.assign({}, p, { model: Object.assign({}, p.model, { fuelT: fz }) });
-    if (place && old.stops.some((s) => s.fuel && !s.status)) q = retimeLocal(insertBestFuel(q, fz, place));
+    if (place && old.stops.some((s) => s.fuel && !s.status)) q = retimeLocal(reinsertFuel(old, q, fz, place));
     return q;
+  }
+  // The pending fuel stop put back into a re-solved plan. Reached (you are at the station) = it goes first among the
+  // pending stops; else the lowest-detour leg. Its reached / navigation state is kept (Reached.keepStateOf).
+  function reinsertFuel(prevPlan, q, fz, place) {
+    const old = prevPlan.stops.find((s) => s.fuel && !s.status);
+    let r;
+    if (old && old.reachedAt != null) {
+      const first = q.stops.find((s) => !s.status);
+      r = withFuel(q, first ? { role: 'stop', id: first.placeId } : null, fz, place);
+    } else r = insertBestFuel(q, fz, place);
+    return Object.assign({}, r, { stops: Reached.keepStateOf(prevPlan.stops, r.stops) });
   }
   // Replan from here: keep the fuel stop, silently re-placed (fresh times for the chosen station only; no Places calls)
   async function keepFuelAfterReplan(prevPlan, prevPlaces, points) {
@@ -1733,7 +1923,7 @@
     }
     P.result.plans = P.result.plans.map((p) => {
       const q = Object.assign({}, p, { model: Object.assign({}, p.model, { fuelT: fz }) });
-      return pending ? retimeLocal(insertBestFuel(q, fz, place)) : q;
+      return pending ? retimeLocal(reinsertFuel(prevPlan, q, fz, place)) : q;
     });
   }
 
@@ -1852,7 +2042,7 @@
   }
 
   function fuelCard(stop, i, place) { // fuel tag, station, ETA, navigation, DONE / SKIP / REMOVE (no WhatsApp message)
-    const btns = navButtons(place);
+    const btns = navButtons(place, () => navTap(stop, i));
     btns.push(primaryBtn(stop, i));
     btns.push(h('button', { class: 'small', onclick: () => skipStop(stop, i) }, 'SKIP'));
     btns.push(h('button', { class: 'small danger', 'aria-label': 'Remove fuel stop', onclick: () => removeFuel() }, 'REMOVE'));
@@ -2045,6 +2235,7 @@
         h('label', { class: 'check-row' },
           h('input', { type: 'checkbox', id: 'autoReach', checked: s.autoReach !== false, style: 'width:auto;min-height:0', onchange: (e) => { s.autoReach = e.target.checked; saveSettings(); } }),
           " Mark Reached automatically when I'm within 150 m (app open)")),
+      lunchSettingsCard(s, field),
       fuelSettingsCard(s, field),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Data'),
         h('div', { class: 'row' }, h('button', { class: 'grow', onclick: exportJson }, 'Export JSON'), h('button', { class: 'grow', onclick: () => fileIn.click() }, 'Import JSON'), fileIn),
@@ -2053,6 +2244,19 @@
       h('div', { class: 'muted', style: 'text-align:center' }, 'L-Tech Waypoint v' + APP_VERSION + ' · build ' + BUILD_STAMP),
       h('div', { class: 'muted', id: 'swBuild', style: 'text-align:center;font-size:12px' }, 'Service worker: checking…'));
     describeServiceWorker().then((t) => { const el = document.getElementById('swBuild'); if (el) el.textContent = t; });
+  }
+
+  // Settings -> Lunch break (the driver's own break; a customer's lunch is the place's closed window). Device-stored, in Export / Import.
+  function lunchSettingsCard(s, field) {
+    const changed = () => { saveSettings(); if (S.plan && retimeNow()) savePlan(); };
+    const cfg = LunchBreak.settingsOf(s);
+    return h('div', { class: 'card', id: 'lunchCard' }, h('h2', { style: 'margin-top:0' }, 'Lunch break'),
+      h('label', { class: 'check-row' },
+        h('input', { type: 'checkbox', id: 'lunchOn', checked: cfg.on, style: 'width:auto;min-height:0', onchange: (e) => { s.lunchBreakOn = e.target.checked; changed(); } }),
+        ' Plan a lunch break'),
+      h('div', { class: 'row' },
+        h('div', { class: 'grow' }, field('Available from', h('input', { type: 'time', id: 'lunchFrom', value: cfg.from, onchange: (e) => { if (/^\d{1,2}:\d{2}$/.test(e.target.value)) { s.lunchBreakFrom = e.target.value; changed(); } } }))),
+        h('div', { class: 'grow' }, field('Length (minutes)', h('input', { type: 'number', id: 'lunchLen', inputmode: 'numeric', min: '5', max: '240', value: String(cfg.lenMin), onchange: (e) => { const n = Math.round(Number(e.target.value)); if (n > 0) { s.lunchBreakMin = n; changed(); } } })))));
   }
 
   // Which build is the service worker running? (compare with the build above; they match once an update has applied)
@@ -2121,6 +2325,7 @@
     else if (S.tab === 'places') renderPlaces(v);
     else renderSettings(v);
     window.scrollTo(0, scroll);
+    syncWatch(); // the GPS watch follows the state (plan, pending stops, day closed) after every change
   }
 
   document.getElementById('tabs').addEventListener('click', (e) => {
@@ -2134,11 +2339,15 @@
   });
 
   // Back in the foreground: re-time what is left from the last done stop (or the start) at the current time.
+  // Hidden: the GPS watch stops. Visible: the watch starts again and one fresh fix is requested (auto-reach on it).
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState !== 'visible' || !S.plan) return;
+    if (document.visibilityState !== 'visible') { stopWatch(); return; }
+    W.blocked = false; // a watch stopped by an error is retried now
+    if (!S.plan) return;
+    lunchTick();
     if (retimeNow()) { savePlan(); if (S.tab === 'route') render(); }
-    refreshFromLocation(); // back in the foreground
-    autoReachNow(); // and the auto-reach rules once, on a fresh fix
+    syncWatch();
+    freshFixNow(); // back in the foreground: one fresh fix -> auto-reach, then the live-origin path
   });
 
   // Service worker: register, look for updates on every launch and whenever the app comes back to the
@@ -2167,10 +2376,12 @@
 
   // Route tab open: re-render once a minute (NO network call) so no time shown has slipped into the past.
   setInterval(() => {
+    if (S.plan) lunchTick(); // a lunch break whose length elapsed ends by itself
     if (S.tab === 'route' && S.plan && document.visibilityState === 'visible' && !document.querySelector('.backdrop')) render();
   }, 60000);
 
   load().then(() => {
+    if (S.plan) lunchTick();
     if (S.plan && retimeNow()) savePlan(); // restored plan: re-time from the last done stop (or start) at the current time
     render();
     if (S.tab === 'route' && S.plan) refreshFromLocation();
