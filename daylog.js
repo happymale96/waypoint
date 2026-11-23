@@ -146,6 +146,18 @@
     return appendEvent(day, { t: info.nowIso, type: 'skip', stopId: info.stopId, name: info.name || '', reachedAt: info.reachedAt != null ? info.reachedAt : null });
   }
   function recordUndoSkip(day, info) { return appendEvent(day, { t: info.nowIso, type: 'undo', of: 'skip', skipStopId: info.stopId }); }
+  // A loose item (collected by a collect-only job) dropped off, and its Undo. They carry no timing, so the day's time-split mark is left alone.
+  // info: {nowIso, looseId, item, place?}
+  function recordDropoff(day, info) {
+    const e = { t: info.nowIso, type: 'dropoff', jobId: null, stopId: null, lat: null, lng: null, accuracy: null, looseId: info.looseId, item: info.item || '', place: info.place || '' };
+    day.events.push(e);
+    return e;
+  }
+  function recordUndoDropoff(day, info) {
+    const e = { t: info.nowIso, type: 'undo', of: 'dropoff', jobId: null, stopId: null, lat: null, lng: null, accuracy: null, looseId: info.looseId };
+    day.events.push(e);
+    return e;
+  }
   // The driver's lunch break (Route tab bar): the real interval, on the day record. An assumed break never started is not logged.
   function recordBreakStart(day, info) { day.breakStartedAt = info.nowIso; day.breakEndedAt = null; day.timeSplitV = TIME_SPLIT_V; }
   function recordBreakEnd(day, info) { if (day.breakStartedAt) day.breakEndedAt = info.nowIso; }
@@ -244,7 +256,9 @@
     return best.reduce((x, y) => Math.max(x, y), 0);
   }
 
-  function summarise(day, jobs, places) {
+  // extra (optional, from OnBoard.summaryExtra): {withYou: [loose items with the driver at the day's close], dropped: [items dropped off that day]}.
+  // A withYou entry whose jobId is already listed by the day's own rows is skipped.
+  function summarise(day, jobs, places, extra) {
     const jobMap = {};
     (jobs || []).forEach((j) => { jobMap[j.id] = j; });
     const placeOf = (id) => (places && places[id]) || day.places[id] || null;
@@ -371,6 +385,10 @@
       else if (e.type === 'undo' && e.of === 'skip') { for (let i = skips.length - 1; i >= 0; i--) if (skips[i].stopId === e.skipStopId) { skips.splice(i, 1); break; } }
     });
 
+    const rowsWith = rows.filter((r) => r.withYou), listed = new Set(rowsWith.map((r) => r.jobId));
+    const stillWithYou = rowsWith.concat(((extra && extra.withYou) || []).filter((x) => !(x.jobId && listed.has(x.jobId))));
+    const droppedOff = ((extra && extra.dropped) || []).slice();
+
     return {
       visits, navs, skips, timeSplitV: day.timeSplitV || 1,
       arrivedEndNavAt: arrEv && arrEv.navStartedAt != null ? arrEv.navStartedAt : null,
@@ -381,7 +399,7 @@
       km, driveMin, hoursOutMin, atStopsMin, startedAt, finishedAt, arrivedEndAt: arrivedAt,
       startedSource: ms(day.edits.startedAt) != null ? 'edited' : snap ? 'first plan' : '—',
       collected, delivered, errands,
-      stillWithYou: rows.filter((r) => r.withYou),
+      stillWithYou, droppedOff,
       notDone: rows.filter((r) => !r.complete),
       plan: { plannedKm: snap ? snap.plannedKm : null, plannedDriveMin: snap ? snap.plannedDriveMin : null, replans, outOfOrder, stopsDone: visitSeq.length, stopsPlanned: order.length },
       rows,
@@ -624,7 +642,8 @@
     sec('Collected', sum.collected.map((c) => '- ' + t(c.t) + ' ' + c.item + ' - ' + c.place));
     sec('Delivered', sum.delivered.map((d) => '- ' + t(d.t) + ' ' + d.item + ' - ' + d.place + (d.urgent ? ' [URGENT]' : '') + (d.late ? ' [LATE]' : '')));
     sec('Errands done', sum.errands.map((e) => '- ' + t(e.t) + ' ' + e.item + ' - ' + e.place));
-    sec('Still with me', sum.stillWithYou.map((r) => '- ' + r.item + ' -> ' + r.to));
+    sec('Still with me', sum.stillWithYou.map((r) => '- ' + (r.item || '(item)') + (r.loose && r.from ? ' (from ' + r.from + ')' : '') + (r.loose && !r.to ? '' : ' -> ' + r.to)));
+    sec('Dropped off', (sum.droppedOff || []).map((d) => '- ' + t(d.t) + ' ' + (d.item || '(item)') + (d.place ? ' (' + d.place + ')' : '')));
     sec('Not done', sum.notDone.map((r) => '- ' + (r.item || r.type) + (r.to ? ' -> ' + r.to : '') + (r.urgent ? ' [URGENT]' : '') + (r.reason ? ' (' + r.reason + ')' : '') + (r.carry ? ' [carried to tomorrow]' : ' [dropped]')));
     return L.join('\n');
   }
@@ -632,7 +651,7 @@
   return {
     SCHEMA, KEEP_DAYS, REASONS, CSV_HEADER,
     dateKey, fmtDate, fmtTime, fmtDur, fmtKm, addDaysKey, dayStartMs, ageDays,
-    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordFuel, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, recordNav, recordSkip, recordUndoSkip, recordBreakStart, recordBreakEnd, TIME_SPLIT_V, arrivedEnd, doneGroups, hasActiveDone,
+    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordFuel, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, recordNav, recordSkip, recordUndoSkip, recordDropoff, recordUndoDropoff, recordBreakStart, recordBreakEnd, TIME_SPLIT_V, arrivedEnd, doneGroups, hasActiveDone,
     ptKey, legKey, seqKey, legFromMatrices, captureLeg, plannedFromMatrices,
     summarise, closeDay, reopenDay, refreshTotals, recordFor, activityKey, hasActivity, isEmptyRecord, openDayKey, endDay,
     REPAIR_VERSION, repairHistory, runRepairOnce, exportPayload, importPayload, pruneDates, weekRange, weekTotals, historyKeys, toCSV, csvCell, toWhatsApp,

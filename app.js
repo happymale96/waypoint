@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = 'f7650cb4'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = 'efae4694'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -36,6 +36,7 @@
     plan: null, busy: false, days: {}, loc: { lastAt: null, origin: null, busy: false, reason: null }, timesFrom: null,
     fuelStations: [], // permanent station memory (see FUEL STOP below); in Export / Import, never shown in the Places tab
     lunch: null, // today's lunch-break state {date, startedAt, endedAt, skipped} (LUNCH BREAK below); stored as meta:lunchBreak
+    loose: [], // items collected by a collect-only job, still with the driver (ITEMS WITH YOU below); collection "loose", in Export / Import
   };
 
   function defaultSettings() {
@@ -73,6 +74,8 @@
     if (!S.places[S.endSel]) S.endSel = Object.keys(S.places)[0] || '';
     await runMigrations();
     await loadDays();
+    S.loose = (await WPStore.list('loose')).filter((x) => x && x.id);
+    await backfillLoose(); // once: today's / the latest closed day's collect-only jobs get their loose item
     await restorePlan(); // the Route tab comes back exactly as it was left
     try { S.lunch = LunchBreak.forDay(await WPStore.get('meta', 'lunchBreak'), lunchDayKey()); } catch (e) { S.lunch = LunchBreak.fresh(lunchDayKey()); }
   }
@@ -355,6 +358,108 @@
     render();
   }
 
+  // ---------- ITEMS WITH YOU (the rules live in onboard.js) ----------
+  // A slim bar on the Plan and Route tabs: "With you: N item(s)", tap to expand. A collect-only job marked DONE leaves a LOOSE
+  // item (not a job, never counted as one, not cleared by End day) with two buttons: Dropped off (Undo) and Deliver to… (opens the
+  // add-job form in in-hand mode; saving it converts the loose item into that job). Items of a pending delivery job show "→ destination".
+  const placeNameOf = (id) => dName(pName(id));
+  const boardState = () => ({ jobs: S.jobs, loose: S.loose, nameOf: placeNameOf });
+  const onBoardNow = () => OnBoard.onBoard(boardState(), Date.now());
+  async function setLoose(next) { // keep S.loose and the stored collection in step (changed items written, removed ones deleted)
+    const before = S.loose;
+    S.loose = next;
+    for (const it of next) { const old = before.find((x) => x.id === it.id); if (!old || JSON.stringify(old) !== JSON.stringify(it)) await WPStore.set('loose', it.id, it); }
+    for (const old of before) if (!next.some((x) => x.id === old.id)) await WPStore.remove('loose', old.id);
+  }
+  let boardOpen = false;
+  function onBoardBar() {
+    const items = onBoardNow();
+    if (!items.length) return null;
+    return h('div', { class: 'onboard', id: 'onBoardBar' },
+      h('button', { class: 'ob-head', id: 'onBoardToggle', type: 'button', 'aria-expanded': String(boardOpen), onclick: () => { boardOpen = !boardOpen; render(); } },
+        h('span', null, OnBoard.barLabel(items.length)), h('span', { class: 'ob-chev', 'aria-hidden': 'true' }, boardOpen ? '▴' : '▾')),
+      boardOpen ? h('div', { class: 'ob-list', id: 'onBoardList' }, items.map(boardRow)) : null);
+  }
+  function boardRow(it) {
+    const when = it.fromAt ? OnBoard.whenLabel(it.fromAt) : '';
+    const src = it.from ? 'from ' + dName(it.from) + (when ? ' · ' + when : '') : (it.kind === 'inhand' ? 'in hand' : '');
+    const sub = [src, it.to ? '→ ' + dName(it.to) : ''].filter(Boolean).join(' ');
+    return h('div', { class: 'ob-row', 'data-kind': it.kind },
+      h('div', { class: 'ob-text' }, h('div', { class: 'ob-name' }, it.item || '(item)'), sub ? h('div', { class: 'muted ob-sub' }, sub) : null),
+      it.kind === 'loose' ? h('div', { class: 'ob-btns' },
+        h('button', { class: 'small', type: 'button', 'data-act': 'drop', onclick: () => looseDrop(it.looseId) }, 'Dropped off'),
+        h('button', { class: 'small', type: 'button', 'data-act': 'deliver', onclick: () => looseDeliver(it.looseId) }, 'Deliver to…')) : null);
+  }
+  // the day event of a drop-off (only when the day has a record; the summary's "Dropped off" line comes from the loose store itself)
+  function logDropoff(kind, it, at, place) {
+    try {
+      const day = dayFor(at, false);
+      if (!day) return null;
+      const info = { nowIso: iso(at), looseId: it.id, item: it.item, place: place || '' };
+      const ev = kind === 'drop' ? DL.recordDropoff(day, info) : DL.recordUndoDropoff(day, info);
+      bgSaveDay(day);
+      return { day, ev };
+    } catch (e) { return null; }
+  }
+  async function looseDrop(id) {
+    const it = S.loose.find((x) => x.id === id);
+    if (!it || it.status === 'dropped') return;
+    const at = Date.now();
+    await setLoose(OnBoard.dropOff(S.loose, id, at, ''));
+    const logged = logDropoff('drop', it, at, '');
+    toastUndo('Dropped off: ' + (it.item || '(item)'), () => looseUndoDrop(id, at));
+    render();
+    try { // where it was left: a fresh fix within 150 m of a saved place (never prompts, never blocks the tap)
+      const f = await quickFix(false, true);
+      const pl = f.ok ? OnBoard.nearestPlace(f, Object.values(S.places), OnBoard.DROP_RADIUS_M) : null;
+      if (!pl) return;
+      await setLoose(OnBoard.setDropPlace(S.loose, id, at, pl.name));
+      if (logged) { logged.ev.place = pl.name; bgSaveDay(logged.day); }
+    } catch (e) { /* the item is dropped off either way */ }
+  }
+  async function looseUndoDrop(id, at) {
+    const it = S.loose.find((x) => x.id === id);
+    if (!it || it.status !== 'dropped' || Date.parse(it.droppedAt) !== at) return;
+    await setLoose(OnBoard.undoDrop(S.loose, id));
+    logDropoff('undo', it, Date.now(), '');
+    render();
+  }
+  function looseDeliver(id) {
+    const it = S.loose.find((x) => x.id === id);
+    if (it) openJobSheet({ looseId: it.id, item: it.item, notes: it.notes });
+  }
+  // once, on the first load after this update: collect-only jobs done today / on the most recent closed day get their loose item
+  async function backfillLoose() {
+    try {
+      const keys = OnBoard.backfillKeys(DL.dateKey(Date.now()), Object.values(S.days).map((d) => ({ date: d.date, closed: !!d.closed })));
+      const rows = [];
+      keys.forEach((k) => {
+        if (!S.days[k]) return;
+        DL.summarise(S.days[k], S.jobs, S.places).rows.forEach((r) => { if (r.type === 'collect' && r.complete && r.doneMs != null) rows.push({ jobId: r.jobId, item: r.item, from: r.from, doneMs: r.doneMs, notes: r.notes }); });
+      });
+      const added = await OnBoard.runBackfillOnce(WPStore, { jobs: S.jobs, loose: S.loose }, { keys, dateKey: DL.dateKey, nameOf: placeNameOf, rows }, new Date().toISOString());
+      if (added && added.length) S.loose = S.loose.concat(added);
+    } catch (e) { /* retried on the next launch */ }
+  }
+
+  // ---------- run state: a RUNNING day, a CLOSED day (the predicates live in onboard.js) ----------
+  const dayRunning = () => OnBoard.isDayRunning(curPlan(), S.plan ? S.days[planDayKey()] : null);
+  function routeClosed() { // the Route tab of a closed day with no plan made since: {closedAtMs, dayKey}, else null
+    if (!S.plan) return null;
+    const day = dayFor(Date.now(), false), c = OnBoard.closedRouteCard(day);
+    return c ? { closedAtMs: c.closedAtMs, dayKey: day.date } : null;
+  }
+  // opening the Plan tab on a running day: the chips tell the truth (PLAN then re-solves from where you are, now)
+  function openPlanTab() { if (dayRunning()) { S.startSel = 'gps'; S.departTime = ''; } }
+  function openTab(tab) {
+    S.tab = tab;
+    if (tab === 'plan') openPlanTab();
+    window.scrollTo(0, 0);
+    render();
+    if (S.plan) savePlan(); // the stored plan remembers which tab you were on
+    if (S.tab === 'route' && S.plan) refreshFromLocation(); // opening the Route tab
+  }
+
   // ---------- PLAN tab ----------
   function openDepartSheet() {
     const sh = openSheet('Depart at');
@@ -371,6 +476,8 @@
     const departLabel = S.departTime || 'Now';
     const chip = (label, cls, fn) => h('button', { class: 'chip-btn ' + cls, title: label, onclick: fn }, h('span', null, label));
 
+    const bar = onBoardBar();
+    if (bar) v.append(bar);
     v.append(
       h('div', { class: 'chips-row', id: 'headerChips' },
         chip(startLabel, 'start', () => openPlacePicker((p) => { S.startSel = p.id; render(); }, 'Start from',
@@ -470,12 +577,14 @@
   }
 
   // ---------- Add job sheet ----------
-  function openJobSheet() {
+  // pre = {looseId, item, notes}: "Deliver to…" on a loose item. The form opens in in-hand mode (no pickup) with the item and notes
+  // filled in and the focus on the destination; saving converts the loose item into the new job, cancelling changes nothing.
+  function openJobSheet(pre) {
     let mode = 'delivery';
-    const st = { pickups: [{ placeId: null, item: '' }], deliveryPlaceId: null, errandPlaceId: null, dwellMin: '', notes: '', urgent: false, after: '', before: '', inHandItem: '' };
+    const st = { pickups: [{ placeId: null, item: '' }], deliveryPlaceId: null, errandPlaceId: null, dwellMin: '', notes: pre ? pre.notes || '' : '', urgent: false, after: '', before: '', inHandItem: pre ? pre.item || '' : '' };
     const sh = openSheet('Add job');
-    function placeBtn(id, placeholder, onPick) {
-      return h('button', { style: 'width:100%;text-align:left', onclick: () => openPlacePicker((p) => { onPick(p); draw(); }) }, id ? pName(id) : placeholder);
+    function placeBtn(id, placeholder, onPick, btnId) {
+      return h('button', { id: btnId || null, style: 'width:100%;text-align:left', onclick: () => openPlacePicker((p) => { onPick(p); draw(); }) }, id ? pName(id) : placeholder);
     }
     function draw() {
       const body = sh.body;
@@ -493,7 +602,7 @@
         });
         body.append(h('button', { onclick: () => { st.pickups.push({ placeId: null, item: '' }); draw(); } }, '+ Add pickup'),
           h('label', { class: 'field' }, 'Deliver to'),
-          h('div', { class: 'row' }, h('div', { class: 'grow' }, placeBtn(st.deliveryPlaceId, 'Pick delivery place', (pl) => { st.deliveryPlaceId = pl.id; })),
+          h('div', { class: 'row' }, h('div', { class: 'grow' }, placeBtn(st.deliveryPlaceId, 'Pick delivery place', (pl) => { st.deliveryPlaceId = pl.id; }, 'jobDest')),
             st.deliveryPlaceId ? h('button', { onclick: () => { st.deliveryPlaceId = null; draw(); } }, '✕') : null));
         // no pickup place chosen = the item is already in hand: optional item name for the delivery itself
         if (!st.pickups.some((p) => p.placeId)) {
@@ -531,13 +640,16 @@
         if (!j.pickups.length && !j.deliveryPlaceId) { toast('Add a pickup or a delivery place'); return; }
         if (!j.pickups.length) j.inHandItem = st.inHandItem.trim();
         if (st.urgent) { j.urgent = true; j.urgentRank = urgentSorted().length + 1; }
+        if (pre && pre.looseId && !j.pickups.length) j.looseId = pre.looseId; // this in-hand job now tracks the loose item
       }
       S.jobs.push(j);
       await saveJob(j);
+      if (j.looseId) await setLoose(OnBoard.convert(S.loose, j.looseId, j.id, Date.now()));
       sh.close();
       render();
     }
     draw();
+    if (pre) setTimeout(() => { const d = sh.body.querySelector('#jobDest'); if (d) d.focus(); }, 50); // the destination is what is left to choose
   }
 
   // ---------- planning ----------
@@ -551,7 +663,11 @@
 
   async function doPlan(opts) {
     if (S.busy) return;
-    const replan = !!opts.replan;
+    // PLAN on a RUNNING day (a stop done / reached / skipped, or a navigation tap) is the old "Replan from here": it re-solves the
+    // stops that are not done, keeps the done / reached stops, the fuel stop, the lunch state and the replan count (the code below).
+    // The start / time chips are reset to "My location" / "Now" whenever the Plan tab opens on a running day (openPlanTab), so what
+    // they show is what is used; a chip changed on purpose wins.
+    const replan = !!opts.replan || dayRunning();
     const s = S.settings;
     banner(null);
     if (!s.tomtomKey) { banner('TomTom API key missing — add it in Settings. (Travel times come from TomTom Matrix Routing v2.)', 'error'); return; }
@@ -565,7 +681,7 @@
     if (S.tab === 'plan') render();
     try {
       let start;
-      if (replan || S.startSel === 'gps') {
+      if (S.startSel === 'gps') {
         banner('Getting your location…', 'busy');
         start = await getGps();
       } else {
@@ -574,7 +690,7 @@
         start = { lat: sp.lat, lng: sp.lng };
       }
       let departAt = new Date();
-      if (!replan && S.departTime) {
+      if (S.departTime) {
         const [hh, mm] = S.departTime.split(':').map(Number);
         const d = new Date(); d.setHours(hh, mm, 0, 0);
         if (d > departAt) departAt = d;
@@ -741,6 +857,7 @@
     opts = opts || {};
     const P = S.plan, L = S.loc;
     if (!P || L.busy || !Solver.refreshDue(Date.now(), L.lastAt, opts.force)) return;
+    if (routeClosed()) return; // a closed day with no plan since: no live times, no routing request
     const plan0 = curPlan();
     if (!plan0) return;
     const nx0 = plan0.stops.find((s) => !s.status), tid = targetId(plan0);
@@ -1000,8 +1117,9 @@
       if (a.kind === 'pickup') {
         const mine = (j.pickups || []).filter((p) => p.placeId === stop.placeId && p.done);
         const p = mine.filter((q) => (q.item || '') === (a.item || '')).pop() || mine.pop();
-        if (p) p.done = false;
+        if (p) { p.done = false; delete p.doneAt; }
         if (j.status === 'done') { j.status = 'pending'; j.doneAt = null; }
+        if (OnBoard.isCollectOnly(j)) await setLoose(OnBoard.removeForJob(S.loose, j.id)); // the DONE is undone: it was never collected
       } else { j.status = 'pending'; j.doneAt = null; }
       await saveJob(j);
     }
@@ -1065,7 +1183,13 @@
     const sh = openSheet('Day summary · ' + DL.fmtDate(date));
     sh.sheet.classList.add('summary');
     let routing = false;
-    const sum = () => DL.summarise(day, S.jobs, S.places);
+    // STILL WITH YOU = what was with the driver when the day closed (now, while open): the day's own rows + loose items;
+    // "Dropped off" = loose items dropped off on this date. Closed days are re-rendered with the same rule.
+    const extraOf = () => {
+      const closeMs = day.closed ? (Date.parse(day.closedAt != null ? day.closedAt : day.endedAt) || Date.now()) : Date.now();
+      return OnBoard.summaryExtra(boardState(), closeMs, DL.dayStartMs(day.date), DL.dayStartMs(DL.addDaysKey(day.date, 1)));
+    };
+    const sum = () => DL.summarise(day, S.jobs, S.places, extraOf());
     const ro = () => !!opts.readOnly;
     const hm = DL.fmtTime;
 
@@ -1156,7 +1280,12 @@
         [d.urgent ? urgentChip.cloneNode(true) : null, d.late ? lateChip.cloneNode(true) : null].filter(Boolean))), 'Nothing delivered');
       const errands = sec('Errands done', 'errand', s.errands.map((e) => line(h('span', null, e.item, ' - ', e.place), hm(e.t))), 'No errands');
       const fuelLine = s.fuel ? h('div', { class: 'card sum-sec fuel', id: 'sumFuel' }, line('Fuel: ' + s.fuel.place + ' ' + hm(s.fuel.t))) : null;
-      const withYou = sec('Still with you', 'inhand', s.stillWithYou.map((r) => line(h('span', null, r.item || '(item)', ' → ', r.to), null, r.urgent ? [urgentChip.cloneNode(true)] : null)), 'Nothing in the van');
+      const withRows = s.stillWithYou.map((r) => (r.loose
+        ? line(h('span', null, r.item || '(item)', r.to ? ' → ' + r.to : '', r.from ? ' · from ' + dName(r.from) : ''), r.fromAt != null ? hm(r.fromAt) : null)
+        : line(h('span', null, r.item || '(item)', ' → ', r.to), null, r.urgent ? [urgentChip.cloneNode(true)] : null)));
+      const droppedRows = (s.droppedOff || []).map((d) => h('div', { class: 'muted sum-dropped' }, 'Dropped off: ' + (d.item || '(item)') + ' ' + hm(d.t) + (d.place ? ' (' + dName(d.place) + ')' : '')));
+      const withYou = h('div', { class: 'card sum-sec inhand', id: 'sumWithYou' }, h('div', { class: 'eyebrow' }, 'Still with you'),
+        withRows.length ? withRows : h('div', { class: 'muted' }, 'Nothing in the van'), droppedRows);
 
       const notDone = sec('Not done', 'notdone', s.notDone.map((r) => {
         const dec = () => (day.decisions[r.jobId] = day.decisions[r.jobId] || {});
@@ -1261,7 +1390,16 @@
 
   function renderRoute(v) {
     const P = S.plan;
+    const bar = onBoardBar();
+    if (bar) v.append(bar);
     if (!P) { v.append(h('div', { class: 'empty card' }, 'No plan yet. Add jobs on the Plan tab and tap PLAN.')); return; }
+    const closed = routeClosed();
+    if (closed) { // the day was closed and nothing has been planned since: one card, no live route
+      const when = DL.dateKey(closed.closedAtMs) === DL.dateKey(Date.now()) ? DL.fmtTime(closed.closedAtMs) : DL.fmtDate(DL.dateKey(closed.closedAtMs)) + ' ' + DL.fmtTime(closed.closedAtMs);
+      v.append(h('div', { class: 'card day-closed', id: 'dayClosedCard' }, h('div', { class: 'title' }, 'Day closed ' + when),
+        h('button', { class: 'primary', id: 'viewSummary', style: 'margin-top:10px', onclick: () => openSummary(closed.dayKey) }, 'View summary')));
+      return;
+    }
     const r = P.result;
     if (r.error) {
       v.append(h('div', { class: 'violations' }, r.error), h('button', { onclick: () => { S.tab = 'plan'; render(); } }, 'Back to Plan'));
@@ -1303,7 +1441,6 @@
         h('a', { class: 'btn primary grow', href: gmapsUrl(ctx.start, wps[half - 1], wps.slice(0, half - 1)), target: '_blank', rel: 'noopener' }, 'Google Maps — Leg 1'),
         h('a', { class: 'btn primary grow', href: gmapsUrl(wps[half - 1], ctx.end, wps.slice(half)), target: '_blank', rel: 'noopener' }, 'Google Maps — Leg 2'));
     }
-    navRow.append(h('button', { class: 'grow', onclick: () => replanFromHere() }, 'Replan from here'));
     const fuelNow = plan.stops.find((s) => s.fuel);
     if (!(fuelNow && fuelNow.status === 'done')) { // one fuel stop per plan; once it is done there is nothing to add or change
       navRow.append(h('button', { class: 'grow', id: 'fuelBtn', onclick: () => fuelTap() }, fuelNow ? 'Change fuel stop' : 'Add fuel stop'));
@@ -1313,7 +1450,7 @@
     v.append(navRow);
     if (P.alt) v.append(altCard(P));
 
-    if (view.left > 0 && plan.stops.some((s) => s.status === 'skipped' && !s.fuel)) v.append(h('div', { class: 'prompt' }, 'A stop was skipped. ', h('button', { class: 'small', onclick: () => replanFromHere() }, 'Replan from here')));
+    if (view.left > 0 && plan.stops.some((s) => s.status === 'skipped' && !s.fuel)) v.append(h('div', { class: 'prompt', id: 'skipPrompt' }, 'A stop was skipped. To bring it back, open the Plan tab and tap PLAN. ', h('button', { class: 'small', onclick: () => openTab('plan') }, 'Go to Plan')));
     if (P.prompt) {
       const stop = plan.stops.find((s) => s.placeId === P.prompt.placeId);
       const place = S.places[P.prompt.placeId];
@@ -1718,10 +1855,12 @@
       if (a.kind === 'pickup') {
         const mine = (j.pickups || []).filter((p) => p.placeId === stop.placeId && !p.done);
         const p = mine.find((q) => (q.item || '') === (a.item || '')) || mine[0];
-        if (p) p.done = true;
+        if (p) { p.done = true; p.doneAt = nowIso; } // when it was collected (the "With you" bar shows it)
         if (!j.deliveryPlaceId && !j.errandPlaceId && j.pickups.every((q) => q.done)) { j.status = 'done'; j.doneAt = nowIso; }
       } else { j.status = 'done'; j.doneAt = nowIso; }
       await saveJob(j);
+      // a collect-only job marked DONE leaves a loose item with the driver (not a job: job counts never change)
+      if (a.kind === 'pickup' && OnBoard.isCollectOnly(j) && j.status === 'done') await setLoose(OnBoard.addForJob(S.loose, j, { nameOf: placeNameOf, at: Date.parse(nowIso) }));
     }
     stop.status = 'done';
     stop.doneAt = nowIso;
@@ -1766,7 +1905,7 @@
     P.alt = null;
     P.result.plans = [P.result.plans[P.idx]]; P.idx = 0;
     retimeNow(); // from the last DONE (never from the skipped stop: we did not go there)
-    toast(ls.stop.fuel ? 'Fuel stop skipped. Undo skip to bring it back.' : 'Skipped — actions stay pending. Undo skip, or replan to bring it back.');
+    toast(ls.stop.fuel ? 'Fuel stop skipped. Undo skip to bring it back.' : 'Skipped — actions stay pending. Undo skip, or tap PLAN to bring it back.');
     await savePlan();
     render();
     refreshFromLocation({ force: true });
@@ -1784,11 +1923,6 @@
     await savePlan();
     render();
     refreshFromLocation({ force: true });
-  }
-
-  async function replanFromHere() {
-    if (!pendingJobs().length) { toast('Nothing left to plan.'); return; }
-    await doPlan({ replan: true });
   }
 
   // ---------- FUEL STOP ----------
@@ -2309,6 +2443,7 @@
   function exportJson() {
     const settings = Object.assign({}, S.settings); delete settings.googleKey; delete settings.tomtomKey;
     const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), places: Object.values(S.places), jobs: S.jobs, settings, fuelStations: S.fuelStations },
+      OnBoard.exportLoose(S.loose), // looseItems: the items still with you
       DL.exportPayload(S.days, S.jobs, S.places)); // + dayLog (records) and dayHistory (per-day totals); keys never included
     const a = h('a', { href: URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })), download: 'waypoint-' + new Date().toISOString().slice(0, 10) + '.json' });
     document.body.append(a); a.click(); a.remove();
@@ -2339,6 +2474,11 @@
         fuelRun = null;
         await saveStations();
       }
+      const lo = OnBoard.importLoose(data); // older exports have no looseItems: the current ones are kept
+      if (lo.present) {
+        await WPStore.clear('loose'); S.loose = [];
+        for (const it of lo.items) { S.loose.push(it); await WPStore.set('loose', it.id, it); }
+      }
       S.plan = null;
       toast('Imported.');
       render();
@@ -2362,11 +2502,7 @@
   document.getElementById('tabs').addEventListener('click', (e) => {
     const b = e.target.closest('button');
     if (!b) return;
-    S.tab = b.dataset.tab;
-    window.scrollTo(0, 0);
-    render();
-    if (S.plan) savePlan(); // the stored plan remembers which tab you were on
-    if (S.tab === 'route' && S.plan) refreshFromLocation(); // opening the Route tab
+    openTab(b.dataset.tab);
   });
 
   // Back in the foreground: re-time what is left from the last done stop (or the start) at the current time.
@@ -2414,6 +2550,7 @@
   load().then(() => {
     if (S.plan) lunchTick();
     if (S.plan && retimeNow()) savePlan(); // restored plan: re-time from the last done stop (or start) at the current time
+    if (S.tab === 'plan') openPlanTab(); // a running day restored on the Plan tab: the chips read "My location" / "Now"
     render();
     if (S.tab === 'route' && S.plan) refreshFromLocation();
     watchLocationPermission();

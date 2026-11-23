@@ -267,3 +267,15 @@ button.end-day { width: 100%; margin: 8px 0 0; min-height: 44px; }
 .error-text { color: var(--danger); font-weight: 600; }
 .pick-row.manual { border-style: dashed; }
 .picker-body > .pick-row.manual { flex: 0 0 auto; margin: 0; } /* pinned above Cancel, outside the scrolling list */
+
+/* items with you: one slim line near the top of the Plan and Route tabs; tap to expand the list */
+.onboard { margin: 0 0 10px; border: 1px solid var(--inhand); background: var(--inhand-tint); color: var(--inhand-ink); border-radius: 12px; overflow: hidden; }
+.ob-head { display: flex; justify-content: space-between; align-items: center; width: 100%; min-height: 40px; border: 0; border-radius: 0; background: transparent; color: inherit; font-size: 15px; padding: 0 12px; }
+.ob-list { border-top: 1px solid var(--inhand); padding: 2px 12px 6px; background: var(--card); color: var(--text); }
+.ob-row { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.ob-row:last-child { border-bottom: 0; }
+.ob-text { min-width: 0; flex: 1 1 auto; }
+.ob-name { font-weight: 700; overflow-wrap: anywhere; }
+.ob-sub { overflow-wrap: anywhere; }
+.ob-btns { display: flex; gap: 6px; flex: none; flex-wrap: wrap; justify-content: flex-end; max-width: 52%; }
+.sum-dropped { margin-top: 6px; overflow-wrap: anywhere; }

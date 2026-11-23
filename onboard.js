@@ -1,0 +1,265 @@
+/* L-Tech Waypoint — onboard.js
+ * Pure helpers (no DOM, no network, no storage): items "with you", the LOOSE-items store, and two run-state predicates.
+ *
+ * ON BOARD (onBoard(state, at)): an item is with the driver when it is
+ *   - collected by a collect -> deliver job whose delivery is not done,
+ *   - an in-hand job whose delivery is not done, or
+ *   - a LOOSE item: collected by a collect-only job (no delivery) and not yet dropped off or converted.
+ * state = {jobs, loose, nameOf(placeId)?}; at = ms (default now). Loose items are NOT jobs: they never change job counts.
+ *
+ * LOOSE ITEM (persisted in collection "loose", one doc per item; in Export / Import as `looseItems`):
+ *   {id, item, notes, collectedFrom, collectedAt (ISO), sourceJobId, status: 'with-me' | 'dropped' | 'converted',
+ *    droppedAt?, droppedPlace?, convertedJobId?, convertedAt?}
+ *   Created when a collect-only job is marked DONE (id loose_<jobId>; undo of that DONE removes it). Not cleared by End day.
+ *   "Dropped off" -> dropped; "Deliver to…" -> converted (the new in-hand job carries looseId and tracks the item from then on;
+ *   if that job is deleted or dropped at End day the item is with the driver again).
+ *
+ * Also here: the "day is running" predicate (PLAN re-solves instead of planning afresh) and the closed-day Route card predicate.
+ * Exports via module.exports (node) or window.OnBoard.
+ */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.OnBoard = factory();
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  const STATUS = ['with-me', 'dropped', 'converted'];
+  const DROP_RADIUS_M = 150;
+  const DROP_ACCURACY_M = 100; // a fix this good or better may name the place an item was dropped at
+  const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const BACKFILL_FLAG = 'looseBackfill';
+  const pad2 = (n) => (n < 10 ? '0' : '') + n;
+  const toMs = (v) => (v == null ? null : typeof v === 'number' ? v : Date.parse(v));
+  const isoOf = (ms) => new Date(ms).toISOString();
+  const uniq = (a) => a.filter((x, i) => a.indexOf(x) === i);
+
+  // ---------- job shapes ----------
+  const isCollectOnly = (j) => !!j && !j.errandPlaceId && !j.deliveryPlaceId && (j.pickups || []).length > 0;
+  const findJob = (jobs, id) => (id == null ? null : (jobs || []).find((j) => j.id === id) || null);
+
+  // is the delivery of this collect -> deliver / in-hand job still to do at moment `at`?
+  function deliveryOpenAt(j, at) {
+    if (!j || j.errandPlaceId || !j.deliveryPlaceId) return false;
+    if (j.status === 'done') { const d = toMs(j.doneAt); return d != null && d > at; }
+    if (j.status === 'dropped') return false;
+    return true;
+  }
+
+  // ---------- loose items ----------
+  // the loose item a collect-only job leaves behind when it is DONE; ctx = {nameOf(placeId), at (ms)}
+  function looseFromJob(job, ctx) {
+    if (!isCollectOnly(job)) return null;
+    const nameOf = (ctx && ctx.nameOf) || ((id) => id);
+    const at = ctx && ctx.at != null ? ctx.at : Date.now();
+    const pk = job.pickups || [];
+    return {
+      id: 'loose_' + job.id,
+      item: uniq(pk.map((p) => (p.item || '').trim()).filter(Boolean)).join(', '),
+      notes: job.notes || '',
+      collectedFrom: uniq(pk.map((p) => nameOf(p.placeId))).join(' + '),
+      collectedAt: isoOf(at), sourceJobId: job.id, status: 'with-me',
+    };
+  }
+  const addForJob = (list, job, ctx) => {
+    const it = looseFromJob(job, ctx);
+    return !it || (list || []).some((x) => x.id === it.id) ? (list || []) : (list || []).concat([it]);
+  };
+  const removeForJob = (list, jobId) => (list || []).filter((x) => x.sourceJobId !== jobId);
+  const mapItem = (list, id, fn) => (list || []).map((x) => (x.id === id ? fn(Object.assign({}, x)) : x));
+
+  function dropOff(list, id, atMs, placeName) {
+    return mapItem(list, id, (x) => {
+      if (x.status === 'dropped') return x;
+      x.status = 'dropped'; x.droppedAt = isoOf(atMs);
+      if (placeName) x.droppedPlace = placeName; else delete x.droppedPlace;
+      return x;
+    });
+  }
+  function undoDrop(list, id) {
+    return mapItem(list, id, (x) => { if (x.status === 'dropped') { x.status = 'with-me'; delete x.droppedAt; delete x.droppedPlace; } return x; });
+  }
+  // the place is found after the tap (a GPS fix takes a moment): only written while the item is still dropped at that same moment
+  function setDropPlace(list, id, atMs, placeName) {
+    return mapItem(list, id, (x) => { if (x.status === 'dropped' && toMs(x.droppedAt) === atMs && placeName) x.droppedPlace = placeName; return x; });
+  }
+  function convert(list, id, jobId, atMs) {
+    return mapItem(list, id, (x) => { if (x.status !== 'dropped') { x.status = 'converted'; x.convertedJobId = jobId; x.convertedAt = isoOf(atMs); } return x; });
+  }
+
+  // is this loose item with the driver at `at`? (a converted one is tracked by its job unless that job is gone or was dropped)
+  function looseHeldAt(it, jobs, at) {
+    const c = toMs(it.collectedAt);
+    if (c != null && c > at) return false;
+    if (it.status === 'dropped') { const d = toMs(it.droppedAt); return d != null && d > at; }
+    if (it.status === 'converted') {
+      const cv = toMs(it.convertedAt);
+      if (cv != null && cv > at) return true;
+      const j = findJob(jobs, it.convertedJobId);
+      return !j || j.status === 'dropped';
+    }
+    return true;
+  }
+
+  // ---------- on board ----------
+  // -> [{key, kind: 'loose' | 'job' | 'inhand', item, notes, from, fromAt, to, jobId?, looseId?, urgent}], oldest collection first
+  function onBoard(state, at) {
+    const now = at != null ? at : Date.now();
+    const jobs = (state && state.jobs) || [], loose = (state && state.loose) || [];
+    const nameOf = (state && state.nameOf) || ((id) => id);
+    const looseById = {};
+    loose.forEach((x) => { looseById[x.id] = x; });
+    const out = [];
+    jobs.forEach((j) => {
+      if (!j || j.errandPlaceId || !j.deliveryPlaceId || !deliveryOpenAt(j, now)) return;
+      const to = nameOf(j.deliveryPlaceId), pk = j.pickups || [];
+      if (!pk.length) { // in hand (an item converted from a loose one keeps where it was collected)
+        const lo = j.looseId ? looseById[j.looseId] : null;
+        if (lo && toMs(lo.convertedAt) > now) return; // at that moment the loose item still counted
+        out.push({ key: 'job:' + j.id, kind: 'inhand', jobId: j.id, looseId: lo ? lo.id : null, item: j.inHandItem || '', notes: j.notes || '', from: lo ? lo.collectedFrom : '', fromAt: lo ? lo.collectedAt : null, to, urgent: !!j.urgent });
+        return;
+      }
+      pk.forEach((p, i) => {
+        if (!p.done || (p.doneAt != null && toMs(p.doneAt) > now)) return;
+        out.push({ key: 'job:' + j.id + ':' + i, kind: 'job', jobId: j.id, looseId: null, item: p.item || '', notes: j.notes || '', from: nameOf(p.placeId), fromAt: p.doneAt || null, to, urgent: !!j.urgent });
+      });
+    });
+    loose.forEach((x) => {
+      if (!looseHeldAt(x, jobs, now)) return;
+      out.push({ key: 'loose:' + x.id, kind: 'loose', jobId: null, looseId: x.id, item: x.item || '', notes: x.notes || '', from: x.collectedFrom || '', fromAt: x.collectedAt || null, to: '', urgent: false });
+    });
+    return out.map((r, i) => ({ r, i })).sort((a, b) => ((toMs(a.r.fromAt) == null ? Infinity : toMs(a.r.fromAt)) - (toMs(b.r.fromAt) == null ? Infinity : toMs(b.r.fromAt))) || a.i - b.i).map((x) => x.r);
+  }
+
+  const barLabel = (n) => 'With you: ' + n + (n === 1 ? ' item' : ' items');
+  function whenLabel(v, nowMs) { // "today 14:05" / "yesterday 14:05" / "22 Nov 14:05"
+    const ms = toMs(v);
+    if (ms == null || isNaN(ms)) return '';
+    const d = new Date(ms), n = new Date(nowMs != null ? nowMs : Date.now());
+    const day0 = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const hm = pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    const diff = Math.round((day0(n) - day0(d)) / 86400000);
+    return (diff === 0 ? 'today' : diff === 1 ? 'yesterday' : d.getDate() + ' ' + MON[d.getMonth()]) + ' ' + hm;
+  }
+
+  // ---------- where an item was dropped ----------
+  function distanceM(a, b) {
+    const r = Math.PI / 180, dl = (b.lat - a.lat) * r, dg = (b.lng - a.lng) * r;
+    const x = Math.sin(dl / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dg / 2) ** 2;
+    return 2 * 6371000 * Math.asin(Math.sqrt(x));
+  }
+  // the saved place within 150 m of a good, fresh fix (the closest one), else null. places = object or array of {name, lat, lng}
+  function nearestPlace(fix, places, radiusM) {
+    if (!fix || fix.ok === false || fix.lat == null || fix.lng == null) return null;
+    if (fix.accuracy != null && fix.accuracy > DROP_ACCURACY_M) return null;
+    let best = null, bd = Infinity;
+    (Array.isArray(places) ? places : Object.values(places || {})).forEach((p) => {
+      if (!p || p.lat == null || p.lng == null) return;
+      const d = distanceM(fix, p);
+      if (d <= (radiusM != null ? radiusM : DROP_RADIUS_M) && d < bd) { best = p; bd = d; }
+    });
+    return best;
+  }
+
+  // ---------- the day summary (STILL WITH YOU / Dropped off) ----------
+  // Loose-origin entries for the summary of a day that closes (or closed) at closeMs, over the local day [fromMs, toMs).
+  // withYou: loose items with the driver at that moment, plus converted ones whose in-hand job was still to deliver then
+  //   (jobId lets daylog.summarise skip a job the day's own rows already list); dropped: items dropped off that day.
+  function summaryExtra(state, closeMs, fromMs, toMsEnd) {
+    const jobs = (state && state.jobs) || [], loose = (state && state.loose) || [];
+    const nameOf = (state && state.nameOf) || ((id) => id);
+    const withYou = [], dropped = [];
+    loose.forEach((x) => {
+      const c = toMs(x.collectedAt);
+      if (c != null && c > closeMs) return;
+      const base = { jobId: null, looseId: x.id, loose: true, item: x.item || '', from: x.collectedFrom || '', fromAt: c, to: '', urgent: false };
+      if (looseHeldAt(x, jobs, closeMs)) withYou.push(base);
+      else if (x.status === 'converted') { // handed to an in-hand job before the close: it is still with the driver if that job was open then
+        const j = findJob(jobs, x.convertedJobId);
+        if (j && deliveryOpenAt(j, closeMs)) withYou.push(Object.assign(base, { jobId: j.id, to: nameOf(j.deliveryPlaceId) }));
+      }
+      if (x.status === 'dropped') {
+        const d = toMs(x.droppedAt);
+        if (d != null && d >= fromMs && d < toMsEnd) dropped.push({ item: x.item || '', t: d, place: x.droppedPlace || '', looseId: x.id });
+      }
+    });
+    dropped.sort((a, b) => a.t - b.t);
+    return { withYou, dropped };
+  }
+
+  // ---------- one-time backfill ----------
+  // The local dates to look at: today and the most recent CLOSED day (days = [{date, closed}]).
+  function backfillKeys(todayKey, days) {
+    const closed = (days || []).filter((d) => d && d.closed && d.date).map((d) => d.date).sort();
+    return uniq([todayKey].concat(closed.length ? [closed[closed.length - 1]] : []));
+  }
+  // A loose item for every collect-only job done on one of `keys` that has none yet. opts: {keys, dateKey(ms), nameOf(placeId),
+  // rows: [{jobId, item, from, doneMs, notes}] (the day logs' completed collect-only rows: cover jobs since cleared)}.
+  // -> {added: [items], list: the new list}. Idempotent: ids are loose_<jobId>.
+  function backfill(state, opts) {
+    const jobs = (state && state.jobs) || [];
+    const list = ((state && state.loose) || []).slice();
+    const has = (jobId) => list.some((x) => x.id === 'loose_' + jobId || x.sourceJobId === jobId);
+    const added = [];
+    jobs.forEach((j) => {
+      if (!isCollectOnly(j) || j.status !== 'done' || !j.doneAt || has(j.id)) return;
+      const t = toMs(j.doneAt);
+      if (t == null || isNaN(t) || opts.keys.indexOf(opts.dateKey(t)) < 0) return;
+      const it = looseFromJob(j, { nameOf: opts.nameOf, at: t });
+      list.push(it); added.push(it);
+    });
+    (opts.rows || []).forEach((r) => {
+      if (!r || !r.jobId || r.doneMs == null || has(r.jobId)) return;
+      const it = { id: 'loose_' + r.jobId, item: r.item || '', notes: r.notes || '', collectedFrom: r.from || '', collectedAt: isoOf(r.doneMs), sourceJobId: r.jobId, status: 'with-me' };
+      list.push(it); added.push(it);
+    });
+    return { added, list };
+  }
+  // Runs the backfill once over a WPStore-like store ({get,set}); stores the new items in "loose" and a flag. -> items, or null if done before.
+  async function runBackfillOnce(store, state, opts, nowIso) {
+    const flag = await store.get('meta', BACKFILL_FLAG);
+    if (flag && flag.done) return null;
+    const res = backfill(state, opts);
+    for (const it of res.added) await store.set('loose', it.id, it);
+    await store.set('meta', BACKFILL_FLAG, { done: true, at: nowIso, added: res.added.map((x) => x.id) });
+    return res.added;
+  }
+
+  // ---------- Export / Import ----------
+  const validItem = (x) => !!x && typeof x.id === 'string' && x.id && typeof x.item === 'string' && STATUS.indexOf(x.status) >= 0;
+  const exportLoose = (list) => ({ looseItems: JSON.parse(JSON.stringify(list || [])) });
+  // -> {present:false} for an export made before this store existed (keep the current one), else {present:true, items:[valid items]}
+  function importLoose(data) {
+    if (!data || !Array.isArray(data.looseItems)) return { present: false, items: [] };
+    const defaults = { notes: '', collectedFrom: '', collectedAt: null, sourceJobId: null };
+    return { present: true, items: data.looseItems.filter(validItem).map((x) => { const o = Object.assign({}, x); Object.keys(defaults).forEach((k) => { if (o[k] === undefined) o[k] = defaults[k]; }); return o; }) };
+  }
+
+  // ---------- run state ----------
+  // The day is RUNNING (PLAN re-solves what is left instead of planning afresh): a plan exists, its day is not closed, and a stop is
+  // done, reached or skipped, or a navigation tap has been made (a stop's navStartedAt, the end point's, or a nav event in the day log).
+  function isDayRunning(plan, day) {
+    if (!plan || !Array.isArray(plan.stops)) return false;
+    if (day && day.closed) return false;
+    if (plan.stops.some((s) => s && (s.status === 'done' || s.status === 'skipped' || s.reachedAt != null || s.navStartedAt != null))) return true;
+    if (plan.endNavStartedAt != null) return true;
+    return !!(day && (day.events || []).some((e) => e && e.type === 'nav'));
+  }
+  // The Route tab of a closed day: today's record is closed and no PLAN / replan has been made since -> {closedAtMs}, else null.
+  function closedRouteCard(day) {
+    if (!day || !day.closed) return null;
+    const evs = day.events || [];
+    let lastEnd = -1;
+    evs.forEach((e, i) => { if (e && e.type === 'endday') lastEnd = i; });
+    const closedAt = toMs(day.closedAt != null ? day.closedAt : day.endedAt);
+    const closedMs = closedAt != null && !isNaN(closedAt) ? closedAt : (lastEnd >= 0 ? toMs(evs[lastEnd].t) : null);
+    if (closedMs == null) return null;
+    const planned = evs.some((e, i) => e && (e.type === 'plan' || e.type === 'replan') && (lastEnd >= 0 ? i > lastEnd : toMs(e.t) > closedMs));
+    return planned ? null : { closedAtMs: closedMs };
+  }
+
+  return {
+    STATUS, DROP_RADIUS_M, isCollectOnly, looseFromJob, addForJob, removeForJob, dropOff, undoDrop, setDropPlace, convert, looseHeldAt,
+    onBoard, barLabel, whenLabel, distanceM, nearestPlace, summaryExtra, backfillKeys, backfill, runBackfillOnce, exportLoose, importLoose,
+    isDayRunning, closedRouteCard,
+  };
+});

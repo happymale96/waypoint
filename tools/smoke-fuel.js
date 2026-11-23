@@ -175,7 +175,7 @@ async function main() {
     check(stopIds.length === 3 && stopIds.includes('pB'), 'a 3-stop plan with the urgent delivery (Beta) is on the Route tab', stopIds);
     const before = await ev('(() => { const p = WaypointDebug.S.plan.result.plans[0]; return { end: p.endArrival, jobs: WaypointDebug.S.jobs.map((j) => j.status + ":" + j.id).join() }; })()');
     check((await text('#fuelBtn')) === 'Add fuel stop', 'the button reads "Add fuel stop"');
-    check(await ev('document.querySelector("#fuelBtn").parentElement.querySelector("button").textContent') === 'Replan from here', 'it sits in the row with "Replan from here"');
+    check(await ev('document.querySelector("#fuelBtn").parentElement.querySelector("a").textContent') === 'Open in Google Maps', 'it sits in the row with "Open in Google Maps" (there is no "Replan from here" any more)');
     const expected = await ev(`(() => { const S = WaypointDebug.S, plan = S.plan.result.plans[0];
       const pts = [plan.model.start].concat(plan.stops.map((s) => S.places[s.placeId])).concat([S.plan.ctx.end]).map((p) => ({ lat: p.lat, lng: p.lng }));
       return Fuel.samplePoints(pts, 4, 50).length; })()`);
