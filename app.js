@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '9de7266a'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '623ec7e3'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -44,6 +44,7 @@
       etaPaddingMin: 15, dwellDefaults: Object.assign({}, DEFAULT_DWELL),
       placesCallsToday: { date: todayStr(), count: 0 }, nav: 'waze', seeded: false, driverName: 'Calvin',
       fuelBrand: 'Caltex', fuelDwellMin: 7, fuelMaxSearches: 50,
+      autoReach: true, // mark Reached automatically within 150 m (app open); stored on the device, in Export / Import
     };
   }
   const saveSettings = () => WPStore.set('settings', 'main', S.settings);
@@ -621,7 +622,11 @@
   }
 
   // done/skipped stops stay at the top (old order); the freshly solved stops follow
-  function compose(oldPlan, plan) {
+  function compose(oldPlan, plan0) {
+    // a stop reached (or flagged "no auto-reach") but not done keeps that state through a re-solve
+    const keep = {};
+    if (oldPlan) oldPlan.stops.forEach((s) => { if (!s.status && (s.reachedAt != null || s.noAutoReach)) keep[s.placeId] = { reachedAt: s.reachedAt != null ? s.reachedAt : null, reachedSource: s.reachedSource || null, noAutoReach: !!s.noAutoReach }; });
+    const plan = Object.keys(keep).length ? Object.assign({}, plan0, { stops: plan0.stops.map((s) => (keep[s.placeId] ? Object.assign({}, s, keep[s.placeId]) : s)) }) : plan0;
     const hist = oldPlan ? oldPlan.stops.filter((s) => s.status) : [];
     if (!hist.length) return plan;
     const t0 = oldPlan.model.t0ms;
@@ -743,6 +748,8 @@
       const fix = await quickFix(!!opts.prompt);
       if (S.plan !== P) return;
       if (!fix.ok) return await fail(fix.code === 'denied' ? 'denied' : 'nofix');
+      autoReachCheck(fix); // every GPS update: auto-Reached when the rules in Reached.autoReachTarget hold
+      { const c0 = curPlan(), n0 = c0 && c0.stops.find((s) => !s.status); if (n0 && n0.reachedAt != null) { L.reason = null; L.origin = null; S.timesFrom = null; return; } } // on site: no routing to where we already are
       const o = L.origin && L.origin.placeId === tid ? L.origin : null;
       const verdict = Solver.judgeFix(fix, o && { lat: o.lat, lng: o.lng }, target, { force: !!opts.force });
       if (verdict === 'ignore') return await fail('nofix');
@@ -780,8 +787,14 @@
   function paintTimesLine() {
     const el = document.getElementById('timesFrom'), plan = curPlan();
     if (!el || !plan) return;
+    el.textContent = timesLineFor(plan);
+  }
+  // The status line: "On site at <name> since 14:10" while a stop is reached and not done, else where the times come from.
+  function timesLineFor(plan) {
+    const os = Reached.onSiteStop(plan.stops);
+    if (os) return 'On site at ' + dName(((S.places[os.placeId] || (S.plan && S.plan.ctx.places[os.placeId])) || {}).name || '') + ' since ' + fmt(os.reachedAt);
     const di = lastDoneIdx(plan);
-    el.textContent = Solver.timesLine({ liveAt: S.timesFrom, lastDoneAt: di >= 0 ? Date.parse(plan.stops[di].doneAt) : null, reason: S.loc.reason, busy: S.loc.busy });
+    return Solver.timesLine({ liveAt: S.timesFrom, lastDoneAt: di >= 0 ? Date.parse(plan.stops[di].doneAt) : null, reason: S.loc.reason, busy: S.loc.busy });
   }
 
   // travel times older than 30 min are re-fetched (3 slices, like PLAN) before re-timing at a DONE
@@ -850,6 +863,9 @@
     try { snap = await WPStore.get('plan', 'current'); } catch (e) { snap = null; }
     if (!snap || snap.v !== 1 || !snap.plan || !snap.plan.model || !snap.ctx || !snap.ctx.matrices) return;
     snap.plan.model.matrices = snap.ctx.matrices;
+    if (snap.savedAt && DayLog.dateKey(Date.parse(snap.savedAt)) !== DayLog.dateKey(Date.now())) { // a plan carried over to another day starts fresh
+      snap.plan.stops = snap.plan.stops.map((s) => (s.status ? s : Reached.carryForward(s)));
+    }
     S.plan = {
       ctx: snap.ctx, noDetour: !!snap.noDetour, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: snap.provider || null,
       result: { plans: [snap.plan], error: null, stats: null, stopIds: snap.plan.model.stopIds },
@@ -930,9 +946,12 @@
       const coord = (id) => coordOf(id, day);
       const prev = lastG ? coord(lastG.stopId) : (day.planSnapshot && day.planSnapshot.start);
       const to = coord(stop.placeId), plan = curPlan();
+      const dsec = plan && plan.model && plan.model.dwellSec ? plan.model.dwellSec[stop.placeId] : null; // planned dwell, for the on-site split
+      const rch = { reachedAt: stop.reachedAt != null ? stop.reachedAt : null, reachedSource: stop.reachedSource || null,
+        dwellMin: dsec != null ? dsec / 60 : ((coordPlace(stop.placeId) || {}).dwellMin != null ? coordPlace(stop.placeId).dwellMin : null) };
       const evs = stop.fuel // the fuel stop is logged as a stop (kind 'fuel'), never as a job action
-        ? [DL.recordFuel(day, { nowIso, stopId: stop.placeId, name: (coordPlace(stop.placeId) || {}).name || '', places: Object.assign({}, S.plan && S.plan.ctx.places, S.places) })]
-        : DL.recordDone(day, { nowIso, stopId: stop.placeId, actions: stop.actions, places: S.places });
+        ? [DL.recordFuel(day, Object.assign({ nowIso, stopId: stop.placeId, name: (coordPlace(stop.placeId) || {}).name || '', places: Object.assign({}, S.plan && S.plan.ctx.places, S.places) }, rch))]
+        : DL.recordDone(day, Object.assign({ nowIso, stopId: stop.placeId, actions: stop.actions, places: S.places }, rch));
       if (plan && prev && to) { // keep the leg just driven if the plan's own routing matrices cover that exact pair
         const m = plan.model;
         const pts = [m.start].concat(m.stopIds.map(coord), [m.end]);
@@ -973,7 +992,7 @@
       await saveJob(j);
     }
     if (day) { DL.recordUndo(day, { nowIso: new Date().toISOString(), stopId: stop.placeId }); bgSaveDay(day); }
-    delete stop.status; delete stop.doneAt;
+    cur.stops[li] = Reached.undoDone(stop); // pending again; reachedAt / reachedSource stay (the stop is back to "reached")
     S.loc.origin = null;
     P.prompt = null;
     retimeNow();
@@ -1091,6 +1110,12 @@
         h('button', { class: 'small grow', disabled: ro(), onclick: () => editTime('startedAt', s.startedAt) }, 'Started ' + (s.startedAt != null ? hm(s.startedAt) : '—') + (ro() ? '' : ' ✎')),
         h('button', { class: 'small grow', disabled: ro(), onclick: () => editTime('finishedAt', s.finishedAt) }, 'Finished ' + (s.finishedAt != null ? hm(s.finishedAt) : '—') + (ro() ? '' : ' ✎')));
 
+      // driving vs on site: only for days where a stop has a Reached time (days closed before this feature show nothing, nothing is backfilled)
+      const sp = Reached.splitOfSummary(s);
+      const splitCard = sp ? h('div', { class: 'card sum-sec split', id: 'sumSplit' }, h('div', { class: 'eyebrow' }, 'Driving vs on site'),
+        h('div', { class: 'sum-split', id: 'sumSplitLine' }, 'Driving ' + DL.fmtDur(sp.totals.driveMin) + ' · On site ' + DL.fmtDur(sp.totals.onSiteMin) + (sp.totals.anyEstimated ? ' (part estimated)' : '')),
+        sp.stops.filter((x) => !x.skipped).map((x) => line(h('span', null, x.name), 'arr ' + (x.estimated ? '~' : '') + hm(x.arrivalMs) + ' · left ' + hm(x.departMs)))) : null;
+
       const urgentChip = h('span', { class: 'chip urgent' }, 'URGENT'), lateChip = h('span', { class: 'chip late' }, 'LATE');
       const collected = sec('Collected', 'collect', s.collected.map((c) => line(h('span', null, c.item || '(item)', ' - ', c.place), hm(c.t))), 'Nothing collected');
       const delivered = sec('Delivered', 'deliver', s.delivered.map((d) => line(h('span', null, d.item || '(item)', ' - ', d.place), hm(d.t),
@@ -1136,7 +1161,7 @@
         } }, 'Close day');
       sh.body.replaceChildren(
         h('div', { class: 'muted sum-sub' }, day.driverId + ' · ' + (day.closed ? 'closed ' + (day.endedAt ? DL.fmtDate(DL.dateKey(Date.parse(day.endedAt))) + ' ' + hm(Date.parse(day.endedAt)) : '') : 'open') + (ro() ? ' · read-only' : '')),
-        tiles, timeRow, collected, delivered, errands, fuelLine, withYou, notDone, planVs,
+        tiles, timeRow, splitCard, collected, delivered, errands, fuelLine, withYou, notDone, planVs,
         h('div', { class: 'sum-actions' }, h('div', { class: 'row' }, copyBtn, csvBtn), h('div', { class: 'row' }, main, h('button', { onclick: sh.close }, 'Back'))));
     }
     draw();
@@ -1219,12 +1244,11 @@
     const view = Solver.liveView(plan, now);
     const remaining = view.stops.filter((s) => !s.status);
     const day = dayFor(now, false), arrEv = day ? DL.arrivedEnd(day) : null;
-    const di = lastDoneIdx(plan), lastDoneAt = di >= 0 ? Date.parse(plan.stops[di].doneAt) : null;
     const departMs = day && day.startedAt ? Date.parse(day.startedAt) : Date.parse(ctx.departAtISO);
 
     // which anchor the times come from (and why not the phone's location); a tap retries at once, bypassing the throttle
     v.append(h('button', { class: 'times-from', id: 'timesFrom', type: 'button', onclick: () => { if (S.loc.busy) toast('Checking your location…'); else refreshFromLocation({ force: true, prompt: true }); } },
-      Solver.timesLine({ liveAt: S.timesFrom, lastDoneAt, reason: S.loc.reason, busy: S.loc.busy })));
+      timesLineFor(plan)));
     v.append(
       h('div', { class: 'card' },
         h('div', { class: 'totals', id: 'routeTotals' },
@@ -1392,12 +1416,83 @@
     head.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } };
     const btns = navButtons(place);
     if (hasDelivery) btns.push(h('button', { class: 'small', onclick: () => { const m = stopMessage(stop, P.shiftMs); shareMessage(m.place, m.text); } }, 'MSG'));
-    btns.push(h('button', { class: 'small ok', onclick: () => markDone(stop, i) }, 'DONE'));
+    btns.push(primaryBtn(stop, i)); // REACHED, then DONE: one button, the place and size DONE always had
     btns.push(h('button', { class: 'small', onclick: () => skipStop(stop, i) }, 'SKIP'));
-    return h('div', { class: 'card stop ' + (st || '') + (stop.detour ? ' detour' : '') },
+    const rin = reachedInline(stop, i); // "Reached 14:10 · auto  Undo" at the end of the card's action lines (no extra row)
+    return h('div', { class: 'card stop ' + (st || '') + (stop.detour ? ' detour' : '') + (rin ? ' reached' : '') },
       head, more,
-      lines.length ? h('div', { class: 'stop-acts' }, lines) : null,
+      lines.length || rin ? h('div', { class: 'stop-acts' }, lines, rin ? h('div', { class: 'muted reached-line' }, rin) : null) : null,
       h('div', { class: 'stop-btns' }, btns));
+  }
+
+  // ---------- REACHED before DONE ----------
+  const primaryBtn = (stop, i) => h('button', { class: 'small ok', 'data-act': Reached.isReached(stop) ? 'done' : 'reached', onclick: () => primaryTap(stop, i) }, Reached.buttonLabel(stop));
+  function reachedInline(stop, i) { // text + a small Undo, or null while the stop is not reached
+    return Reached.isReached(stop)
+      ? [Reached.reachedText(stop, fmt), ' ', h('button', { class: 'link-undo', type: 'button', 'aria-label': 'Undo reached', onclick: () => undoReachedTap(stop, i) }, 'Undo')]
+      : null;
+  }
+  const placeOfStop = (s) => S.places[s.placeId] || (S.plan && S.plan.ctx.places[s.placeId]) || null;
+
+  async function afterReachChange() { // shared tail of Reached / Undo reached: re-time (on site = departure from reached + dwell), repaint, save
+    S.loc.origin = null;
+    retimeNow();
+    if (S.tab === 'route') render();
+    await savePlan();
+  }
+  function reachStop(stop, source) { // stamps the live stop; false when it cannot be reached (done, skipped, already reached)
+    if (!stop || stop.status || Reached.isReached(stop)) return false;
+    Object.assign(stop, Reached.stampReached(stop, Date.now(), source));
+    return true;
+  }
+  async function markReached(stop0, i0) { // REACHED: nothing but the stamp, the re-time and the repaint (no message, no day-log entry)
+    const ls = liveStop(stop0, i0);
+    if (!ls || !reachStop(ls.stop, 'tap')) return;
+    await afterReachChange();
+  }
+  async function undoReachedTap(stop0, i0) { // back to REACHED; this stop is never auto-reached again in this plan
+    const ls = liveStop(stop0, i0);
+    if (!ls || ls.stop.status || !Reached.isReached(ls.stop)) return;
+    Object.assign(ls.stop, Reached.undoReached(ls.stop));
+    await afterReachChange();
+    refreshFromLocation({ force: true });
+  }
+  // The one primary button: REACHED first, then DONE. For 500 ms after the stop became reached it ignores taps.
+  function primaryTap(stop0, i0) {
+    const ls = liveStop(stop0, i0);
+    if (!ls) return;
+    if (!Reached.isReached(ls.stop)) return markReached(stop0, i0);
+    if (Reached.tapIgnored(ls.stop, Date.now())) return;
+    return markDone(stop0, i0);
+  }
+  function toastUndo(msg, fn) {
+    const t = document.getElementById('toast');
+    t.replaceChildren(msg + ' · ', h('button', { class: 'toast-undo', type: 'button', onclick: () => { t.hidden = true; fn(); } }, 'Undo'));
+    t.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { t.hidden = true; }, 8000);
+  }
+  // Auto-reach (setting on, app open): called with every fresh GPS fix. Reached.autoReachTarget holds the rules.
+  function autoReachCheck(fix) {
+    try {
+      const P = S.plan, plan = curPlan();
+      if (!P || !plan || !fix || !fix.ok) return false;
+      const stops = plan.stops.map((s) => { const pl = placeOfStop(s); return pl ? { id: s.placeId, lat: pl.lat, lng: pl.lng, status: s.status, reachedAt: s.reachedAt, noAutoReach: s.noAutoReach } : null; }).filter(Boolean);
+      if (P.ctx.end) stops.push({ id: END_ID, lat: P.ctx.end.lat, lng: P.ctx.end.lng, isEnd: true });
+      const id = Reached.autoReachTarget(fix, stops, { enabled: S.settings.autoReach !== false, visible: document.visibilityState === 'visible', now: Date.now() });
+      if (!id) return false;
+      const idx = plan.stops.findIndex((s) => s.placeId === id && !s.status), live = plan.stops[idx];
+      if (!reachStop(live, 'auto')) return false;
+      afterReachChange();
+      toastUndo('Reached ' + dName((placeOfStop(live) || {}).name || '') + ' ' + fmt(live.reachedAt) + ' (auto)', () => undoReachedTap(live, idx));
+      return true;
+    } catch (e) { return false; }
+  }
+  async function autoReachNow() { // page became visible: one GPS read (never prompts), then the same rules
+    const plan = curPlan();
+    if (!S.plan || !plan || S.settings.autoReach === false || !plan.stops.some((s) => !s.status)) return;
+    const fix = await quickFix(false);
+    if (fix.ok) autoReachCheck(fix);
   }
 
   // the stop object a button was rendered with may belong to an older plan object (re-timing replaces them): re-find it
@@ -1758,12 +1853,13 @@
 
   function fuelCard(stop, i, place) { // fuel tag, station, ETA, navigation, DONE / SKIP / REMOVE (no WhatsApp message)
     const btns = navButtons(place);
-    btns.push(h('button', { class: 'small ok', onclick: () => markDone(stop, i) }, 'DONE'));
+    btns.push(primaryBtn(stop, i));
     btns.push(h('button', { class: 'small', onclick: () => skipStop(stop, i) }, 'SKIP'));
     btns.push(h('button', { class: 'small danger', 'aria-label': 'Remove fuel stop', onclick: () => removeFuel() }, 'REMOVE'));
-    return h('div', { class: 'card stop fuel' },
+    const rin = reachedInline(stop, i); // shares the card's address line (no extra row)
+    return h('div', { class: 'card stop fuel' + (rin ? ' reached' : '') },
       h('div', { class: 'stop-head' }, h('span', { class: 'num' }, (i + 1) + '.'), h('span', { class: 'nm' }, dName(place.name)), h('span', { class: 'pill fuel' }, 'FUEL'), h('span', { class: 'times' }, fmt(stop.arriveAt))),
-      place.address ? h('div', { class: 'muted fuel-addr' }, place.address) : null,
+      place.address || rin ? h('div', { class: 'muted fuel-addr' }, place.address || '', place.address && rin ? ' · ' : '', rin) : null,
       h('div', { class: 'stop-btns' }, btns));
   }
 
@@ -1945,6 +2041,10 @@
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Default dwell (minutes) for new places'), h('div', { class: 'row' }, dd)),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Navigation'),
         field('Per-stop navigation button', bind(h('select', null, [['waze', 'Waze'], ['google', 'Google Maps'], ['both', 'Both']].map(([val, lab]) => h('option', { value: val, selected: s.nav === val }, lab))), 'nav'))),
+      h('div', { class: 'card', id: 'reachedCard' }, h('h2', { style: 'margin-top:0' }, 'Reached'),
+        h('label', { class: 'check-row' },
+          h('input', { type: 'checkbox', id: 'autoReach', checked: s.autoReach !== false, style: 'width:auto;min-height:0', onchange: (e) => { s.autoReach = e.target.checked; saveSettings(); } }),
+          " Mark Reached automatically when I'm within 150 m (app open)")),
       fuelSettingsCard(s, field),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Data'),
         h('div', { class: 'row' }, h('button', { class: 'grow', onclick: exportJson }, 'Export JSON'), h('button', { class: 'grow', onclick: () => fileIn.click() }, 'Import JSON'), fileIn),
@@ -2038,6 +2138,7 @@
     if (document.visibilityState !== 'visible' || !S.plan) return;
     if (retimeNow()) { savePlan(); if (S.tab === 'route') render(); }
     refreshFromLocation(); // back in the foreground
+    autoReachNow(); // and the auto-reach rules once, on a fresh fix
   });
 
   // Service worker: register, look for updates on every launch and whenever the app comes back to the

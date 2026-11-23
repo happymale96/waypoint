@@ -13,6 +13,8 @@
  *   Finished / Hours out come from the arrived_end event if there is one, else the LAST DONE event (edits.finishedAt beats both),
  *   never from closedAt. arrived_end {endPoint:{lat,lng,name}} also adds a final leg (last done stop -> end point) to km / drive time;
  *   it never closes the day. An undo with of:'arrived_end' cancels the latest one.
+ *   done events also carry reachedAt (ms | null), reachedSource ('tap' | 'auto' | null) and dwellMin (the planned dwell):
+ *   summarise().visits lists them per done stop; reached.js turns that into the driving / on-site split.
  *   edits.startedAt / edits.finishedAt = user overrides (ISO) of Started / Finished.
  *   legs  = per-leg metres/seconds already held from routing responses: "lat,lng>lat,lng" -> {m, s}
  *   routed = result of the ONE routing request made at End Day: {key, legs:[{m,s}], at}
@@ -121,16 +123,22 @@
   }
 
   // A DONE tap: one event per action at the stop, all sharing t (the fix, if any, is patched in later).
-  function recordDone(day, info) { // info: {nowIso, stopId, actions:[{jobId,kind,item}], places{}}
+  // The stop's Reached state rides on every event of the tap, raw: reachedAt (ms | null), reachedSource ('tap' | 'auto' | null)
+  // and the planned dwell in minutes (what daySplit estimates an arrival with).
+  const reachedFields = (info) => ({
+    reachedAt: info.reachedAt != null ? info.reachedAt : null, reachedSource: info.reachedAt != null ? (info.reachedSource || 'tap') : null,
+    dwellMin: info.dwellMin != null ? info.dwellMin : null,
+  });
+  function recordDone(day, info) { // info: {nowIso, stopId, actions:[{jobId,kind,item}], places{}, reachedAt?, reachedSource?, dwellMin?}
     snapPlace(day, info.places, info.stopId);
-    return info.actions.map((a) => appendEvent(day, { t: info.nowIso, type: 'done', jobId: a.jobId || null, stopId: info.stopId, kind: a.kind, item: a.item || '' }));
+    return info.actions.map((a) => appendEvent(day, Object.assign({ t: info.nowIso, type: 'done', jobId: a.jobId || null, stopId: info.stopId, kind: a.kind, item: a.item || '' }, reachedFields(info))));
   }
   // The fuel stop: recorded as a stop with its done time (kind 'fuel', no job). It is never a job: job counts ignore it and
   // closeDay never carries it forward. info: {nowIso, stopId, name, places{}}
   const FUEL_KIND = 'fuel';
   function recordFuel(day, info) {
     snapPlace(day, info.places, info.stopId);
-    return appendEvent(day, { t: info.nowIso, type: 'done', jobId: null, stopId: info.stopId, kind: FUEL_KIND, item: info.name || '' });
+    return appendEvent(day, Object.assign({ t: info.nowIso, type: 'done', jobId: null, stopId: info.stopId, kind: FUEL_KIND, item: info.name || '' }, reachedFields(info)));
   }
   const isFuelGroup = (g) => g.events.some((e) => e.kind === FUEL_KIND);
   function recordUndo(day, info) { // info: {nowIso, stopId}
@@ -326,7 +334,15 @@
     const firstPlanIdx = day.events.findIndex((e) => e.type === 'plan' || e.type === 'replan');
     const replans = day.events.filter((e, i) => e.type === 'replan' || (e.type === 'plan' && i !== firstPlanIdx)).length;
 
+    // every done stop in tap order with its raw Reached data (Reached.splitOfSummary turns this into driving vs on site)
+    const visits = groups.map((g) => {
+      const e0 = g.events[0] || {};
+      return { stopId: g.stopId, name: isFuelGroup(g) ? 'Fuel: ' + (e0.item || nameOf(g.stopId)) : nameOf(g.stopId), fuel: isFuelGroup(g), doneAt: g.tMs,
+        reachedAt: e0.reachedAt != null ? e0.reachedAt : null, reachedSource: e0.reachedSource || null, dwellMin: e0.dwellMin != null ? e0.dwellMin : null };
+    });
+
     return {
+      visits,
       date: day.date, driverId: day.driverId, closed: !!day.closed, closedAt: ms(day.closedAt != null ? day.closedAt : day.endedAt),
       jobsDone: rows.filter((r) => r.complete).length, jobsTotal: rows.length,
       stopsVisited: visitSeq.length, doneSeq, fuel,

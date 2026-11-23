@@ -214,7 +214,7 @@ async function main() {
     check(after.jobs === before.jobs, 'job count unchanged (all 3 jobs still pending)');
     check(after.saved && after.mem === rem1, 'the plan is persisted with the fuel stop; stations are in the station memory (' + after.mem + ')');
     const card = await ev('document.querySelector(".card.stop.fuel").innerText');
-    check(/FUEL/.test(card) && /WAZE/.test(card) && /DONE/.test(card) && /SKIP/.test(card) && /REMOVE/.test(card) && !/MSG/.test(card), 'the fuel card: FUEL tag, name, WAZE, DONE, SKIP, REMOVE and no message button', card.replace(/\n/g, ' | '));
+    check(/FUEL/.test(card) && /WAZE/.test(card) && /REACHED/.test(card) && !/DONE/.test(card) && /SKIP/.test(card) && /REMOVE/.test(card) && !/MSG/.test(card), 'the fuel card: FUEL tag, name, WAZE, REACHED (then DONE), SKIP, REMOVE and no message button', card.replace(/\n/g, ' | '));
     check((await text('#fuelBtn')) === 'Change fuel stop', 'the button now reads "Change fuel stop"');
 
     console.log('2. tap "Change fuel stop" at once');
@@ -255,7 +255,10 @@ async function main() {
     await ev('window.__online = true');
 
     console.log('6. DONE on the fuel stop: logged as a stop, not a job');
-    await click('.card.stop.fuel button.ok');
+    await click('.card.stop.fuel button.ok'); // REACHED first ...
+    await waitFor('/^DONE$/.test(document.querySelector(".card.stop.fuel button.ok").textContent)', 'the fuel button to read DONE');
+    await advance(1 / 60); // ... past the 500 ms double-tap guard ...
+    await click('.card.stop.fuel button.ok'); // ... then DONE
     await waitFor('document.querySelector(".card.stop.done .title") && /Fuel/.test(document.querySelector(".card.stop.done .title").textContent)', 'the fuel stop to show as done');
     const log = await ev(`(() => { const S = WaypointDebug.S, d = Object.values(S.days)[0], s = DayLog.summarise(d, S.jobs, S.places);
       return { jobs: s.jobsDone + "/" + s.jobsTotal, fuel: s.fuel && s.fuel.place, stops: s.stopsVisited, ev: d.events.filter((e) => e.kind === "fuel").length, prompt: !!document.querySelector(".prompt") }; })()`);

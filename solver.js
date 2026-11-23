@@ -451,15 +451,17 @@
       if (s.status === 'done' || s.status === 'skipped') return Object.assign({}, s);
       const pi = s.fuel ? (fz ? FUEL : null) : pidx(s.placeId);
       if (pi == null) return Object.assign({}, s);
-      const legSec = firstLeft && ov != null ? ov : legAny(pos, pi, t);
+      const onSite = s.reachedAt != null; // reached, not done: we ARE here. Arrival = the Reached time, expected
+      const legSec = onSite ? 0 : firstLeft && ov != null ? ov : legAny(pos, pi, t); // departure = max(now, reached + planned dwell)
       firstLeft = false;
-      const arrive0 = t + legSec * 1000;
+      const arrive0 = onSite ? Number(s.reachedAt) : t + legSec * 1000;
       let arrive = arrive0;
       const af = m.afterMs ? m.afterMs[s.placeId] : null;
-      if (af != null && af > arrive) arrive = af;
+      if (!onSite && af != null && af > arrive) arrive = af;
       const wins = normWindows((m.closed || {})[s.placeId]);
-      if (m.respectClosed && wins.length) arrive = pushPastClosed(wins, arrive);
-      const dep = arrive + ((m.dwellSec || {})[s.placeId] || 0) * 1000;
+      if (!onSite && m.respectClosed && wins.length) arrive = pushPastClosed(wins, arrive);
+      const dwellMs = ((m.dwellSec || {})[s.placeId] || 0) * 1000;
+      const dep = onSite ? Math.max(nowMs, arrive + dwellMs) : arrive + dwellMs;
       const out = Object.assign({}, s, {
         arriveAt: Math.round(arrive), departAt: Math.round(dep),
         waitSec: Math.round((arrive - arrive0) / 1000),
@@ -516,8 +518,15 @@
   function liveView(plan, nowMs) {
     const stops = plan.stops.map((s) => Object.assign({}, s));
     const left = stops.filter((s) => !s.status);
-    const shiftMs = left.length && left[0].arriveAt < nowMs ? nowMs - left[0].arriveAt : 0;
-    if (shiftMs) left.forEach((s) => { s.arriveAt += shiftMs; s.departAt += shiftMs; });
+    let shiftMs = 0;
+    if (left.length && left[0].reachedAt != null) { // on site: its arrival is a fact; only the departure (and everything after) rolls forward
+      shiftMs = Math.max(0, nowMs - left[0].departAt);
+      left[0].departAt += shiftMs;
+      left.slice(1).forEach((s) => { s.arriveAt += shiftMs; s.departAt += shiftMs; });
+    } else {
+      shiftMs = left.length && left[0].arriveAt < nowMs ? nowMs - left[0].arriveAt : 0;
+      if (shiftMs) left.forEach((s) => { s.arriveAt += shiftMs; s.departAt += shiftMs; });
+    }
     let end = Math.max(plan.endArrival + shiftMs, nowMs);
     left.forEach((s) => { end = Math.max(end, s.arriveAt, s.departAt); });
     return { stops, endArrival: end, left: left.length, leftSec: Math.max(0, Math.round((end - nowMs) / 1000)), shiftMs };
