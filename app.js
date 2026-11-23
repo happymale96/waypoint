@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '59fe18a1'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '6ec301cb'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -37,6 +37,7 @@
     fuelStations: [], // permanent station memory (see FUEL STOP below); in Export / Import, never shown in the Places tab
     lunch: null, // today's lunch-break state {date, startedAt, endedAt, skipped} (LUNCH BREAK below); stored as meta:lunchBreak
     loose: [], // items collected by a collect-only job, still with the driver (ITEMS WITH YOU below); collection "loose", in Export / Import
+    tt: { down: false, lastLiveAt: null }, // TomTom: out (limit / unavailable) since the last failed call; the last live re-time (TOMTOM BUDGET below)
   };
 
   function defaultSettings() {
@@ -45,6 +46,7 @@
       templates: Object.assign({}, Messages.DEFAULT_TEMPLATES),
       etaPaddingMin: 10, dwellDefaults: Object.assign({}, DEFAULT_DWELL),
       placesCallsToday: { date: todayStr(), count: 0 }, nav: 'waze', seeded: false, driverName: 'Calvin',
+      tomtomUsage: null, // {day (UTC), requests, cells}: TomTom usage on this device today (TOMTOM BUDGET)
       fuelBrand: 'Caltex', fuelDwellMin: 7, fuelMaxSearches: 50,
       autoReach: true, // mark Reached automatically within 150 m (app open); stored on the device, in Export / Import
       // the driver's lunch break (Settings -> Lunch break; device-stored, in Export / Import)
@@ -197,6 +199,74 @@
     const c = S.settings.placesCallsToday;
     return c.date === todayStr() ? c.count : 0;
   }
+
+  // ---------- TOMTOM BUDGET (the rules live in budget.js) ----------
+  // Every TomTom response is counted per UTC day (requests + matrix cells, settings.tomtomUsage). From Budget.GUARD the
+  // automatic live re-times (visible, the 10-minute tick) stop for the rest of that UTC day. A 401 / 403 / 429 / 5xx /
+  // unreachable answer sets S.tt.down: ONE notice on the Plan and Route tabs; PLAN uses estimated times; the next
+  // successful call clears it.
+  const ttGuard = () => Budget.guardHit(S.settings.tomtomUsage, Date.now());
+  function ttRepaint() { if ((S.tab === 'route' || S.tab === 'plan') && !S.busy && !document.querySelector('.backdrop')) render(); }
+  Providers.setTomTomHook({
+    count(requests, cells) {
+      const wasGuard = ttGuard();
+      S.settings.tomtomUsage = Budget.addUsage(S.settings.tomtomUsage, Date.now(), requests, cells);
+      saveSettings();
+      if (!wasGuard && ttGuard()) ttRepaint();
+    },
+    ok() { if (S.tt.down) { S.tt.down = false; ttRepaint(); } },
+    down() { if (!S.tt.down) { S.tt.down = true; ttRepaint(); } },
+  });
+  function ttNotice() { // the ONE TomTom notice (down wins over the guard); the guard one only on the Route tab
+    if (S.tt.down) return h('div', { class: 'tt-notice down', id: 'ttNotice', role: 'status' }, Budget.DOWN_MSG);
+    if (S.tab === 'route' && ttGuard()) return h('div', { class: 'tt-notice', id: 'ttNotice', role: 'status' }, Budget.GUARD_MSG);
+    return null;
+  }
+  // Is a live re-time (one 1 x 1 TomTom request) allowed for this trigger now? Moves the throttle when it is.
+  function liveDue(trigger) {
+    const d = Budget.retimeDecision({ lastAt: S.tt.lastLiveAt }, { type: trigger, at: Date.now(), visible: document.visibilityState === 'visible', pending: hasPendingStop(curPlan()), guard: ttGuard() });
+    if (d.call) S.tt.lastLiveAt = d.state.lastAt;
+    return d.call;
+  }
+  // the stored plan's real TomTom cells feed the per-pair cache (the estimated-times fallback reuses them after a reload)
+  function seedPairsFromPlan() {
+    try {
+      const plan = curPlan(), m = plan && plan.model;
+      if (!m || !m.matrices || !m.matrices.length) return;
+      const pl = (id) => S.places[id] || S.plan.ctx.places[id];
+      const pts = [m.start].concat(m.stopIds.map(pl), [m.end]);
+      if (pts.every((p) => p && p.lat != null)) Providers.seedPairs(pts, m.matrices[0]);
+    } catch (e) { /* only a cache */ }
+  }
+  // The re-time after TomTom came back: the estimated legs still ahead are replaced by real times (ONE request over the
+  // remaining chain: next stop ... end point), the est. marks go.
+  async function fillEstimatedLegs() {
+    const P = S.plan, plan = curPlan(), m = plan && plan.model;
+    if (!m) return false;
+    if (!Budget.hasEst(m.matrices)) { if (P.provider && P.provider.estimated) P.provider.estimated = false; return false; } // only cached real times left
+    if (!S.settings.tomtomKey) return false;
+    const k = m.stopIds.length, pidx = (pid) => { const i = m.stopIds.indexOf(pid); return i < 0 ? null : i + 1; };
+    const from = lastDoneIdx(plan);
+    const chain = [from >= 0 ? pidx(plan.stops[from].placeId) : 0];
+    plan.stops.forEach((s) => { if (!s.status && !s.fuel) { const p = pidx(s.placeId); if (p != null) chain.push(p); } });
+    chain.push(k + 1);
+    const idx = chain.filter((p) => p != null);
+    const est = m.matrices[0].est;
+    if (idx.length < 2 || !idx.some((a, i) => i > 0 && est[idx[i - 1]][a])) return false;
+    const pt = (i) => { if (i === 0) return m.start; if (i === k + 1) return m.end; const pl = S.places[m.stopIds[i - 1]] || P.ctx.places[m.stopIds[i - 1]]; return { lat: pl.lat, lng: pl.lng }; };
+    try {
+      const legs = await Providers.routeLegs(idx.map(pt), S.settings.tomtomKey);
+      if (S.plan !== P) return false;
+      legs.forEach((l, i) => {
+        const a = idx[i], b = idx[i + 1];
+        m.matrices.forEach((sl) => { if (l.s != null) sl.m[a][b] = l.s; if (sl.d && l.m != null) sl.d[a][b] = l.m; if (sl.est) sl.est[a][b] = false; });
+      });
+      if (!Budget.hasEst(m.matrices) && P.provider) P.provider.estimated = false;
+      return true;
+    } catch (e) { return false; }
+  }
+  let curEst = { stops: new Set(), end: false }; // which ETAs on the Route tab carry "est." (set by renderRoute)
+  const estMark = (on) => (on ? ' est.' : '');
 
   // ---------- place picker (single autocomplete box) ----------
   async function savePlaceFromSearch(r) {
@@ -513,7 +583,7 @@
     window.scrollTo(0, 0);
     render();
     if (S.plan) savePlan(); // the stored plan remembers which tab you were on
-    if (S.tab === 'route' && S.plan) refreshFromLocation(); // opening the Route tab
+    // opening the Route tab: no TomTom request (the times count down from the last live re-time; TOMTOM BUDGET)
   }
 
   // ---------- PLAN tab ----------
@@ -534,6 +604,8 @@
 
     const bar = onBoardBar();
     if (bar) v.append(bar);
+    const ttn = ttNotice();
+    if (ttn) v.append(ttn);
     const note = jobsChangedNote();
     if (note) v.append(note);
     v.append(
@@ -790,7 +862,8 @@
       const input = { start, end, jobs, places, departAtISO: departAt.toISOString(), noDetour: false };
       const points = Solver.pointsFor(input);
       banner('Asking TomTom for travel times (live traffic, 3 time slices)…', 'busy');
-      const got = await Providers.getMatrices(points, input.departAtISO, s.tomtomKey, { force: replan });
+      // TomTom out (limit / unavailable): cached pairs + straight-line estimates, the plan flagged estimated (never blocked)
+      const got = await Providers.getMatricesOrEstimate(points, input.departAtISO, s.tomtomKey, { force: replan });
       const prevNoDetour = S.plan ? S.plan.noDetour : false;
       const prevPlan = replan ? curPlan() : null; // a replan keeps the stops already done on top
       const prevCtxPlaces = replan && S.plan ? S.plan.ctx.places : null; // (the fuel station lives there)
@@ -798,14 +871,15 @@
       const dayKey = replan && planDayKey() ? planDayKey() : DL.dateKey(departAt.getTime());
       const fetchedAt = new Date().toISOString();
       got.matrices.forEach((x) => { if (!x.fetchedAt) x.fetchedAt = fetchedAt; });
-      S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices, dayKey }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial } };
+      S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices, dayKey }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial, estimated: !!got.estimated } };
       solveFresh();
       if (jobs !== allJobs) S.plan.ctx.jobs = allJobs; // lookups by job id still find the whole job (the solve above used the trimmed copy)
       if (prevPlan) {
         S.plan.result.plans = S.plan.result.plans.map((p) => compose(prevPlan, p));
         await keepFuelAfterReplan(prevPlan, prevCtxPlaces, points); // silent: the chosen station only, no Places calls
       }
-      banner('Travel times: TomTom live traffic — ' + (got.fromCache ? 'from session cache (0 calls)' : got.calls + ' calls') + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
+      if (got.estimated) banner(null); // the one TomTom notice says it (ttNotice); no second banner
+      else banner('Travel times: TomTom live traffic — ' + (got.fromCache ? 'from session cache (0 calls)' : got.calls + ' calls') + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
       S.loc.origin = null; S.loc.lastAt = null; S.loc.reason = null;
       retimeNow(); // the shared timing path (the lunch break included)
       logPlan(replan, { start, departAt, places, points, matrices: got.matrices, jobs: Solver.buildStops(jobs, places).jobs });
@@ -816,7 +890,7 @@
     } finally {
       S.busy = false;
       render();
-      if (S.tab === 'route' && S.plan) refreshFromLocation();
+      if (S.tab === 'route' && S.plan) refreshFromLocation({ trigger: 'plan' });
     }
   }
 
@@ -826,7 +900,6 @@
   // Invariant: plan.model.matrices === ctx.matrices (the matrices the current problem was solved with).
   const curPlan = () => (S.plan && S.plan.result && !S.plan.result.error && S.plan.result.plans[S.plan.idx]) || null;
   const iso = (ms) => new Date(ms).toISOString();
-  const STALE_MS = 30 * 60000; // travel times older than this are re-fetched at a DONE
 
   function lastDoneIdx(plan, skipFuel) { // stop most recently marked done; -1 = none yet (= the start point)
     let best = -1, bt = -1;
@@ -906,9 +979,9 @@
   // stop, or the end point once every stop is done / skipped) and is at most 5 minutes old.
   const END_ID = '__end__';
   const targetId = (plan) => { const nx = plan.stops.find((s) => !s.status); return nx ? nx.placeId : END_ID; };
-  function originFor(plan, at) {
+  function originFor(plan, at) { // the last live TomTom time counts down until the next live re-time (Budget.originKept)
     const o = S.loc.origin, now = Date.now();
-    if (!o || o.placeId !== targetId(plan) || at > now || !Solver.originFresh(o, now)) return null;
+    if (!o || o.placeId !== targetId(plan) || at > now || !Budget.originKept(o, now)) return null;
     return { durationToNextSec: Math.max(0, (o.arriveMs - at) / 1000) };
   }
   // The ONE timing path: Solver.retime, then the driver's lunch break (assumed or real; LunchBreak.applyBreak), so the Route
@@ -941,17 +1014,21 @@
       return await Geo.getFix(navigator.geolocation, { fresh: !!fresh });
     } catch (e) { return { ok: false, code: 'unavailable' }; }
   }
-  // Fix -> ONE routing request (fix -> next not-done stop, or the end point when every stop is done / skipped; live
-  // traffic, depart now) -> first ETA = now + duration, later stops follow through the existing legs and dwell times.
-  // No solver run, same order. Never blocks: on any failure it records WHY (S.loc.reason) for the status line.
-  // opts.force = bypass the 2-minute / 300 m throttle (DONE, SKIP, status-line tap); opts.prompt = may ask for permission.
+  // The LIVE RE-TIME. Fix -> ONE 1 x 1 routing request (fix -> next not-done stop, or the end point when every stop is done /
+  // skipped; live traffic, depart now) -> first ETA = now + duration, later stops follow through the plan's own stop-to-stop
+  // times and dwell (never the whole matrix again). No solver run, same order. Never blocks: on any failure it records WHY
+  // (S.loc.reason) for the status line. opts.trigger (Budget.retimeDecision): 'plan' | 'done' | 'skip' | 'undo' | 'tap'
+  // (always; these also bypass the 300 m "unmoved" rule), 'visible' | 'tick' (automatic: 5-min gap, stopped by the daily
+  // guard), 'edit' (fuel added / removed: 5-min gap). A GPS-watch position never comes here. opts.prompt = may ask for permission.
   async function refreshFromLocation(opts) {
     opts = opts || {};
     const P = S.plan, L = S.loc;
-    if (!P || L.busy || !Solver.refreshDue(Date.now(), L.lastAt, opts.force)) return;
+    if (!P || L.busy) return;
     if (routeClosed()) return; // a closed day with no plan since: no live times, no routing request
     const plan0 = curPlan();
     if (!plan0) return;
+    if (!liveDue(opts.trigger || 'visible')) return;
+    opts.force = Budget.isAlways(opts.trigger);
     const nx0 = plan0.stops.find((s) => !s.status), tid = targetId(plan0);
     const target = nx0 ? (S.places[nx0.placeId] || P.ctx.places[nx0.placeId]) : P.ctx.end;
     if (!target) return;
@@ -960,7 +1037,7 @@
     const fail = async (reason) => {
       L.reason = reason;
       // denied, or a live origin older than 5 min: fall back to the last DONE (a fresher origin may still stand)
-      if (L.origin && (reason === 'denied' || !Solver.originFresh(L.origin, Date.now()))) { L.origin = null; if (S.plan === P) { retimeNow(); await savePlan(); } }
+      if (L.origin && (reason === 'denied' || !Budget.originKept(L.origin, Date.now()))) { L.origin = null; if (S.plan === P) { retimeNow(); await savePlan(); } }
       if (S.tab === 'route') render();
     };
     try {
@@ -987,6 +1064,8 @@
       const hadAlt = !!P.alt, now = Date.now();
       L.origin = { placeId: tid, lat: fix.lat, lng: fix.lng, arriveMs: now + dur * 1000, usedAt: now };
       L.reason = null;
+      if (verdict === 'route') await fillEstimatedLegs(); // TomTom answered: estimated legs still ahead get real times
+      if (S.plan !== P) return;
       retimeNow();
       if (hadAlt && cur.stops.some((s) => !s.status)) computeAvoidLunch(); // the Avoid-lunch delta follows the new times
       await savePlan();
@@ -998,7 +1077,7 @@
     try {
       if (!navigator.permissions || !navigator.permissions.query) return;
       navigator.permissions.query({ name: 'geolocation' }).then((st) => {
-        st.addEventListener('change', () => { if (st.state === 'granted' && S.plan) refreshFromLocation({ force: true }); });
+        st.addEventListener('change', () => { if (st.state === 'granted' && S.plan) refreshFromLocation({ trigger: 'visible' }); });
       }).catch(() => {});
     } catch (e) { /* not supported */ }
   }
@@ -1016,27 +1095,6 @@
     if (os) return 'On site at ' + dName(((S.places[os.placeId] || (S.plan && S.plan.ctx.places[os.placeId])) || {}).name || '') + ' since ' + fmt(os.reachedAt);
     const di = lastDoneIdx(plan);
     return Solver.timesLine({ liveAt: S.timesFrom, lastDoneAt: di >= 0 ? Date.parse(plan.stops[di].doneAt) : null, reason: S.loc.reason, busy: S.loc.busy });
-  }
-
-  // travel times older than 30 min are re-fetched (3 slices, like PLAN) before re-timing at a DONE
-  async function refreshIfStale(plan) {
-    const P = S.plan, m = plan.model;
-    const oldest = Math.min.apply(null, m.matrices.map((x) => Date.parse(x.fetchedAt) || 0));
-    if (Date.now() - oldest <= STALE_MS) return;
-    if (!S.settings.tomtomKey) { banner('Travel times are older than 30 min but the TomTom key is missing — keeping them.', 'error'); return; }
-    try {
-      banner('Travel times are older than 30 min — refreshing from TomTom (live traffic, 3 time slices)…', 'busy');
-      const pt = (pid) => { const pl = S.places[pid] || P.ctx.places[pid]; return { lat: pl.lat, lng: pl.lng }; };
-      const points = [m.start].concat(m.stopIds.map(pt), [m.end]);
-      const got = await Providers.getMatrices(points, new Date().toISOString(), S.settings.tomtomKey, { force: true });
-      const stamp = new Date().toISOString();
-      got.matrices.forEach((x) => { x.fetchedAt = stamp; });
-      m.matrices = got.matrices; P.ctx.matrices = got.matrices; // keep plan.model.matrices === ctx.matrices
-      P.provider = { calls: got.calls, fromCache: false, partial: !!got.partial };
-      banner('Travel times: TomTom live traffic — ' + got.calls + ' calls (refreshed)' + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
-    } catch (e) {
-      banner(e.message || String(e), 'error'); // keep going with the older matrices
-    }
   }
 
   // "Avoid lunch": re-solve what is left with closed windows respected (arrival inside a window waits it out)
@@ -1223,7 +1281,7 @@
     banner(null);
     await savePlan();
     render();
-    refreshFromLocation({ force: true });
+    refreshFromLocation({ trigger: 'undo' });
   }
 
   // ARRIVED at the end point: a day-log event (+ a never-blocking fix), the final leg for the summary, the Day complete
@@ -1484,6 +1542,8 @@
     const P = S.plan;
     const bar = onBoardBar();
     if (bar) v.append(bar);
+    const ttn = ttNotice();
+    if (ttn) v.append(ttn);
     if (!P) { v.append(h('div', { class: 'empty card' }, 'No plan yet. Add jobs on the Plan tab and tap PLAN.')); return; }
     const closed = routeClosed();
     if (closed) { // the day was closed and nothing has been planned since: one card, no live route
@@ -1507,16 +1567,20 @@
     const remaining = view.stops.filter((s) => !s.status);
     const day = dayFor(now, false), arrEv = day ? DL.arrivedEnd(day) : null;
     const departMs = day && day.startedAt ? Date.parse(day.startedAt) : Date.parse(ctx.departAtISO);
+    // estimated times (TomTom was out at PLAN): which ETAs depend on an estimated leg carry "est."
+    curEst = Budget.estStops(plan, lastDoneIdx(plan), S.timesFrom != null);
+    const estimated = curEst.stops.size > 0 || curEst.end || !!(P.provider && P.provider.estimated);
 
     // which anchor the times come from (and why not the phone's location); a tap retries at once, bypassing the throttle
-    v.append(h('button', { class: 'times-from', id: 'timesFrom', type: 'button', onclick: () => { if (S.loc.busy) toast('Checking your location…'); else refreshFromLocation({ force: true, prompt: true }); } },
+    v.append(h('button', { class: 'times-from', id: 'timesFrom', type: 'button', onclick: () => { if (S.loc.busy) toast('Checking your location…'); else refreshFromLocation({ trigger: 'tap', prompt: true }); } },
       timesLineFor(plan)));
     v.append(
       h('div', { class: 'card' },
         h('div', { class: 'totals', id: 'routeTotals' },
           h('div', null, h('b', { id: 'stopsLeft' }, view.left), h('span', { class: 'muted' }, 'stops left')),
           h('div', null, h('b', { id: 'minLeft' }, Solver.formatDuration(view.leftSec)), h('span', { class: 'muted' }, 'left')),
-          h('div', null, h('b', { id: 'endArrive' }, fmt(view.endArrival)), h('span', { class: 'muted' }, 'arrive ' + (ctx.end.name || 'end')))),
+          h('div', null, h('b', { id: 'endArrive' }, fmt(view.endArrival) + estMark(curEst.end)), h('span', { class: 'muted' }, 'arrive ' + (ctx.end.name || 'end')))),
+        estimated ? h('div', { class: 'chip est', id: 'estHeader' }, 'Estimated times') : null,
         h('div', { class: 'muted', id: 'departedAt', style: 'margin-top:8px' }, (departMs > now ? 'Departs ' : 'Departed ') + fmt(departMs)),
         P.shiftMs > 60000 ? h('div', { class: 'chip detour' }, 'Running ' + Math.round(P.shiftMs / 60000) + ' min behind plan') : null,
         lunchSkippedLine()),
@@ -1660,7 +1724,7 @@
     return h('div', { class: 'card stop endcard' + (arrEv ? ' arrived' : ''), id: 'endCard' },
       h('div', { class: 'stop-head' },
         h('span', { class: 'nm' }, dName(end.name || 'End')),
-        h('span', { class: 'times', id: 'endCardTime' }, arrEv ? 'arrived ' + fmt(arrivedMs) : fmt(endArrival))),
+        h('span', { class: 'times', id: 'endCardTime' }, arrEv ? 'arrived ' + fmt(arrivedMs) : fmt(endArrival) + estMark(curEst.end))),
       h('div', { class: 'muted end-label' }, 'End of route'),
       h('div', { class: 'stop-btns' }, btns));
   }
@@ -1707,7 +1771,7 @@
     const todays = (place.closedWindows || []).filter((w) => (Array.isArray(w.days) ? w.days : ALL_DAYS).indexOf(wd) >= 0);
     const more = h('div', { class: 'stop-more', hidden: !openStops.has(stop.placeId) },
       place.address ? h('div', null, place.address) : null,
-      h('div', { class: 'times' }, fmt(stop.arriveAt) + ' → ' + fmt(stop.departAt)),
+      h('div', { class: 'times' }, fmt(stop.arriveAt) + ' → ' + fmt(stop.departAt) + estMark(curEst.stops.has(stop.placeId))),
       todays.length ? h('div', null, 'Closed today: ' + todays.map((w) => w.from + '–' + w.to).join(', ')) : null,
       stop.waitSec > 60 ? h('div', null, 'Wait ~' + Math.round(stop.waitSec / 60) + ' min here before service starts.') : null,
       stop.detour ? h('div', null, 'Detour: not urgent, but visited before the last urgent delivery.') : null,
@@ -1716,7 +1780,7 @@
       h('span', { class: 'num' }, (i + 1) + '.'),
       h('span', { class: 'nm' }, dName(place.name)),
       pills,
-      h('span', { class: 'times' }, fmt(stop.arriveAt)));
+      h('span', { class: 'times' }, fmt(stop.arriveAt) + estMark(curEst.stops.has(stop.placeId))));
     const toggle = () => {
       const on = more.hidden; more.hidden = !on;
       head.setAttribute('aria-expanded', String(on));
@@ -1765,7 +1829,7 @@
     if (!ls || ls.stop.status || !Reached.isReached(ls.stop)) return;
     Object.assign(ls.stop, Reached.undoReached(ls.stop));
     await afterReachChange();
-    refreshFromLocation({ force: true });
+    refreshFromLocation({ trigger: 'undo' });
   }
   // The one primary button: REACHED first, then DONE. For 500 ms after the stop became reached it ignores taps.
   function primaryTap(stop0, i0) {
@@ -1843,7 +1907,8 @@
     const reason = code === 1 ? 'denied' : 'nofix';
     if (S.loc.reason !== reason) { S.loc.reason = reason; paintTimesLine(); } // the status line says why, as before (no toast)
   }
-  // One fix (watch update, or the fresh foreground fix): store it, auto-reach, then re-time (throttled for the watch).
+  // One fix (watch update, or the fresh foreground fix): store it, auto-reach, then re-time. A WATCH position never calls
+  // TomTom: it only re-times locally (at most once per 30 s), counting the ETAs down from the last TomTom-based times.
   function takeFix(fix, src) {
     S.loc.lastFix = fix;
     const now = Date.now();
@@ -1852,8 +1917,16 @@
       if (!Reached.retimeDue(W.lastRetimeAt, now)) return;
       W.lastRetimeAt = now;
       if (S.plan && retimeNow()) { savePlan(); if (S.tab === 'route' && !document.querySelector('.backdrop')) render(); }
+      return;
     }
-    refreshFromLocation({ fix }); // the usual live-origin path (its own 2-min / 300 m throttle on routing requests)
+    refreshFromLocation({ fix, trigger: 'visible' }); // the foreground fix: a live re-time if Budget allows (5-min gap, guard)
+  }
+  // The minute timer's live re-time: while visible with a stop pending, once every 10 minutes (Budget.PERIOD_MS), using the
+  // watch's last fix when it is under a minute old (else one quick fix). Stopped by the daily guard.
+  function liveTick() {
+    if (!S.plan || S.loc.busy || document.visibilityState !== 'visible' || !hasPendingStop(curPlan()) || routeClosed()) return;
+    const fx = S.loc.lastFix, fresh = fx && fx.ok && Date.now() - (fx.at || 0) <= 60000;
+    refreshFromLocation({ trigger: 'tick', fix: fresh ? fx : undefined });
   }
   // Back in the foreground: one immediate FRESH fix (no cached position); auto-reach is evaluated when it arrives.
   async function freshFixNow() {
@@ -1861,7 +1934,7 @@
     if (!P) return;
     const fix = await quickFix(false, true);
     if (S.plan !== P) return;
-    if (fix.ok) takeFix(fix, 'visible'); else refreshFromLocation({ fix });
+    if (fix.ok) takeFix(fix, 'visible'); else refreshFromLocation({ fix, trigger: 'visible' });
   }
 
   // ---------- LUNCH BREAK (the driver's; the rules live in lunchbreak.js) ----------
@@ -1966,8 +2039,7 @@
     P.result.plans[0] = timedPlan(P.result.plans[0], i, nowIso);
     P.shiftMs = 0;
     render();
-    await refreshIfStale(P.result.plans[0]);              // travel times older than 30 min are re-fetched, then re-timed again
-    P.result.plans[0] = timedPlan(P.result.plans[0], i, nowIso);
+    // (no whole-matrix refresh at a DONE: the live re-time below asks TomTom for the next leg only)
     // offer to send the ETA to the next stop if it is a delivery and has a WhatsApp number
     const plan = P.result.plans[0];
     const next = plan.stops.slice(i + 1).find((s) => !s.status);
@@ -1980,7 +2052,7 @@
     await savePlan();
     render();
     dayCompleteBanner();
-    refreshFromLocation({ force: true }); // after DONE: ETAs from where we are now (a new target, so not throttled; never blocks)
+    refreshFromLocation({ trigger: 'done' }); // after DONE: ETAs from where we are now (always; one 1 x 1 request; never blocks)
   }
 
   // A stop becomes skipped ONLY by this explicit tap (nothing else - DONE order, timing, replan - ever sets it).
@@ -2002,7 +2074,7 @@
     toast(ls.stop.fuel ? 'Fuel stop skipped. Undo skip to bring it back.' : 'Skipped — actions stay pending. Undo skip to bring it back.');
     await savePlan();
     render();
-    refreshFromLocation({ force: true });
+    refreshFromLocation({ trigger: 'skip' });
   }
   async function undoSkip(stop0, i0) { // puts the stop back in the chain and re-times
     const P = S.plan, cur = curPlan();
@@ -2016,7 +2088,7 @@
     banner(null);
     await savePlan();
     render();
-    refreshFromLocation({ force: true });
+    refreshFromLocation({ trigger: 'undo' });
   }
 
   // ---------- FUEL STOP ----------
@@ -2237,7 +2309,11 @@
       const short = Fuel.shortlist(pts, known, legs, 5);
       const stationPts = short.map((r) => Object.assign({}, r.station, { fuel: true, key: llKey(r.station) }));
       let table;
-      try { table = await fuelTable(pts.concat(stationPts), base); } catch (e) { if (!cancelled) fail('Could not get travel times: ' + (e.message || e)); return; }
+      try { table = await fuelTable(pts.concat(stationPts), base); } catch (e) {
+        if (cancelled) return;
+        if (e && e.kind === 'limit') { sh.close(); render(); return; } // the one TomTom notice says why (no second banner)
+        fail('Could not get travel times: ' + (e.message || e)); return;
+      }
       if (cancelled) return;
       const fzs = {};
       const fzOf = (st) => fzs[st.placeId] || (fzs[st.placeId] = makeFuelT(st, table, base));
@@ -2280,7 +2356,7 @@
     toast('Fuel stop added: ' + dName(st.name));
     await savePlan();
     render();
-    refreshFromLocation({ force: true });
+    refreshFromLocation({ trigger: 'edit' });
   }
   async function removeFuel() {
     const P = S.plan, cur = curPlan();
@@ -2297,7 +2373,7 @@
     toast('Fuel stop removed.');
     await savePlan();
     render();
-    refreshFromLocation({ force: true });
+    refreshFromLocation({ trigger: 'edit' });
   }
 
   function fuelCard(stop, i, place) { // fuel tag, station, ETA, navigation, DONE / SKIP / REMOVE (no WhatsApp message)
@@ -2307,7 +2383,7 @@
     btns.push(h('button', { class: 'small danger', 'aria-label': 'Remove fuel stop', onclick: () => removeFuel() }, 'REMOVE'));
     const rin = reachedInline(stop, i); // shares the card's address line (no extra row)
     return h('div', { class: 'card stop fuel' + (rin ? ' reached' : '') },
-      h('div', { class: 'stop-head' }, h('span', { class: 'num' }, (i + 1) + '.'), h('span', { class: 'nm' }, dName(place.name)), h('span', { class: 'pill fuel' }, 'FUEL'), h('span', { class: 'times' }, fmt(stop.arriveAt))),
+      h('div', { class: 'stop-head' }, h('span', { class: 'num' }, (i + 1) + '.'), h('span', { class: 'nm' }, dName(place.name)), h('span', { class: 'pill fuel' }, 'FUEL'), h('span', { class: 'times' }, fmt(stop.arriveAt) + estMark(curEst.stops.has(stop.placeId)))),
       place.address || rin ? h('div', { class: 'muted fuel-addr' }, place.address || '', place.address && rin ? ' · ' : '', rin) : null,
       h('div', { class: 'stop-btns' }, btns));
   }
@@ -2481,7 +2557,8 @@
         h('div', { class: 'muted' }, 'Keys stay on this device (never in the code, never exported).')),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Google Places calls today'),
         h('div', { class: 'title' }, String(placesCallsToday())),
-        h('div', { class: 'muted' }, 'Counted on this device only. No Google-side cap is set yet.')),
+        h('div', { class: 'muted' }, 'Counted on this device only. No Google-side cap is set yet.'),
+        h('div', { class: 'tt-usage', id: 'ttUsage' }, Budget.usageLine(S.settings.tomtomUsage, Date.now()))),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Driver'),
         field('Driver name (day log + summary)', bind(h('input', { value: s.driverName || 'Calvin', autocomplete: 'off' }), 'driverName', (x) => x.trim() || 'Calvin'))),
       historyCard(),
@@ -2561,7 +2638,7 @@
         for (const d of dl.records) { S.days[d.date] = d; await WPStore.set('daylogs', d.date, d); }
       }
       if (data.settings) {
-        const keep = { googleKey: S.settings.googleKey, tomtomKey: S.settings.tomtomKey, placesCallsToday: S.settings.placesCallsToday };
+        const keep = { googleKey: S.settings.googleKey, tomtomKey: S.settings.tomtomKey, placesCallsToday: S.settings.placesCallsToday, tomtomUsage: S.settings.tomtomUsage };
         S.settings = Object.assign(defaultSettings(), data.settings, keep);
         await saveSettings();
       }
@@ -2639,21 +2716,25 @@
     }).catch(() => {});
   }
 
-  // Route tab open: re-render once a minute (NO network call) so no time shown has slipped into the past.
-  setInterval(() => {
+  // Once a minute: re-render the Route tab (NO network call) so no time shown has slipped into the past; the 10-minute
+  // live re-time (liveTick: Budget decides, one 1 x 1 request at most).
+  function minuteTick() {
     if (S.plan) lunchTick(); // a lunch break whose length elapsed ends by itself
     if (S.tab === 'route' && S.plan && document.visibilityState === 'visible' && !document.querySelector('.backdrop')) render();
-  }, 60000);
+    liveTick();
+  }
+  setInterval(minuteTick, 60000);
 
   load().then(() => {
+    seedPairsFromPlan();
     if (S.plan) lunchTick();
     if (S.plan && retimeNow()) savePlan(); // restored plan: re-time from the last done stop (or start) at the current time
     if (S.tab === 'plan') openPlanTab(); // a running day restored on the Plan tab: the chips read "My location" / "Now"
     render();
-    if (S.tab === 'route' && S.plan) refreshFromLocation();
+    if (S.tab === 'route' && S.plan) refreshFromLocation({ trigger: 'visible' }); // launch = the page becoming visible
     watchLocationPermission();
     setupServiceWorker();
   }).catch((e) => banner('Startup failed: ' + e.message, 'error'));
 
-  window.WaypointDebug = { S, doPlan, render };
+  window.WaypointDebug = { S, doPlan, render, minuteTick };
 })();

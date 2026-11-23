@@ -556,6 +556,7 @@
       departAt: s.departAt, fetchedAt: s.fetchedAt,
       m: idxList.map((a, i) => idxList.map((b, j) => (i === j ? 0 : s.m[a][b]))),
       d: s.d ? idxList.map((a, i) => idxList.map((b, j) => (i === j ? 0 : s.d[a][b]))) : undefined, // metres (day log), when held
+      est: s.est ? idxList.map((a, i) => idxList.map((b, j) => (i === j ? false : !!s.est[a][b]))) : undefined, // estimated cells (TomTom out)
     }));
   }
 

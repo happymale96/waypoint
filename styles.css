@@ -285,3 +285,8 @@ button.end-day { width: 100%; margin: 8px 0 0; min-height: 44px; }
 .jobs-changed { margin: 0 0 10px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--chip); font-size: 14px; font-weight: 600; }
 .pin-glyph { font-size: 13px; }
 .done-pickup .name { font-weight: 700; }
+/* TomTom budget: the one notice (limit reached / unavailable, or the daily guard), "Estimated times", the Settings counter */
+.tt-notice { margin: 0 0 10px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--chip); font-size: 14px; font-weight: 600; }
+.tt-notice.down { background: var(--warn); color: #fff; border-color: transparent; }
+.chip.est { margin-top: 8px; }
+.tt-usage { margin-top: 8px; font-size: 14px; }
