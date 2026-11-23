@@ -60,6 +60,8 @@ button:disabled { opacity: .5; }
 .title { font-weight: 700; font-size: 17px; }
 .place-name { overflow-wrap: anywhere; }
 .place-tag { display: block; margin-top: 8px; }
+.place-wa { display: block; margin-top: 4px; }
+.place-closed { display: block; margin-top: 4px; color: var(--text); font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
 .timeline { position: relative; }
 .stop { border-left: 5px solid var(--brand); }
 .stop.done { opacity: .5; border-left-color: var(--ok); }
