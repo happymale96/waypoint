@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = 'efae4694'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '06fc13b5'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -673,7 +673,9 @@
     if (!s.tomtomKey) { banner('TomTom API key missing — add it in Settings. (Travel times come from TomTom Matrix Routing v2.)', 'error'); return; }
     const end = S.places[S.endSel];
     if (!end) { banner('Pick an end place.', 'error'); return; }
-    const jobs = JSON.parse(JSON.stringify(S.jobs));
+    const allJobs = JSON.parse(JSON.stringify(S.jobs));
+    // on a running day a SKIPPED stop is left exactly as it is: what it holds is not solved again (only Undo skip brings it back)
+    const jobs = replan ? OnBoard.jobsForPlan(allJobs, curPlan()) : allJobs;
     const stopIds = Solver.buildStops(jobs, S.places).stopIds;
     if (!stopIds.length) { toast('No pending jobs to plan.'); return; }
     if (stopIds.length > Solver.MAX_STOPS) { banner('Too many stops: ' + stopIds.length + ' distinct places (max ' + Solver.MAX_STOPS + '). Park some jobs first.', 'error'); return; }
@@ -709,6 +711,7 @@
       got.matrices.forEach((x) => { if (!x.fetchedAt) x.fetchedAt = fetchedAt; });
       S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices, dayKey }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial } };
       solveFresh();
+      if (jobs !== allJobs) S.plan.ctx.jobs = allJobs; // lookups by job id still find the whole job (the solve above used the trimmed copy)
       if (prevPlan) {
         S.plan.result.plans = S.plan.result.plans.map((p) => compose(prevPlan, p));
         await keepFuelAfterReplan(prevPlan, prevCtxPlaces, points); // silent: the chosen station only, no Places calls
@@ -1450,7 +1453,7 @@
     v.append(navRow);
     if (P.alt) v.append(altCard(P));
 
-    if (view.left > 0 && plan.stops.some((s) => s.status === 'skipped' && !s.fuel)) v.append(h('div', { class: 'prompt', id: 'skipPrompt' }, 'A stop was skipped. To bring it back, open the Plan tab and tap PLAN. ', h('button', { class: 'small', onclick: () => openTab('plan') }, 'Go to Plan')));
+    if (view.left > 0 && plan.stops.some((s) => s.status === 'skipped' && !s.fuel)) v.append(h('div', { class: 'prompt', id: 'skipPrompt' }, 'A stop was skipped. PLAN leaves it skipped; tap Undo skip on it to bring it back. ', h('button', { class: 'small', onclick: () => openTab('plan') }, 'Go to Plan')));
     if (P.prompt) {
       const stop = plan.stops.find((s) => s.placeId === P.prompt.placeId);
       const place = S.places[P.prompt.placeId];
@@ -1905,7 +1908,7 @@
     P.alt = null;
     P.result.plans = [P.result.plans[P.idx]]; P.idx = 0;
     retimeNow(); // from the last DONE (never from the skipped stop: we did not go there)
-    toast(ls.stop.fuel ? 'Fuel stop skipped. Undo skip to bring it back.' : 'Skipped — actions stay pending. Undo skip, or tap PLAN to bring it back.');
+    toast(ls.stop.fuel ? 'Fuel stop skipped. Undo skip to bring it back.' : 'Skipped — actions stay pending. Undo skip to bring it back.');
     await savePlan();
     render();
     refreshFromLocation({ force: true });

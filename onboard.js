@@ -244,6 +244,23 @@
     if (plan.endNavStartedAt != null) return true;
     return !!(day && (day.events || []).some((e) => e && e.type === 'nav'));
   }
+  // The jobs PLAN solves on a running day: whatever a SKIPPED stop holds (its pickups, delivery or errand, by job and place) is left
+  // out, so PLAN never re-solves a skipped stop or adds its job again; only "Undo skip" brings it back. Returns copies; the stored
+  // jobs are not touched. A job with nothing left to visit after that is dropped. No plan (or nothing skipped): the jobs as given.
+  function jobsForPlan(jobs, plan) {
+    const skipped = ((plan && plan.stops) || []).filter((s) => s && s.status === 'skipped' && !s.fuel);
+    if (!skipped.length) return jobs;
+    const held = (j, kind, pid) => skipped.some((s) => s.placeId === pid && (s.actions || []).some((a) => a.jobId === j.id && a.kind === kind));
+    const out = [];
+    (jobs || []).forEach((j) => {
+      if (j.errandPlaceId) { if (!held(j, 'errand', j.errandPlaceId)) out.push(j); return; }
+      const c = JSON.parse(JSON.stringify(j));
+      c.pickups = (c.pickups || []).map((p) => (!p.done && held(j, 'pickup', p.placeId) ? Object.assign({}, p, { done: true }) : p));
+      if (c.deliveryPlaceId && held(j, 'deliver', c.deliveryPlaceId)) c.deliveryPlaceId = null;
+      if (c.pickups.some((p) => !p.done) || c.deliveryPlaceId) out.push(c);
+    });
+    return out;
+  }
   // The Route tab of a closed day: today's record is closed and no PLAN / replan has been made since -> {closedAtMs}, else null.
   function closedRouteCard(day) {
     if (!day || !day.closed) return null;
@@ -260,6 +277,6 @@
   return {
     STATUS, DROP_RADIUS_M, isCollectOnly, looseFromJob, addForJob, removeForJob, dropOff, undoDrop, setDropPlace, convert, looseHeldAt,
     onBoard, barLabel, whenLabel, distanceM, nearestPlace, summaryExtra, backfillKeys, backfill, runBackfillOnce, exportLoose, importLoose,
-    isDayRunning, closedRouteCard,
+    isDayRunning, jobsForPlan, closedRouteCard,
   };
 });

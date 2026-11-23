@@ -312,6 +312,32 @@ async function main() {
     await waitFor('document.querySelector("#sumWithYou")', 'the closed day summary');
     check(/printer ribbon/.test(await text('#sumWithYou') || ''), 'the closed day is re-rendered with the same rule');
 
+    console.log('RUN 3 (fresh storage): PLAN on a running day keeps a skipped stop skipped');
+    await fresh();
+    await planNow(4);
+    await ev('(() => { const c = [...document.querySelectorAll(".timeline .card.stop")].find((x) => x.querySelector(".nm") && x.querySelector(".nm").textContent.indexOf("Carrier") === 0); [...c.querySelectorAll(".stop-btns button")].find((b) => b.textContent === "SKIP").click(); return true; })()');
+    await waitFor(planStop('carrier') + '.status === "skipped"', 'Carrier to be skipped');
+    const skippedCards = () => ev('[...document.querySelectorAll(".timeline .card.stop.skipped")].map((c) => ({ t: c.textContent, undo: !!c.querySelector("button[aria-label=\\"Undo skip\\"]") }))');
+    const jobsRun3 = await S('jobs.length');
+    check(await ev('(() => { const b = document.querySelector("#skipPrompt button"); return !!b && b.textContent === "Go to Plan"; })()'), 'the skip prompt keeps its "Go to Plan" button');
+    await tab('plan');
+    await ev('(() => { const j = ' + JSON.stringify(job('jd3', { pickups: [{ placeId: 'sup', item: 'cable', done: false }], deliveryPlaceId: 'd1', createdAt: '2026-11-23T01:09:00.000Z' })) + '; WaypointDebug.S.jobs.push(j); return WPStore.set("jobs", j.id, j).then(() => { WaypointDebug.render(); return true; }); })()');
+    await advanceMs(60000);
+    await planNow(4); // Carrier (skipped, once) + the three live stops; before the fix the skipped job came back as a fifth stop
+    const sk = await skippedCards();
+    check(sk.length === 1 && /Carrier/.test(sk[0].t) && sk[0].undo, 'after PLAN: Carrier is still skipped, once, with "Undo skip"', sk);
+    check(!/\d\d:\d\d/.test(sk[0].t), 'the skipped stop shows no ETA', sk[0].t);
+    const afterPlan = await ev('(() => { const S = WaypointDebug.S, p = S.plan.result.plans[0]; return { names: p.stops.map((s) => s.placeId + ":" + (s.status || "")), carrier: p.stops.filter((s) => s.placeId === "carrier").length, first: p.stops[0].placeId + ":" + p.stops[0].status, jc: S.jobs.find((j) => j.id === "jc").status, jobs: S.jobs.length }; })()');
+    check(afterPlan.carrier === 1 && afterPlan.first === 'carrier:skipped' && afterPlan.names.length === 4, 'the skipped stop is in its place, not added again', afterPlan.names);
+    check(afterPlan.jc === 'pending' && afterPlan.jobs === jobsRun3 + 1, 'its job is still pending (not done) and no job was added or lost', afterPlan);
+    await tab('route');
+    await click('.timeline .card.stop.skipped button[aria-label="Undo skip"]');
+    await waitFor('!document.querySelector(".timeline .card.stop.skipped")', 'Undo skip');
+    await tab('plan');
+    await planNow(4);
+    const pendC = await ev('(() => { const p = WaypointDebug.S.plan.result.plans[0], s = p.stops.find((x) => x.placeId === "carrier"); const c = [...document.querySelectorAll(".timeline .card.stop")].find((x) => x.textContent.indexOf("Carrier") >= 0); return { n: p.stops.filter((x) => x.placeId === "carrier").length, status: s && s.status, arriveAt: s && s.arriveAt, txt: c ? c.textContent : "", skipped: document.querySelectorAll(".timeline .card.stop.skipped").length }; })()');
+    check(pendC.n === 1 && !pendC.status && pendC.skipped === 0 && pendC.arriveAt > 0 && /\d\d:\d\d/.test(pendC.txt), 'after Undo skip and PLAN: Carrier is pending, with an ETA', pendC);
+
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {
     await cleanup();

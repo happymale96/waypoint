@@ -233,6 +233,38 @@ console.log('predicate: the day is RUNNING (PLAN re-solves instead of planning a
   ok(OB.isDayRunning({ stops: null }, null) === false, 'a broken plan: not running');
 }
 
+console.log('PLAN on a running day keeps a skipped stop skipped (OnBoard.jobsForPlan)');
+{
+  const Solver = require('../solver.js');
+  const pl = {};
+  ['A', 'B', 'C', 'D'].forEach((id, i) => { pl[id] = { id, name: 'Place ' + id, lat: 3.1 + i * 0.01, lng: 101.6 + i * 0.01, type: 'other' }; });
+  const errand = (id, pid, status) => ({ id, errandPlaceId: pid, pickups: [], deliveryPlaceId: null, notes: id, status: status || 'pending' });
+  const stopOf = (pid, jid, status) => Object.assign({ placeId: pid, actions: [{ jobId: jid, kind: 'errand', item: jid }] }, status ? { status } : {});
+  const jobs = [errand('jA', 'A', 'done'), errand('jB', 'B'), errand('jC', 'C'), errand('jD', 'D')]; // D was added after the plan
+  const plan = { stops: [stopOf('A', 'jA', 'done'), stopOf('B', 'jB', 'skipped'), stopOf('C', 'jC')] };
+  const before = JSON.stringify(jobs);
+  const solved = OB.jobsForPlan(jobs, plan);
+  eq(Solver.buildStops(solved, pl).stopIds, ['C', 'D'], 'A done, B skipped, C pending, D new: PLAN solves C and D only');
+  ok(JSON.stringify(jobs) === before && jobs.length === 4, 'the stored jobs are untouched: the job count is unchanged');
+  ok(!solved.some((j) => j.id === 'jB') && Solver.buildStops(solved, pl).stopIds.indexOf('B') < 0, 'the skipped stop\'s job is not solved again (no new stop for it)');
+  // the solve itself gives the skipped place no stop and no ETA
+  const mk = (n) => ({ departAt: '2026-11-23T01:00:00.000Z', m: Array.from({ length: n }, (_, a) => Array.from({ length: n }, (_, b) => (a === b ? 0 : 300))) });
+  const res = Solver.solve({ start: { lat: 3.09, lng: 101.59 }, end: { lat: 3.2, lng: 101.7 }, jobs: solved, places: pl, matrices: [mk(4)], departAtISO: '2026-11-23T01:00:00.000Z', noDetour: false });
+  ok(!res.error && res.plans[0].stops.map((s) => s.placeId).sort().join('') === 'CD', 'the re-solve gives C and D a stop and ETA, B none', res.error);
+  // after "Undo skip" on B (its status removed) the next PLAN includes B, C and D
+  const undone = { stops: plan.stops.map((s) => { const c = Object.assign({}, s); if (c.placeId === 'B') delete c.status; return c; }) };
+  eq(Solver.buildStops(OB.jobsForPlan(jobs, undone), pl).stopIds, ['B', 'C', 'D'], 'after Undo skip on B the next PLAN solves B, C and D');
+  ok(OB.jobsForPlan(jobs, null) === jobs && OB.jobsForPlan(jobs, { stops: [stopOf('A', 'jA', 'done')] }) === jobs, 'no plan, or nothing skipped: the jobs as given');
+  ok(OB.jobsForPlan(jobs, { stops: [{ placeId: 'FUEL', fuel: true, status: 'skipped', actions: [] }] }) === jobs, 'a skipped fuel stop holds no job: the jobs as given');
+  // a carry job: pickup at a live stop, delivery at the skipped stop -> only the live pickup is solved (the delivery stays skipped)
+  const carry = { id: 'jX', pickups: [{ placeId: 'C', item: 'box', done: false }], deliveryPlaceId: 'B', errandPlaceId: null, status: 'pending' };
+  const mixed = OB.jobsForPlan([carry], { stops: [{ placeId: 'B', status: 'skipped', actions: [{ jobId: 'jX', kind: 'deliver', item: 'box' }] }] });
+  eq(Solver.buildStops(mixed, pl).stopIds, ['C'], 'a job with its delivery at the skipped stop: the delivery is not solved again');
+  ok(carry.deliveryPlaceId === 'B', 'the stored job keeps its delivery place');
+  // a new job at the same place as the skipped stop is a new job: solved as normal
+  eq(Solver.buildStops(OB.jobsForPlan(jobs.concat([errand('jE', 'B')]), plan), pl).stopIds, ['C', 'D', 'B'], 'a newly added job at the skipped place is a new stop');
+}
+
 console.log('predicate: the Route tab of a closed day');
 {
   const T = (h, m) => iso(at(23, h, m));
