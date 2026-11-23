@@ -103,6 +103,34 @@
     const changed = was !== JSON.stringify([out.settings.dwellDefaults, out.settings.etaPaddingMin]) || before !== JSON.stringify(out.places.map((p) => p.dwellMin));
     return { state: out, suppliers, customers, changed };
   }
+  // ---------- pinned places ----------
+  // A saved place has a boolean `pinned`. In every place picker pinned places come FIRST (name order), also while typing (they stay at
+  // the top even when they do not match the text); the normal matches follow without repeating a pinned place. The Places tab sorts
+  // pinned first, then the existing name order.
+  const nameCmp = (a, b) => String(a.name).localeCompare(String(b.name));
+  function pickerOrder(places, query) {
+    const q = String(query || '').trim().toLowerCase();
+    const all = places.slice();
+    const pinned = all.filter((p) => p.pinned).sort(nameCmp);
+    const rest = all.filter((p) => !p.pinned && (!q || (p.name + ' ' + (p.address || '')).toLowerCase().includes(q))).sort(nameCmp);
+    return pinned.concat(rest);
+  }
+  function pinnedFirst(places) { // the Places tab: pinned first, then name order
+    return places.filter((p) => p.pinned).sort(nameCmp).concat(places.filter((p) => !p.pinned).sort(nameCmp));
+  }
+  // One-time migration (2026-11-24): every saved place of type "office" is pinned; nothing else. state = {places, migrations:{pinOffice2026_11_24}}
+  // -> {state (a new object), count, changed}. With the flag already set nothing changes.
+  const PIN_FLAG = 'pinOffice2026_11_24';
+  function migratePins(state) {
+    const out = JSON.parse(JSON.stringify(state || {}));
+    out.places = out.places || []; out.migrations = out.migrations || {};
+    if (out.migrations[PIN_FLAG]) return { state: out, count: 0, changed: false };
+    let count = 0;
+    out.places.forEach((p) => { if (p.type === 'office' && p.pinned !== true) { p.pinned = true; count++; } });
+    out.migrations[PIN_FLAG] = true;
+    return { state: out, count, changed: count > 0 };
+  }
+
   // form = {name, address, type, salutation, lang, lat, lng, accuracy}
   function manualPlace(form, ctx) {
     const o = {
@@ -196,6 +224,6 @@
     return s.from + '–' + s.to + (s.friFrom ? ' · Fri ' + s.friFrom + '–' + s.friTo : '');
   }
 
-  return { SHORT_LINK_MSG, MY_BOX, GOOD_ACCURACY_M, parseCoords, outsideMalaysia, inRange, mapsCheckUrl, getFix, makePlace, manualPlace, moveLocation, undoMove, migrateDwell, DWELL_FLAG,
+  return { SHORT_LINK_MSG, MY_BOX, GOOD_ACCURACY_M, parseCoords, outsideMalaysia, inRange, mapsCheckUrl, getFix, makePlace, manualPlace, moveLocation, undoMove, migrateDwell, DWELL_FLAG, pickerOrder, pinnedFirst, migratePins, PIN_FLAG,
     daysLabel, simpleToStored, storedToSimple, validateSimple, formatWindows, lunchCardText };
 });

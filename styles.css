@@ -279,3 +279,9 @@ button.end-day { width: 100%; margin: 8px 0 0; min-height: 44px; }
 .ob-sub { overflow-wrap: anywhere; }
 .ob-btns { display: flex; gap: 6px; flex: none; flex-wrap: wrap; justify-content: flex-end; max-width: 52%; }
 .sum-dropped { margin-top: 6px; overflow-wrap: anywhere; }
+
+/* edit a job: tappable boxes, the pencil, the slim "jobs changed" line, the pin glyph in the pickers */
+.job-grid .box.tap { cursor: pointer; }
+.jobs-changed { margin: 0 0 10px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--chip); font-size: 14px; font-weight: 600; }
+.pin-glyph { font-size: 13px; }
+.done-pickup .name { font-weight: 700; }

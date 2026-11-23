@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '9f5b67bb'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '59fe18a1'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -74,6 +74,7 @@
     if (!S.places[S.endSel]) S.endSel = Object.keys(S.places)[0] || '';
     await runMigrations();
     const dwellRes = await runDwellMigration(false); // once per device (flag in meta/migrations)
+    await runPinMigration(false); // once per device: every office-type place is pinned (no toast)
     await loadDays();
     S.loose = (await WPStore.list('loose')).filter((x) => x && x.id);
     await backfillLoose(); // once: today's / the latest closed day's collect-only jobs get their loose item
@@ -107,6 +108,17 @@
     await saveSettings();
     rec[Geo.DWELL_FLAG] = true;
     await WPStore.set('meta', 'migrations', rec);
+    return res;
+  }
+  // One-time pin migration (Geo.migratePins): every saved place of type "office" gets pinned = true, nothing else. Flag meta/migrations.pinOffice2026_11_24.
+  async function runPinMigration(force) {
+    const rec = (await WPStore.get('meta', 'migrations')) || { done: [] };
+    if (rec[Geo.PIN_FLAG] && !force) return null;
+    const res = Geo.migratePins({ places: Object.values(S.places), migrations: {} });
+    for (const p of res.state.places) if (!!S.places[p.id].pinned !== !!p.pinned) { S.places[p.id].pinned = true; await savePlace(S.places[p.id]); }
+    const rec2 = (await WPStore.get('meta', 'migrations')) || { done: [] }; // read again: the dwell migration may have just written it
+    rec2[Geo.PIN_FLAG] = true;
+    await WPStore.set('meta', 'migrations', rec2);
     return res;
   }
   const dwellToastText = (r) => 'Updated: ' + r.suppliers + ' supplier places to 10 min, ' + r.customers + ' customer places to 30 min, ETA padding to 10 min';
@@ -219,19 +231,21 @@
     const input = h('input', { type: 'search', placeholder: 'Type a place name…', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', enterkeyhint: 'search' });
     const status = h('div', { class: 'muted picker-status', role: 'status' });
     const list = h('div', { class: 'picker-list' });
-    const localMatches = (q) => {
+    // pinned places first (name order, also while typing), then the normal matches without repeating a pinned place
+    const localMatches = (q) => Geo.pickerOrder(Object.values(S.places), q);
+    const textMatches = (q) => { // how many saved places match the text itself (a pinned place that does not match does not count)
       const ql = q.toLowerCase();
-      return Object.values(S.places).filter((p) => !ql || (p.name + ' ' + p.address).toLowerCase().includes(ql)).sort(byName);
+      return Object.values(S.places).filter((p) => !ql || (p.name + ' ' + p.address).toLowerCase().includes(ql)).length;
     };
     const choose = (p) => { sh.close(); onPick(p); };
-    const row = (name, sub, fn) => h('button', { class: 'pick-row', onclick: fn },
-      h('span', { class: 'title' }, name), h('span', { class: 'muted' }, sub || ''));
+    const row = (name, sub, fn, pinned) => h('button', { class: 'pick-row' + (pinned ? ' pinned' : ''), onclick: fn },
+      h('span', { class: 'title' }, pinned ? h('span', { class: 'pin-glyph', 'aria-label': 'Pinned', title: 'Pinned' }, '📌') : null, pinned ? ' ' : null, name), h('span', { class: 'muted' }, sub || ''));
 
     function paint() {
       const q0 = input.value.trim();
       // optional fixed rows (e.g. "Use my location" for the start chip) shown while the box is empty
       const kids = (extras && !q0 ? extras.map((x) => row(x.label, '', () => { sh.close(); x.fn(); })) : [])
-        .concat(localMatches(q0).map((p) => row(p.name, Messages.typeLabel(p.type) + (p.address ? ' · ' + p.address : ''), () => choose(p))));
+        .concat(localMatches(q0).map((p) => row(p.name, Messages.typeLabel(p.type) + (p.address ? ' · ' + p.address : ''), () => choose(p), !!p.pinned)));
       if (g.state === 'done' && g.results.length) {
         kids.push(h('div', { class: 'divider' }, 'Google'));
         g.results.forEach((r) => kids.push(row(r.name, r.address, async () => {
@@ -266,7 +280,7 @@
       g = { state: 'idle', results: [], error: '' };
       paint();
       const q = input.value.trim();
-      if (q.length >= 3 && !localMatches(q).length) timer = setTimeout(() => googleSearch(q), 800);
+      if (q.length >= 3 && !textMatches(q)) timer = setTimeout(() => googleSearch(q), 800);
     });
     input.addEventListener('keydown', (e) => {
       if (e.key !== 'Enter') return;
@@ -303,6 +317,7 @@
     const locStatus = h('div', { class: 'muted', id: 'manualLocStatus', role: 'status' });
     const check = h('a', { class: 'btn small', id: 'manualCheck', target: '_blank', rel: 'noopener', hidden: true }, 'Check in Google Maps');
     const nowBtn = h('button', { id: 'manualNow', type: 'button' }, 'Use where I am now');
+    const pin = h('input', { type: 'checkbox', id: 'manualPin', style: 'width:auto;min-height:0' });
     const paste = h('input', { id: 'manualPaste', placeholder: '3.1234, 101.5678  or a Google Maps link', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false' });
 
     function setLoc(l, msg, isError) {
@@ -336,6 +351,7 @@
       if (!loc || !Geo.inRange(loc.lat, loc.lng)) { toast('Set the location first: use where you are now, or paste coordinates.'); return; }
       if (Geo.outsideMalaysia(loc.lat, loc.lng) && !confirm('This is outside Malaysia. Save anyway?')) return;
       const p = Geo.manualPlace({ name: name.value, address: addr.value, type: type.value, salutation: sal.value, lang: lang.value, lat: loc.lat, lng: loc.lng, accuracy: loc.accuracy }, placeCtx());
+      if (pin.checked) p.pinned = true;
       await savePlace(p);
       sh.close();
       toast('Saved ' + p.name);
@@ -350,6 +366,7 @@
       h('label', { class: 'field' }, 'or paste coordinates / a Google Maps link'), paste,
       locStatus, h('div', { class: 'row', style: 'margin-top:6px' }, check),
       h('label', { class: 'field' }, 'Address / landmark note'), addr,
+      h('label', { class: 'check-row' }, pin, ' Pin to top of search'),
       h('div', { class: 'sticky-actions' }, h('button', { onclick: sh.close }, 'Cancel'), h('button', { class: 'primary', id: 'manualSave', onclick: save }, 'Save place')));
     setTimeout(() => { if (!name.value) name.focus(); }, 50);
   }
@@ -408,6 +425,9 @@
     for (const old of before) if (!next.some((x) => x.id === old.id)) await WPStore.remove('loose', old.id);
   }
   let boardOpen = false;
+  // after a job was edited on a day that has a plan: the route is NOT re-planned by itself; this line stays until the next PLAN
+  const JOBS_CHANGED_TEXT = 'Jobs changed - tap PLAN to update the route';
+  const jobsChangedNote = () => (S.plan && S.plan.jobsChanged ? h('div', { class: 'jobs-changed', id: 'jobsChangedNote', role: 'status' }, JOBS_CHANGED_TEXT) : null);
   function onBoardBar() {
     const items = onBoardNow();
     if (!items.length) return null;
@@ -514,6 +534,8 @@
 
     const bar = onBoardBar();
     if (bar) v.append(bar);
+    const note = jobsChangedNote();
+    if (note) v.append(note);
     v.append(
       h('div', { class: 'chips-row', id: 'headerChips' },
         chip(startLabel, 'start', () => openPlacePicker((p) => { S.startSel = p.id; render(); }, 'Start from',
@@ -551,6 +573,7 @@
   }
   const ICON_PARK = 'M6 5h4v14H6zM14 5h4v14h-4z';
   const ICON_UNPARK = 'M7 4l13 8-13 8z';
+  const ICON_EDIT = 'M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z';
   const ICON_TRASH = 'M9 3h6l1 2h4v2H4V5h4l1-2zM6 9h12l-1 12H7L6 9z';
 
   // Two-column card: COLLECT (amber) -> DELIVER (teal); errands get one full-width ERRAND box.
@@ -558,10 +581,11 @@
     const parked = j.status === 'parked';
     const win = (j.arriveAfter || j.arriveBefore)
       ? h('span', { class: 'chip win' }, [j.arriveAfter && 'after ' + j.arriveAfter, j.arriveBefore && 'before ' + j.arriveBefore].filter(Boolean).join(' · ')) : null;
+    const editIt = () => openJobSheet(null, j); // a tap on either box (COLLECT / IN HAND, DELIVER) edits the job
     let grid;
     if (j.errandPlaceId) {
       const dw = j.dwellMin != null ? j.dwellMin : (S.places[j.errandPlaceId] || {}).dwellMin;
-      grid = h('div', { class: 'job-grid' }, h('div', { class: 'box errand' },
+      grid = h('div', { class: 'job-grid' }, h('div', { class: 'box errand tap', onclick: editIt },
         h('div', { class: 'eyebrow' }, 'ERRAND'),
         h('div', { class: 'name' }, dName(pName(j.errandPlaceId))),
         dw != null ? h('div', { class: 'muted sub' }, dw + ' min there') : null,
@@ -570,18 +594,18 @@
       const pk = j.pickups || [];
       // no pickups = already in hand: green IN HAND box (not the amber COLLECT box)
       const left = pk.length
-        ? h('div', { class: 'box collect' },
+        ? h('div', { class: 'box collect tap', onclick: editIt },
           h('div', { class: 'eyebrow' }, 'COLLECT'),
           pk.map((p) => h('div', { class: 'pick' + (p.done ? ' done' : '') },
             h('div', { class: 'name' }, (p.done ? '✓ ' : '') + dName(pName(p.placeId))),
             p.item ? h('div', { class: 'muted sub' }, p.item) : null)))
-        : h('div', { class: 'box inhand' },
+        : h('div', { class: 'box inhand tap', onclick: editIt },
           h('div', { class: 'eyebrow' }, 'IN HAND'),
           j.inHandItem ? h('div', { class: 'muted sub' }, j.inHandItem) : null);
       grid = h('div', { class: 'job-grid' },
         left,
         h('div', { class: 'arrow', 'aria-hidden': 'true' }, '→'),
-        h('div', { class: 'box deliver' },
+        h('div', { class: 'box deliver tap', onclick: editIt },
           h('div', { class: 'eyebrow' }, 'DELIVER'),
           j.deliveryPlaceId ? h('div', { class: 'name' }, dName(pName(j.deliveryPlaceId))) : h('div', { class: 'muted' }, 'Collect only'),
           win));
@@ -604,7 +628,7 @@
           h('button', { class: 'small danger', onclick: async () => { await WPStore.remove('jobs', j.id); S.jobs = S.jobs.filter((x) => x !== j); render(); } }, 'Delete'))
         : h('div', { class: 'job-actions' },
           j.errandPlaceId ? null : h('button', { class: 'small urgent-toggle', 'aria-pressed': j.urgent ? 'true' : 'false', title: j.urgent ? 'Clear urgent' : 'Mark urgent', onclick: () => setUrgent(j, !j.urgent) }, 'Urgent'),
-          park, del);
+          h('button', { class: 'icon-btn edit-btn', 'aria-label': 'Edit job', title: 'Edit', onclick: editIt }, svgIcon(ICON_EDIT)), park, del);
       foot.replaceChildren(...[j.notes ? h('div', { class: 'job-notes' }, j.notes) : null,
         j.carriedFrom ? h('div', { class: 'job-notes carried' }, 'Carried from ' + DayLog.fmtDate(j.carriedFrom) + (j.carryReason ? ' · ' + j.carryReason : '')) : null, actions].filter(Boolean));
     }
@@ -615,22 +639,37 @@
   // ---------- Add job sheet ----------
   // pre = {looseId, item, notes}: "Deliver to…" on a loose item. The form opens in in-hand mode (no pickup) with the item and notes
   // filled in and the focus on the destination; saving converts the loose item into the new job, cancelling changes nothing.
-  function openJobSheet(pre) {
-    let mode = 'delivery';
-    const st = { pickups: [{ placeId: null, item: '' }], deliveryPlaceId: null, errandPlaceId: null, dwellMin: '', notes: pre ? pre.notes || '' : '', urgent: false, after: '', before: '', inHandItem: pre ? pre.item || '' : '' };
-    const sh = openSheet('Add job');
+  // edit = a pending or held job: the same form in EDIT mode, every field pre-filled (jobedit.js holds the rules). A pickup already
+  // collected is shown read-only ("Collected 11:02 - cannot change"); saving updates the SAME job.
+  function openJobSheet(pre, edit) {
+    if (edit && !JobEdit.isEditable(edit)) return;
+    const f0 = edit ? JobEdit.formOf(edit) : null;
+    let mode = f0 ? f0.mode : 'delivery';
+    const st = f0
+      ? { pickups: f0.pickups, deliveryPlaceId: f0.deliveryPlaceId, errandPlaceId: f0.errandPlaceId, dwellMin: f0.dwellMin, notes: f0.notes, urgent: f0.urgent, after: f0.after, before: f0.before, inHandItem: f0.inHandItem }
+      : { pickups: [{ placeId: null, item: '' }], deliveryPlaceId: null, errandPlaceId: null, dwellMin: '', notes: pre ? pre.notes || '' : '', urgent: false, after: '', before: '', inHandItem: pre ? pre.item || '' : '' };
+    const hasDone = !!(edit && JobEdit.donePickups(edit).length);
+    const sh = openSheet(edit ? 'Edit job' : 'Add job');
+    if (edit) sh.sheet.id = 'editJobSheet';
+    const formNow = () => ({ mode, pickups: st.pickups.map((p) => ({ ref: p.ref, placeId: p.placeId, item: p.item })), deliveryPlaceId: st.deliveryPlaceId, inHandItem: st.inHandItem,
+      errandPlaceId: st.errandPlaceId, dwellMin: st.dwellMin, notes: st.notes, urgent: st.urgent, after: st.after, before: st.before });
     function placeBtn(id, placeholder, onPick, btnId) {
       return h('button', { id: btnId || null, style: 'width:100%;text-align:left', onclick: () => openPlacePicker((p) => { onPick(p); draw(); }) }, id ? pName(id) : placeholder);
     }
     function draw() {
       const body = sh.body;
       body.replaceChildren();
-      body.append(h('div', { class: 'seg' },
+      if (!hasDone) body.append(h('div', { class: 'seg' },
         h('button', { class: mode === 'delivery' ? 'on' : '', onclick: () => { mode = 'delivery'; draw(); } }, 'Delivery'),
         h('button', { class: mode === 'errand' ? 'on' : '', onclick: () => { mode = 'errand'; draw(); } }, 'Errand')));
       if (mode === 'delivery') {
         body.append(h('label', { class: 'field' }, 'Pickups (none = item already in hand)'));
         st.pickups.forEach((p, i) => {
+          if (p.done) { // already collected: shown, never changed
+            body.append(h('div', { class: 'card done-pickup' }, h('div', { class: 'name' }, pName(p.placeId)), p.item ? h('div', { class: 'muted' }, p.item) : null,
+              h('div', { class: 'muted' }, 'Collected ' + (p.doneAt ? DL.fmtTime(Date.parse(p.doneAt)) + ' ' : '') + '- cannot change')));
+            return;
+          }
           body.append(h('div', { class: 'card' },
             placeBtn(p.placeId, 'Pick pickup place', (pl) => { p.placeId = pl.id; }),
             h('input', { placeholder: 'Item (e.g. 2 pcs sensor)', value: p.item, style: 'margin-top:8px', oninput: (e) => { p.item = e.target.value; } }),
@@ -658,9 +697,23 @@
         h('div', { class: 'row' },
           h('div', { class: 'grow' }, h('label', { class: 'field' }, 'Arrive after'), h('input', { type: 'time', value: st.after, oninput: (e) => { st.after = e.target.value; } })),
           h('div', { class: 'grow' }, h('label', { class: 'field' }, 'Arrive before'), h('input', { type: 'time', value: st.before, oninput: (e) => { st.before = e.target.value; } }))),
-        h('div', { class: 'sticky-actions' }, h('button', { onclick: sh.close }, 'Cancel'), h('button', { class: 'primary', onclick: save }, 'Save job'))].filter(Boolean));
+        h('div', { class: 'sticky-actions' }, h('button', { onclick: sh.close }, 'Cancel'), h('button', { class: 'primary', id: 'saveJobBtn', onclick: save }, edit ? 'Save changes' : 'Save job'))].filter(Boolean));
+    }
+    async function saveEdit() {
+      const res = JobEdit.updateJob(S.jobs, edit.id, formNow(), { placeDwell: (id) => (S.places[id] && S.places[id].dwellMin != null ? S.places[id].dwellMin : 10) });
+      if (!res.ok) { toast(res.error); return; }
+      const before = S.jobs;
+      S.jobs = res.jobs;
+      for (const id of res.changedIds) await saveJob(S.jobs.find((x) => x.id === id));
+      if (before.length !== S.jobs.length) throw new Error('job count changed');
+      if (S.plan) { S.plan.jobsChanged = true; await savePlan(); } // the route is NOT re-planned: the owner taps PLAN
+      sh.close();
+      render();
     }
     async function save() {
+      if (edit) return saveEdit();
+      const err = JobEdit.validate(formNow());
+      if (err) { toast(err); return; }
       const j = {
         id: uid('j'), pickups: [], deliveryPlaceId: null, notes: st.notes.trim(), urgent: false, urgentRank: 0,
         arriveBefore: st.before || null, arriveAfter: st.after || null, status: 'pending', doneAt: null, createdAt: new Date().toISOString(),
@@ -1018,7 +1071,7 @@
     const P = S.plan, plan = curPlan();
     if (!P || !plan) return null;
     return {
-      v: 1, savedAt: new Date().toISOString(), tab: S.tab, noDetour: P.noDetour, provider: P.provider || null, ctx: P.ctx,
+      v: 1, savedAt: new Date().toISOString(), tab: S.tab, jobsChanged: !!P.jobsChanged, noDetour: P.noDetour, provider: P.provider || null, ctx: P.ctx,
       plan: Object.assign({}, plan, { model: Object.assign({}, plan.model, { matrices: null }) }), // matrices are stored once, in ctx
     };
   }
@@ -1037,7 +1090,7 @@
       delete snap.plan.endNavStartedAt; // the end point's navigation tap belongs to that day too
     }
     S.plan = {
-      ctx: snap.ctx, noDetour: !!snap.noDetour, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: snap.provider || null,
+      ctx: snap.ctx, noDetour: !!snap.noDetour, jobsChanged: !!snap.jobsChanged, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: snap.provider || null,
       result: { plans: [snap.plan], error: null, stats: null, stopIds: snap.plan.model.stopIds },
     };
     if (['plan', 'route', 'places', 'settings'].includes(snap.tab)) S.tab = snap.tab;
@@ -1439,6 +1492,8 @@
         h('button', { class: 'primary', id: 'viewSummary', style: 'margin-top:10px', onclick: () => openSummary(closed.dayKey) }, 'View summary')));
       return;
     }
+    const note = jobsChangedNote();
+    if (note) v.append(note);
     const r = P.result;
     if (r.error) {
       v.append(h('div', { class: 'violations' }, r.error), h('button', { onclick: () => { S.tab = 'plan'; render(); } }, 'Back to Plan'));
@@ -2291,7 +2346,7 @@
     const list = h('div');
     function drawList() {
       const q = placeFilter.trim().toLowerCase();
-      const items = Object.values(S.places).filter((p) => !q || (p.name + ' ' + p.address).toLowerCase().includes(q)).sort(byName);
+      const items = Geo.pinnedFirst(Object.values(S.places).filter((p) => !q || (p.name + ' ' + p.address).toLowerCase().includes(q)));
       const none = Object.keys(S.places).length ? 'No places match.' : 'No places yet.';
       list.replaceChildren(...(items.length ? items.map((p) => h('div', { class: 'card', onclick: () => openPlaceEditor(p) },
         h('div', { class: 'title place-name' }, p.name),
@@ -2313,6 +2368,7 @@
     const dwell = h('input', { type: 'number', inputmode: 'numeric', min: '0', value: String(p.dwellMin) });
     const type = h('select', { onchange: (e) => { dwell.value = String(S.settings.dwellDefaults[e.target.value] != null ? S.settings.dwellDefaults[e.target.value] : 10); syncType(); } }, TYPES.map((t) => h('option', { value: t, selected: p.type === t }, Messages.typeLabel(t))));
     const wa = h('input', { type: 'tel', inputmode: 'tel', value: Messages.compactNumber(p.whatsapp), placeholder: '+60123456789' });
+    const pin = h('input', { type: 'checkbox', id: 'placePin', checked: !!p.pinned, style: 'width:auto;min-height:0' });
     const sal = h('select', null, ['Encik', 'Puan', 'Cik'].map((t) => h('option', { value: t, selected: (p.salutation || 'Encik') === t }, t)));
     const lang = h('select', null, [['default', 'Default (' + S.settings.defaultLang + ')'], ['ms', 'Bahasa Malaysia'], ['en', 'English']].map(([val, lab]) => h('option', { value: val, selected: (p.lang || 'default') === val }, lab)));
     // suppliers are collected from, never messaged: hide salutation + language for them (WhatsApp stays)
@@ -2373,6 +2429,7 @@
     sh.body.append(
       h('label', { class: 'field' }, 'Name'), name, h('label', { class: 'field' }, 'Address'), addr,
       h('label', { class: 'field' }, 'Type'), type, h('label', { class: 'field' }, 'Dwell (minutes)'), dwell,
+      h('label', { class: 'check-row' }, pin, ' Pin to top of search'),
       lunchBox,
       h('label', { class: 'field' }, 'WhatsApp number'), wa,
       salBox,
@@ -2388,7 +2445,7 @@
         h('button', { class: 'primary', onclick: async () => {
           if (!name.value.trim()) { toast('Name is required'); return; }
           if (!keepCustom) { const cw = lunchValue(); if (!cw) return; p.closedWindows = cw; }
-          Object.assign(p, { name: name.value.trim(), address: addr.value.trim(), type: type.value, dwellMin: Number(dwell.value) || 0, whatsapp: Messages.compactNumber(wa.value), salutation: sal.value, lang: lang.value });
+          Object.assign(p, { name: name.value.trim(), address: addr.value.trim(), type: type.value, dwellMin: Number(dwell.value) || 0, whatsapp: Messages.compactNumber(wa.value), salutation: sal.value, lang: lang.value, pinned: pin.checked });
           await savePlace(p); sh.close(); render();
         } }, 'Save')));
   }
@@ -2481,7 +2538,7 @@
 
   function exportJson() {
     const settings = Object.assign({}, S.settings); delete settings.googleKey; delete settings.tomtomKey;
-    const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), dwellMigrated: true, places: Object.values(S.places), jobs: S.jobs, settings, fuelStations: S.fuelStations },
+    const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), dwellMigrated: true, pinMigrated: true, places: Object.values(S.places), jobs: S.jobs, settings, fuelStations: S.fuelStations },
       OnBoard.exportLoose(S.loose), // looseItems: the items still with you
       DL.exportPayload(S.days, S.jobs, S.places)); // + dayLog (records) and dayHistory (per-day totals); keys never included
     const a = h('a', { href: URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })), download: 'waypoint-' + new Date().toISOString().slice(0, 10) + '.json' });
@@ -2520,6 +2577,7 @@
       }
       S.plan = null;
       const mig = data.dwellMigrated === true ? null : await runDwellMigration(true); // data that predates the flag gets the same migration
+      if (data.pinMigrated !== true) await runPinMigration(true); // ... and so does data that predates pinned places
       toast(mig && mig.changed ? 'Imported. ' + dwellToastText(mig) : 'Imported.');
       render();
     } catch (e) { toast('Import failed: ' + e.message); }
