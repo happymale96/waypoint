@@ -338,6 +338,46 @@ async function main() {
     const pendC = await ev('(() => { const p = WaypointDebug.S.plan.result.plans[0], s = p.stops.find((x) => x.placeId === "carrier"); const c = [...document.querySelectorAll(".timeline .card.stop")].find((x) => x.textContent.indexOf("Carrier") >= 0); return { n: p.stops.filter((x) => x.placeId === "carrier").length, status: s && s.status, arriveAt: s && s.arriveAt, txt: c ? c.textContent : "", skipped: document.querySelectorAll(".timeline .card.stop.skipped").length }; })()');
     check(pendC.n === 1 && !pendC.status && pendC.skipped === 0 && pendC.arriveAt > 0 && /\d\d:\d\d/.test(pendC.txt), 'after Undo skip and PLAN: Carrier is pending, with an ETA', pendC);
 
+    console.log('RUN 4 (fresh storage): the one-time dwell migration and the customer message time');
+    await fresh();
+    await ev(`(() => { // the owner's old data: 3 customer factories (20, 20, 40), 2 suppliers (5, 15), 1 office (10), 1 home (0), padding 15, the flag absent
+      Object.keys(localStorage).filter((k) => /^waypoint:(places|jobs):/.test(k) || k === 'waypoint:plan:current' || k === 'waypoint:meta:migrations').forEach((k) => localStorage.removeItem(k));
+      const pl = (id, type, d) => ({ id, name: id, address: id, type, dwellMin: d, lat: 3.1, lng: 101.6, closedWindows: [] });
+      [pl('f1', 'factory', 20), pl('f2', 'factory', 20), pl('f3', 'factory', 40), pl('s1', 'supplier', 5), pl('s2', 'supplier', 15), pl('office', 'office', 10), pl('home', 'home', 0)]
+        .forEach((p) => localStorage.setItem('waypoint:places:' + p.id, JSON.stringify(p)));
+      const s = JSON.parse(localStorage.getItem('waypoint:settings:main'));
+      s.etaPaddingMin = 15; s.dwellDefaults = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
+      localStorage.setItem('waypoint:settings:main', JSON.stringify(s));
+      return true; })()`);
+    await send('Page.reload');
+    await waitFor('window.WaypointDebug && document.querySelector("#planBtn")', 'the reloaded app');
+    await waitFor('(() => { const t = document.getElementById("toast"); return t && !t.hidden && /^Updated:/.test(t.textContent); })()', 'the migration toast');
+    check(await text('#toast') === 'Updated: 2 supplier places to 10 min, 3 customer places to 30 min, ETA padding to 10 min', 'the toast names 2 supplier places, 3 customer places and the padding', await text('#toast'));
+    const stored = () => ev(`(() => { const g = (k) => JSON.parse(localStorage.getItem(k)); const d = (id) => g('waypoint:places:' + id).dwellMin; const s = g('waypoint:settings:main');
+      return { d: ['f1', 'f2', 'f3', 's1', 's2', 'office', 'home'].map(d), pad: s.etaPaddingMin, defs: s.dwellDefaults, flag: (g('waypoint:meta:migrations') || {}).dwell2026_11_23 }; })()`);
+    const st1 = await stored();
+    check(JSON.stringify(st1.d) === JSON.stringify([30, 30, 30, 10, 10, 10, 0]), 'stored dwells: customers 30, suppliers 10, office 10, home 0', st1.d);
+    check(st1.pad === 10 && st1.defs.supplier === 10 && st1.defs.factory === 30 && st1.defs.other === 10 && st1.defs.office === 10 && st1.defs.home === 0, 'stored padding 10; defaults supplier 10, customer factory 30, the rest unchanged', st1);
+    check(st1.flag === true, 'the migration flag is stored');
+    await ev('(() => { const p = JSON.parse(localStorage.getItem("waypoint:places:f1")); p.dwellMin = 45; localStorage.setItem("waypoint:places:f1", JSON.stringify(p)); return true; })()'); // the owner later sets one to 45
+    await send('Page.reload');
+    await waitFor('window.WaypointDebug && document.querySelector("#planBtn")', 'the second load');
+    await sleep(800);
+    check(await ev('document.getElementById("toast").hidden || !/^Updated:/.test(document.getElementById("toast").textContent)'), 'a second load shows no migration toast');
+    const st2 = await stored();
+    check(JSON.stringify(st2.d) === JSON.stringify([45, 30, 30, 10, 10, 10, 0]) && st2.pad === 10 && st2.flag === true, 'and changes nothing: a place set to 45 stays 45', st2);
+
+    console.log('   the customer message: ETA + padding (10), rounded up to a 5-minute mark only if needed');
+    await fresh(); // the seed world, migrated on load (padding 10)
+    await planNow(4);
+    await ev('(() => { const P = WaypointDebug.S.plan, p = P.result.plans[0], s = p.stops.find((x) => x.placeId === "d1"), d = new Date(); d.setHours(17, 0, 0, 0); s.arriveAt = d.getTime(); WaypointDebug.render(); window.__copied = null; Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (t) => { window.__copied = t; } } }); return true; })()');
+    const eta = await ev('(() => { const c = [...document.querySelectorAll(".timeline .card.stop")].find((x) => x.querySelector(".nm") && x.querySelector(".nm").textContent.indexOf("Delta") === 0); return c ? c.querySelector(".times").textContent : null; })()');
+    check(eta === '17:00', 'the stop shows ETA 17:00', eta);
+    await ev('(() => { const c = [...document.querySelectorAll(".timeline .card.stop")].find((x) => x.querySelector(".nm") && x.querySelector(".nm").textContent.indexOf("Delta") === 0); [...c.querySelectorAll("button")].find((b) => b.textContent === "MSG").click(); return true; })()');
+    await waitFor('window.__copied', 'the copied message');
+    const copied = await ev('window.__copied');
+    check(/pukul 5:10 petang\./.test(copied), 'the copied message says 5:10 petang (17:10) for an ETA of 17:00', copied);
+
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {
     await cleanup();

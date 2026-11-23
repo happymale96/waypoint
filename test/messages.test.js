@@ -48,5 +48,23 @@ const en = M.buildMessage({ place: { name: 'Acme', lang: 'en' }, settings, arriv
 eq(en, "Good afternoon. Your items are with me, I'll deliver them to you around 2:40 pm. Thank you.\n— Calvin, L-Tech Automation", 'place.lang overrides default');
 eq(M.langFor({ lang: 'default' }, { defaultLang: 'en' }), 'en', 'default lang from settings');
 
+console.log('message time = ETA + padding, rounded UP to a 5-minute mark only if not already on one');
+{
+  const hm = (m) => String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
+  const t = (eta, pad) => hm(M.messageMinutes(eta, pad));
+  eq(t('17:00', 10), '17:10', 'padding 10: ETA 17:00 -> 17:10');
+  eq(t('17:02', 10), '17:15', 'padding 10: ETA 17:02 -> 17:15');
+  eq(t('17:05', 10), '17:15', 'padding 10: ETA 17:05 -> 17:15');
+  eq(t('16:56', 10), '17:10', 'padding 10: ETA 16:56 -> 17:10');
+  eq(t('17:02', 0), '17:05', 'padding 0: ETA 17:02 -> 17:05');
+  eq(t('17:00', 0), '17:00', 'padding 0: ETA 17:00 stays 17:00');
+  eq(t('23:55', 10), '00:05', 'midnight wrap: ETA 23:55, padding 10 -> 00:05');
+  eq(t('17:00', 15), '17:15', 'padding 15: ETA 17:00 -> 17:15 (nothing hidden is added)');
+  eq(t(new Date(2030, 0, 1, 17, 0, 40), 10), '17:10', 'a Date ETA with seconds: the minute counts, as on the Route card');
+  eq(M.etaText('17:00', 10, 'en'), '5:10 pm', 'etaText (en) uses the same minutes');
+  eq(M.etaText('17:02', 10, 'ms'), '5:15 petang', 'etaText (ms) uses the same minutes');
+  eq(M.buildMessage({ place: { lang: 'en' }, settings: { defaultLang: 'ms' }, arriveAt: '17:00', now: new Date(2030, 0, 1, 15, 0) }).includes('around 5:10 pm'), true, 'with no padding setting the default is 10');
+}
+
 console.log('\n' + passes + ' passed, ' + failures + ' failed');
 process.exit(failures ? 1 : 0);

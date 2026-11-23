@@ -26,10 +26,15 @@
     const d = v instanceof Date ? v : new Date(v);
     return d.getHours() * 60 + d.getMinutes();
   }
-  function etaText(arriveAt, paddingMin, lang) {
+  // The time the customer is told: ETA + padding, rounded UP to the next 5-minute mark only if it is not already on one. Nothing
+  // else is added. Returns minutes since midnight (0..1439).
+  function messageMinutes(arriveAt, paddingMin) {
     let mins = toMinutes(arriveAt) + (Number(paddingMin) || 0);
-    mins = Math.ceil(mins / 5) * 5;
-    mins = ((mins % 1440) + 1440) % 1440;
+    if (mins % 5 !== 0) mins = Math.ceil(mins / 5) * 5;
+    return ((mins % 1440) + 1440) % 1440;
+  }
+  function etaText(arriveAt, paddingMin, lang) {
+    const mins = messageMinutes(arriveAt, paddingMin);
     const h = Math.floor(mins / 60), m = mins % 60;
     const mm = (m < 10 ? '0' : '') + m;
     if (lang === 'en') {
@@ -61,7 +66,7 @@
       salam: greeting(now.getHours(), lang),
       salutation: place.salutation || 'Encik',
       items: opts.items || '',
-      time: etaText(opts.arriveAt, s.etaPaddingMin != null ? s.etaPaddingMin : 15, lang),
+      time: etaText(opts.arriveAt, s.etaPaddingMin != null ? s.etaPaddingMin : 10, lang),
       name: place.name || '',
     });
   }
@@ -97,5 +102,5 @@
     return 'https://wa.me/' + n + '?text=' + encodeURIComponent(text);
   }
 
-  return { DEFAULT_TEMPLATES, greeting, etaText, fill, langFor, buildMessage, normaliseNumber, compactNumber, typeLabel, waLink };
+  return { DEFAULT_TEMPLATES, greeting, messageMinutes, etaText, fill, langFor, buildMessage, normaliseNumber, compactNumber, typeLabel, waLink };
 });

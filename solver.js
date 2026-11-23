@@ -21,7 +21,7 @@
   const TOP_N = 5;
   const BIG = 3 * 86400;        // seconds, used for missing/failed matrix cells
   const LATE_W = 1e7;           // soft mode: lateness dominates total time
-  const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
+  const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
   // ---------- small helpers ----------
   const pad2 = (n) => (n < 10 ? '0' : '') + n;

@@ -3,9 +3,9 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '06fc13b5'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '9f5b67bb'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
-  const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
+  const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
   // ---------- tiny DOM helper ----------
   function h(tag, props, ...kids) {
@@ -43,7 +43,7 @@
     return {
       googleKey: '', tomtomKey: '', defaultLang: 'ms',
       templates: Object.assign({}, Messages.DEFAULT_TEMPLATES),
-      etaPaddingMin: 15, dwellDefaults: Object.assign({}, DEFAULT_DWELL),
+      etaPaddingMin: 10, dwellDefaults: Object.assign({}, DEFAULT_DWELL),
       placesCallsToday: { date: todayStr(), count: 0 }, nav: 'waze', seeded: false, driverName: 'Calvin',
       fuelBrand: 'Caltex', fuelDwellMin: 7, fuelMaxSearches: 50,
       autoReach: true, // mark Reached automatically within 150 m (app open); stored on the device, in Export / Import
@@ -73,10 +73,12 @@
     S.jobs = (await WPStore.list('jobs')).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
     if (!S.places[S.endSel]) S.endSel = Object.keys(S.places)[0] || '';
     await runMigrations();
+    const dwellRes = await runDwellMigration(false); // once per device (flag in meta/migrations)
     await loadDays();
     S.loose = (await WPStore.list('loose')).filter((x) => x && x.id);
     await backfillLoose(); // once: today's / the latest closed day's collect-only jobs get their loose item
     await restorePlan(); // the Route tab comes back exactly as it was left
+    if (dwellRes && dwellRes.changed) { dwellToPlan(); toast(dwellToastText(dwellRes)); }
     try { S.lunch = LunchBreak.forDay(await WPStore.get('meta', 'lunchBreak'), lunchDayKey()); } catch (e) { S.lunch = LunchBreak.fresh(lunchDayKey()); }
   }
 
@@ -90,6 +92,40 @@
       return { days: ALL_DAYS.slice(), from: w.from, to: w.to };
     });
     return changed;
+  }
+
+  // One-time dwell migration (Geo.migrateDwell): supplier places 10 min, customer factories 30, the new-place defaults, ETA padding 10.
+  // Guarded by the flag meta/migrations.dwell2026_11_23. force = an Import of data that predates the flag: runs on what was imported.
+  // Returns null when it did not run, else {suppliers, customers, changed}.
+  async function runDwellMigration(force) {
+    const rec = (await WPStore.get('meta', 'migrations')) || { done: [] };
+    if (rec[Geo.DWELL_FLAG] && !force) return null;
+    const res = Geo.migrateDwell({ places: Object.values(S.places), settings: { dwellDefaults: S.settings.dwellDefaults, etaPaddingMin: S.settings.etaPaddingMin }, migrations: {} });
+    for (const p of res.state.places) if (S.places[p.id].dwellMin !== p.dwellMin) await savePlace(p);
+    S.settings.dwellDefaults = res.state.settings.dwellDefaults;
+    S.settings.etaPaddingMin = res.state.settings.etaPaddingMin;
+    await saveSettings();
+    rec[Geo.DWELL_FLAG] = true;
+    await WPStore.set('meta', 'migrations', rec);
+    return res;
+  }
+  const dwellToastText = (r) => 'Updated: ' + r.suppliers + ' supplier places to 10 min, ' + r.customers + ' customer places to 30 min, ETA padding to 10 min';
+  // An active plan: the stops not done take the new place dwell; the next re-time (existing path) moves the times. The order is kept.
+  function dwellToPlan() {
+    const plan = curPlan();
+    if (!plan || !plan.model || !plan.model.dwellSec) return;
+    plan.stops.forEach((s) => {
+      const pl = S.places[s.placeId];
+      if (!pl || s.fuel || s.status === 'done' || plan.model.dwellSec[s.placeId] == null) return;
+      const placeDwell = Number(pl.dwellMin) * 60;
+      let errand = null, hasOther = false;
+      (s.actions || []).forEach((a) => {
+        if (a.kind !== 'errand') { hasOther = true; return; }
+        const j = S.jobs.find((x) => x.id === a.jobId);
+        if (j && j.dwellMin != null && j.dwellMin !== '') errand = Math.max(errand || 0, Number(j.dwellMin));
+      });
+      plan.model.dwellSec[s.placeId] = errand != null ? (hasOther ? Math.max(placeDwell, errand * 60) : errand * 60) : placeDwell;
+    });
   }
 
   // One-off seed migrations, recorded in storage (meta/migrations) so each runs once.
@@ -2445,7 +2481,7 @@
 
   function exportJson() {
     const settings = Object.assign({}, S.settings); delete settings.googleKey; delete settings.tomtomKey;
-    const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), places: Object.values(S.places), jobs: S.jobs, settings, fuelStations: S.fuelStations },
+    const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), dwellMigrated: true, places: Object.values(S.places), jobs: S.jobs, settings, fuelStations: S.fuelStations },
       OnBoard.exportLoose(S.loose), // looseItems: the items still with you
       DL.exportPayload(S.days, S.jobs, S.places)); // + dayLog (records) and dayHistory (per-day totals); keys never included
     const a = h('a', { href: URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })), download: 'waypoint-' + new Date().toISOString().slice(0, 10) + '.json' });
@@ -2483,7 +2519,8 @@
         for (const it of lo.items) { S.loose.push(it); await WPStore.set('loose', it.id, it); }
       }
       S.plan = null;
-      toast('Imported.');
+      const mig = data.dwellMigrated === true ? null : await runDwellMigration(true); // data that predates the flag gets the same migration
+      toast(mig && mig.changed ? 'Imported. ' + dwellToastText(mig) : 'Imported.');
       render();
     } catch (e) { toast('Import failed: ' + e.message); }
   }

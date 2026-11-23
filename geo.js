@@ -82,6 +82,27 @@
       dwellMin: dd, closedWindows: [], whatsapp: '', salutation: 'Encik', lang: 'default',
     }, o);
   }
+  // One-time dwell migration (2026-11-23). state = {places:[place], settings:{dwellDefaults, etaPaddingMin}, migrations:{dwell2026_11_23}}
+  // -> {state (a new object), suppliers, customers, changed}. Every supplier place gets dwell 10, every customer factory (stored type
+  // "factory") 30, whatever it was; office / home / other are not touched. The default dwell for new places becomes supplier 10 /
+  // customer factory 30, the ETA padding 10, and the flag is set. With the flag already set nothing changes (counts 0).
+  const DWELL_FLAG = 'dwell2026_11_23';
+  function migrateDwell(state) {
+    const out = JSON.parse(JSON.stringify(state || {}));
+    out.places = out.places || []; out.settings = out.settings || {}; out.migrations = out.migrations || {};
+    if (out.migrations[DWELL_FLAG]) return { state: out, suppliers: 0, customers: 0, changed: false };
+    let suppliers = 0, customers = 0;
+    out.places.forEach((p) => {
+      if (p.type === 'supplier') { p.dwellMin = 10; suppliers++; } else if (p.type === 'factory') { p.dwellMin = 30; customers++; }
+    });
+    const was = JSON.stringify([out.settings.dwellDefaults || null, out.settings.etaPaddingMin]);
+    out.settings.dwellDefaults = Object.assign({}, out.settings.dwellDefaults, { supplier: 10, factory: 30 });
+    out.settings.etaPaddingMin = 10;
+    out.migrations[DWELL_FLAG] = true;
+    const before = JSON.stringify((state.places || []).map((p) => p.dwellMin));
+    const changed = was !== JSON.stringify([out.settings.dwellDefaults, out.settings.etaPaddingMin]) || before !== JSON.stringify(out.places.map((p) => p.dwellMin));
+    return { state: out, suppliers, customers, changed };
+  }
   // form = {name, address, type, salutation, lang, lat, lng, accuracy}
   function manualPlace(form, ctx) {
     const o = {
@@ -175,6 +196,6 @@
     return s.from + '–' + s.to + (s.friFrom ? ' · Fri ' + s.friFrom + '–' + s.friTo : '');
   }
 
-  return { SHORT_LINK_MSG, MY_BOX, GOOD_ACCURACY_M, parseCoords, outsideMalaysia, inRange, mapsCheckUrl, getFix, makePlace, manualPlace, moveLocation, undoMove,
+  return { SHORT_LINK_MSG, MY_BOX, GOOD_ACCURACY_M, parseCoords, outsideMalaysia, inRange, mapsCheckUrl, getFix, makePlace, manualPlace, moveLocation, undoMove, migrateDwell, DWELL_FLAG,
     daysLabel, simpleToStored, storedToSimple, validateSimple, formatWindows, lunchCardText };
 });

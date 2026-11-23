@@ -87,6 +87,33 @@ const near = (r, lat, lng) => r.ok === true && Math.abs(r.lat - lat) < 1e-9 && M
   ok(f.ok === false && f.code === 'unavailable' && calls.length === 1, 'position unavailable: reported, no retry');
   ok((await Geo.getFix(null)).code === 'unavailable', 'no geolocation object: unavailable');
 
+  console.log('migrateDwell: the one-time dwell migration');
+  {
+    const pl = (id, type, dwellMin) => ({ id, name: id, type, dwellMin, lat: 3, lng: 101 });
+    const start = () => ({
+      places: [pl('f1', 'factory', 20), pl('f2', 'factory', 20), pl('f3', 'factory', 40), pl('s1', 'supplier', 5), pl('s2', 'supplier', 15), pl('o', 'office', 10), pl('h', 'home', 0)],
+      settings: { etaPaddingMin: 15, dwellDefaults: { factory: 20, supplier: 5, other: 10, office: 10, home: 0 } },
+      migrations: {},
+    });
+    const in0 = start(), before = JSON.stringify(in0);
+    const r = Geo.migrateDwell(in0);
+    const d = (id) => r.state.places.find((p) => p.id === id).dwellMin;
+    ok(r.customers === 3 && r.suppliers === 2, 'counts: 3 customer factories, 2 suppliers', [r.customers, r.suppliers]);
+    ok(d('f1') === 30 && d('f2') === 30 && d('f3') === 30, 'every customer factory is 30, whatever it was (20, 20, 40)');
+    ok(d('s1') === 10 && d('s2') === 10, 'every supplier is 10 (5, 15)');
+    ok(d('o') === 10 && d('h') === 0, 'the office (10) and home (0) are untouched');
+    ok(r.state.settings.etaPaddingMin === 10, 'ETA padding 15 -> 10');
+    ok(r.state.settings.dwellDefaults.supplier === 10 && r.state.settings.dwellDefaults.factory === 30 && r.state.settings.dwellDefaults.other === 10 && r.state.settings.dwellDefaults.office === 10 && r.state.settings.dwellDefaults.home === 0, 'defaults: supplier 10, customer factory 30, the others unchanged');
+    ok(r.state.migrations[Geo.DWELL_FLAG] === true && r.changed === true, 'the flag is set');
+    ok(JSON.stringify(in0) === before, 'the input state is not modified');
+    r.state.places.find((p) => p.id === 'f1').dwellMin = 45; // the owner edits one later
+    const r2 = Geo.migrateDwell(r.state);
+    ok(r2.suppliers === 0 && r2.customers === 0 && r2.changed === false, 'a second run (flag set) counts nothing');
+    ok(r2.state.places.find((p) => p.id === 'f1').dwellMin === 45 && JSON.stringify(r2.state) === JSON.stringify(r.state), 'a second run changes nothing: a place set to 45 stays 45');
+    const fresh = Geo.migrateDwell({ places: [], settings: { etaPaddingMin: 10, dwellDefaults: { factory: 30, supplier: 10 } }, migrations: {} });
+    ok(fresh.changed === false && fresh.state.migrations[Geo.DWELL_FLAG] === true, 'nothing to change (fresh install): flag set, nothing reported');
+  }
+
   console.log('\n' + passes + ' passed, ' + failures + ' failed');
   process.exit(failures ? 1 : 0);
 })();
