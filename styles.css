@@ -142,11 +142,10 @@ a.btn.small { min-height: 40px; padding: 0 10px; font-size: 14px; }
 .urgent-toggle[aria-pressed="true"] { background: var(--urgent-bg); border-color: var(--urgent-bg); color: #fff; }
 .urgent-badge { cursor: pointer; }
 .urgent-badge .urgent-label { width: auto; font-weight: 800; font-size: 13px; letter-spacing: .06em; padding: 0 6px; white-space: nowrap; }
-/* weekday closed windows, collapsed done stops, avoid-lunch card */
-.win-row { border: 1px solid var(--border); border-radius: 12px; padding: 8px; margin-bottom: 8px; background: var(--card); }
-.days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-bottom: 8px; }
-.day { min-height: 44px; padding: 0; border-radius: 10px; font-size: 15px; font-weight: 700; }
-.day.on { background: var(--brand); color: var(--brand-text); border-color: var(--brand); }
+/* lunch window form, collapsed done stops, avoid-lunch card */
+.quick { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
+.check-row { display: flex; align-items: center; gap: 8px; margin: 12px 0 4px; font-weight: 600; min-height: 44px; }
+.check-row input { flex: 0 0 auto; width: 22px; height: 22px; min-height: 0; }
 .card.stop.compact { padding: 8px 12px; margin: 6px 0; }
 .card.stop.compact .title { font-size: 15px; }
 .card.alt { border: 2px solid var(--deliver); }

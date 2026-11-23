@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '41a903dd'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '57b4f817'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -70,21 +70,6 @@
 
   // ---------- closed windows: {days:[1..7] (ISO, Mon=1), from, to} ----------
   const ALL_DAYS = [1, 2, 3, 4, 5, 6, 7];
-  const DAY_CHIPS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
-  const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-  const DAY3 = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-  function daysLabel(days) { // [] / all seven -> '' ; [1,2,3,4] -> "Mon–Thu" ; [5] -> "Fri"
-    const d = Array.from(new Set(days || [])).sort((a, b) => a - b);
-    if (d.length === 7 || !d.length) return d.length ? '' : 'never';
-    const out = [];
-    for (let i = 0; i < d.length;) {
-      let j = i;
-      while (j + 1 < d.length && d[j + 1] === d[j] + 1) j++;
-      out.push(j === i ? DAY3[d[i] - 1] : (j === i + 1 ? DAY3[d[i] - 1] + ', ' + DAY3[d[j] - 1] : DAY3[d[i] - 1] + '–' + DAY3[d[j] - 1]));
-      i = j + 1;
-    }
-    return out.join(', ');
-  }
   function normalizeWindows(p) { // legacy entries (no days) -> every day. Returns true if anything changed.
     let changed = false;
     p.closedWindows = (p.closedWindows || []).map((w) => {
@@ -1496,7 +1481,7 @@
         h('div', { class: 'place-tag' }, h('span', { class: 'chip' }, Messages.typeLabel(p.type))),
         h('div', { class: 'muted' }, p.address || (p.lat.toFixed(4) + ', ' + p.lng.toFixed(4))),
         p.whatsapp ? h('div', { class: 'muted place-wa' }, 'WA ' + Messages.compactNumber(p.whatsapp)) : null,
-        (p.closedWindows || []).length ? h('div', { class: 'place-closed' }, 'Lunch ' + p.closedWindows.map((w) => (daysLabel(w.days) ? daysLabel(w.days) + ' ' : '') + w.from + '–' + w.to).join(', ')) : null)) : [h('div', { class: 'empty card' }, none)]));
+        Geo.lunchCardText(p.closedWindows) ? h('div', { class: 'place-closed' }, 'Lunch ' + Geo.lunchCardText(p.closedWindows)) : null)) : [h('div', { class: 'empty card' }, none)]));
     }
     v.append(h('div', { class: 'row' }, h('div', { class: 'grow' }, input), h('button', { class: 'primary', onclick: () => openPlacePicker((p) => openPlaceEditor(p), 'Add place') }, '+ Add')), list);
     drawList();
@@ -1504,7 +1489,8 @@
 
   function openPlaceEditor(p) {
     const sh = openSheet('Edit place');
-    const w = JSON.parse(JSON.stringify(p.closedWindows || []));
+    const simple0 = Geo.storedToSimple(p.closedWindows);
+    let keepCustom = !simple0.fits; // stored hours do not fit the simple form: leave them untouched unless replaced
     const name = h('input', { value: p.name });
     const addr = h('input', { value: p.address });
     const dwell = h('input', { type: 'number', inputmode: 'numeric', min: '0', value: String(p.dwellMin) });
@@ -1516,21 +1502,37 @@
     const salBox = h('div', null, h('label', { class: 'field' }, 'Salutation'), sal, h('label', { class: 'field' }, 'Message language'), lang);
     function syncType() { salBox.hidden = type.value === 'supplier'; }
     syncType();
-    const wBox = h('div');
-    w.forEach((x) => { if (!Array.isArray(x.days)) x.days = ALL_DAYS.slice(); });
-    function drawW() { // each window: M T W T F S S toggle chips (ISO Mon=1) + from / to
-      wBox.replaceChildren(...w.map((x, i) => h('div', { class: 'win-row' },
-        h('div', { class: 'days' }, DAY_CHIPS.map((lab, d) => {
-          const on = x.days.includes(d + 1);
-          return h('button', { class: 'day' + (on ? ' on' : ''), type: 'button', 'aria-pressed': on ? 'true' : 'false', 'aria-label': DAY_NAMES[d],
-            onclick: () => { x.days = on ? x.days.filter((n) => n !== d + 1) : x.days.concat(d + 1).sort((a, b) => a - b); drawW(); } }, lab);
-        })),
-        h('div', { class: 'row' },
-          h('div', { class: 'grow' }, h('input', { type: 'time', value: x.from, oninput: (e) => { x.from = e.target.value; } })),
-          h('div', { class: 'grow' }, h('input', { type: 'time', value: x.to, oninput: (e) => { x.to = e.target.value; } })),
-          h('button', { class: 'small danger', 'aria-label': 'Remove window', onclick: () => { w.splice(i, 1); drawW(); } }, '✕')))));
+    // Lunch / closed window: one Mon-Fri window + an optional different Friday window (stored format unchanged: see Geo.simpleToStored)
+    const timeIn = (v) => h('input', { type: 'time', value: v || '' });
+    const lFrom = timeIn(simple0.from), lTo = timeIn(simple0.to), fFrom = timeIn(simple0.friFrom), fTo = timeIn(simple0.friTo);
+    const friOn = h('input', { type: 'checkbox', id: 'friDiff', checked: !!(simple0.friFrom || simple0.friTo), style: 'width:auto;min-height:0' });
+    const lunchErr = h('div', { class: 'error-text', role: 'alert', hidden: true });
+    const quick = (picks, fi, ti) => h('div', { class: 'quick' }, picks.map((r) => h('button', { type: 'button', class: 'small', onclick: () => { const [x, y] = r.split('-'); fi.value = x; ti.value = y; lunchErr.hidden = true; } }, r)));
+    const fridayBox = h('div', { hidden: !friOn.checked },
+      quick(['12:30-14:30', '13:00-14:30'], fFrom, fTo),
+      h('div', { class: 'row' }, h('div', { class: 'grow' }, h('label', { class: 'field' }, 'Friday from'), fFrom), h('div', { class: 'grow' }, h('label', { class: 'field' }, 'Friday to'), fTo)));
+    friOn.addEventListener('change', () => { fridayBox.hidden = !friOn.checked; });
+    const simpleForm = h('div', null,
+      h('label', { class: 'field' }, 'Lunch / closed window (Mon-Fri)'),
+      quick(['12:00-13:00', '12:30-13:30', '13:00-14:00'], lFrom, lTo),
+      h('div', { class: 'row' }, h('div', { class: 'grow' }, h('label', { class: 'field' }, 'From'), lFrom), h('div', { class: 'grow' }, h('label', { class: 'field' }, 'To'), lTo),
+        h('button', { type: 'button', class: 'small', onclick: () => { lFrom.value = ''; lTo.value = ''; lunchErr.hidden = true; } }, 'Clear')),
+      h('label', { class: 'check-row' }, friOn, ' Different on Friday'),
+      fridayBox);
+    const customBox = h('div', null,
+      h('label', { class: 'field' }, 'Lunch / closed window'),
+      h('div', null, 'Custom hours kept: ' + Geo.formatWindows(p.closedWindows)),
+      h('button', { type: 'button', class: 'small', onclick: () => { keepCustom = false; syncLunch(); } }, 'Replace with simple window'));
+    const lunchBox = h('div', null, customBox, simpleForm, lunchErr);
+    function syncLunch() { customBox.hidden = !keepCustom; simpleForm.hidden = keepCustom; if (keepCustom) lunchErr.hidden = true; }
+    syncLunch();
+    // -> stored windows, or null (and an inline message) when the simple form is invalid
+    function lunchValue() {
+      const s = { from: lFrom.value, to: lTo.value, friFrom: friOn.checked ? fFrom.value : '', friTo: friOn.checked ? fTo.value : '' };
+      const errs = Geo.validateSimple(s, friOn.checked);
+      lunchErr.hidden = !errs.length; lunchErr.textContent = errs.join(' ');
+      return errs.length ? null : Geo.simpleToStored(s);
     }
-    drawW();
     // wrong pin? re-take it where you stand (saved at once; the old coordinates are kept so it can be undone once)
     const adopt = (np) => { Object.keys(p).forEach((k) => { delete p[k]; }); Object.assign(p, np); };
     const pinInfo = h('div', { class: 'muted', id: 'pinInfo' });
@@ -1554,8 +1556,7 @@
     sh.body.append(
       h('label', { class: 'field' }, 'Name'), name, h('label', { class: 'field' }, 'Address'), addr,
       h('label', { class: 'field' }, 'Type'), type, h('label', { class: 'field' }, 'Dwell (minutes)'), dwell,
-      h('label', { class: 'field' }, 'Closed windows (by weekday)'), wBox,
-      h('button', { class: 'small', onclick: () => { w.push({ days: ALL_DAYS.slice(), from: '12:00', to: '13:00' }); drawW(); } }, '+ Add closed window'),
+      lunchBox,
       h('label', { class: 'field' }, 'WhatsApp number'), wa,
       salBox,
       h('label', { class: 'field' }, 'Location'), pinInfo, h('div', { class: 'row', style: 'margin-top:6px' }, h('div', { class: 'grow' }, updLoc), undoLoc), pinMsg,
@@ -1569,7 +1570,8 @@
         h('button', { onclick: sh.close }, 'Cancel'),
         h('button', { class: 'primary', onclick: async () => {
           if (!name.value.trim()) { toast('Name is required'); return; }
-          Object.assign(p, { name: name.value.trim(), address: addr.value.trim(), type: type.value, dwellMin: Number(dwell.value) || 0, closedWindows: w.filter((x) => x.from && x.to && x.days.length), whatsapp: Messages.compactNumber(wa.value), salutation: sal.value, lang: lang.value });
+          if (!keepCustom) { const cw = lunchValue(); if (!cw) return; p.closedWindows = cw; }
+          Object.assign(p, { name: name.value.trim(), address: addr.value.trim(), type: type.value, dwellMin: Number(dwell.value) || 0, whatsapp: Messages.compactNumber(wa.value), salutation: sal.value, lang: lang.value });
           await savePlace(p); sh.close(); render();
         } }, 'Save')));
   }

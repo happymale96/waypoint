@@ -109,5 +109,70 @@
     return out;
   }
 
-  return { SHORT_LINK_MSG, MY_BOX, GOOD_ACCURACY_M, parseCoords, outsideMalaysia, inRange, mapsCheckUrl, getFix, makePlace, manualPlace, moveLocation, undoMove };
+  // ---- closed (lunch) windows. Stored format (unchanged): [{ days: [1..7] (ISO, Mon=1), from: 'HH:MM', to: 'HH:MM' }]
+  const DAY3 = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const WEEKDAYS = [1, 2, 3, 4, 5], MON_THU = [1, 2, 3, 4], FRI = [5];
+  function daysLabel(days) { // [] -> 'never'; all seven -> ''; [1,2,3,4] -> "Mon–Thu"; [5] -> "Fri"
+    const d = Array.from(new Set(days || [])).sort((a, b) => a - b);
+    if (d.length === 7 || !d.length) return d.length ? '' : 'never';
+    const out = [];
+    for (let i = 0; i < d.length;) {
+      let j = i;
+      while (j + 1 < d.length && d[j + 1] === d[j] + 1) j++;
+      out.push(j === i ? DAY3[d[i] - 1] : (j === i + 1 ? DAY3[d[i] - 1] + ', ' + DAY3[d[j] - 1] : DAY3[d[i] - 1] + '–' + DAY3[d[j] - 1]));
+      i = j + 1;
+    }
+    return out.join(', ');
+  }
+  const mins = (t) => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || '')); return m ? Number(m[1]) * 60 + Number(m[2]) : NaN; };
+  const daySet = (w) => Array.from(new Set(Array.isArray(w.days) ? w.days : [1, 2, 3, 4, 5, 6, 7])).sort((a, b) => a - b).join(',');
+  // {from,to,friFrom,friTo} -> stored windows. No from/to -> none. A Friday window equal to the main one adds nothing.
+  function simpleToStored(s) {
+    const from = (s && s.from) || '', to = (s && s.to) || '', fF = (s && s.friFrom) || '', fT = (s && s.friTo) || '';
+    if (!from || !to) return [];
+    if (fF && fT && !(fF === from && fT === to)) return [{ days: MON_THU.slice(), from, to }, { days: FRI.slice(), from: fF, to: fT }];
+    return [{ days: WEEKDAYS.slice(), from, to }];
+  }
+  // stored windows -> {from,to,friFrom,friTo,fits}. fits = exactly "one window Mon-Fri" or "one Mon-Thu + one Fri"; else false.
+  function storedToSimple(stored) {
+    const none = { from: '', to: '', friFrom: '', friTo: '' };
+    const w = Array.isArray(stored) ? stored : [];
+    if (!w.length) return Object.assign({}, none, { fits: true });
+    const bad = Object.assign({}, none, { fits: false });
+    if (w.some((x) => !x || !x.from || !x.to)) return bad;
+    if (w.length === 1 && daySet(w[0]) === WEEKDAYS.join(',')) return { from: w[0].from, to: w[0].to, friFrom: '', friTo: '', fits: true };
+    if (w.length === 2) {
+      const a = w.find((x) => daySet(x) === MON_THU.join(',')), b = w.find((x) => daySet(x) === FRI.join(','));
+      if (a && b && a !== b) return { from: a.from, to: a.to, friFrom: b.from === a.from && b.to === a.to ? '' : b.from, friTo: b.from === a.from && b.to === a.to ? '' : b.to, fits: true };
+    }
+    return bad;
+  }
+  // Messages for the simple form (empty = valid). No midnight crossing: To must be after From.
+  function validateSimple(s, fridayOn) {
+    const errs = [];
+    const from = (s && s.from) || '', to = (s && s.to) || '';
+    if ((from || to) && !(from && to)) errs.push('Enter both From and To for the lunch window.');
+    else if (from && to && !(mins(to) > mins(from))) errs.push('Lunch window: To must be after From.');
+    if (fridayOn) {
+      const fF = (s && s.friFrom) || '', fT = (s && s.friTo) || '';
+      if ((fF || fT) && !(fF && fT)) errs.push('Enter both From and To for Friday.');
+      else if (fF && fT && !(mins(fT) > mins(fF))) errs.push('Friday window: To must be after From.');
+      else if (fF && fT && !(from && to)) errs.push('Enter the Mon–Fri window before a different Friday window.');
+    }
+    return errs;
+  }
+  // Long formatter (any stored shape): "Mon–Thu 12:30–13:30, Fri 13:00–14:30"
+  function formatWindows(stored) {
+    return (stored || []).map((w) => (daysLabel(w.days) ? daysLabel(w.days) + ' ' : '') + w.from + '–' + w.to).join(', ');
+  }
+  // Text after the "Lunch " prefix on the Places card ('' = nothing to show)
+  function lunchCardText(stored) {
+    if (!(stored || []).length) return '';
+    const s = storedToSimple(stored);
+    if (!s.fits) return formatWindows(stored);
+    return s.from + '–' + s.to + (s.friFrom ? ' · Fri ' + s.friFrom + '–' + s.friTo : '');
+  }
+
+  return { SHORT_LINK_MSG, MY_BOX, GOOD_ACCURACY_M, parseCoords, outsideMalaysia, inRange, mapsCheckUrl, getFix, makePlace, manualPlace, moveLocation, undoMove,
+    daysLabel, simpleToStored, storedToSimple, validateSimple, formatWindows, lunchCardText };
 });

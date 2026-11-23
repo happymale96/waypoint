@@ -19,7 +19,8 @@ else {
   if (/dwell/i.test(block)) errs.push('Places card render path mentions Dwell');
   const m = block.match(/h\('div',\s*\{\s*class:\s*'([^']*\bplace-closed\b[^']*)'\s*\},\s*'Lunch '\s*\+/);
   if (!m) errs.push("closed hours are not emitted as h('div', {class:'place-closed'}, 'Lunch ' + ...)");
-  if (!/\(p\.closedWindows \|\| \[\]\)\.length \? h\('div', \{ class: 'place-closed'/.test(block)) errs.push('closed line is not conditional on closedWindows');
+  if (!/Geo\.lunchCardText\(p\.closedWindows\) \? h\('div', \{ class: 'place-closed'/.test(block)) errs.push('closed line is not conditional on the closed-window text');
+  if (!/'Lunch '\s*\+\s*Geo\.lunchCardText\(p\.closedWindows\)/.test(block)) errs.push("closed line text is not 'Lunch ' + Geo.lunchCardText(p.closedWindows)");
   if (!/p\.whatsapp \? h\('div'/.test(block)) errs.push('WhatsApp line is not its own conditional div');
   if (/'\s*·\s*/.test(block)) errs.push('stray separator dot in the Places card render path');
   const iAddr = block.indexOf('p.address'), iWa = block.indexOf('p.whatsapp'), iCl = block.indexOf('place-closed');

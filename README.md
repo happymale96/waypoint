@@ -18,7 +18,7 @@ Live: https://happymale96.github.io/waypoint/
 | `sw.js`, `manifest.json`, `icon-*.png` | PWA shell |
 | `tools/verify-icons.js` | `node tools/verify-icons.js <icon-pack folder>`: checks icon references, PNG sizes and the pack's SHA-256s. The icon PNGs/SVGs are a pre-rendered pack from the official vector logo; never regenerate or resize them |
 | `tools/stamp-sw.js` | Writes the build stamp into `sw.js` and `app.js` — **run before every commit** (see below) |
-| `test/*.test.js` | `TZ=Asia/Kuala_Lumpur sh -c "node test/solver.test.js && node test/messages.test.js && node test/daylog.test.js && node test/location.test.js && node test/route.test.js && node test/geo.test.js && node test/endday.test.js && node test/changes.test.js && node tools/check-icons.js"` (day keys are the device's local date) |
+| `test/*.test.js` | `TZ=Asia/Kuala_Lumpur sh -c "node test/solver.test.js && node test/messages.test.js && node test/daylog.test.js && node test/location.test.js && node test/route.test.js && node test/geo.test.js && node test/endday.test.js && node test/changes.test.js && node test/lunch.test.js && node tools/check-icons.js"` (day keys are the device's local date) |
 
 ## Releases and the build stamp
 The service worker's cache name is `waypoint-<stamp>`. The stamp is an 8-character content hash of the whole app shell (html, css, js, json, icons), written by `tools/stamp-sw.js` into `sw.js` (`BUILD`) and `app.js` (`BUILD_STAMP`, shown in **Settings → build …**).
