@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* Places card content check (no dependencies).
  *  1. The Places list card render path (app.js, from the card div to the empty-state) has no "Dwell" text.
- *  2. Closed hours are emitted in their own block-level div, prefixed "Closed ", conditional on closedWindows.
+ *  2. Closed hours are emitted in their own block-level div, prefixed "Lunch ", conditional on closedWindows.
  *  3. CSS: that div is display:block and does not use the dim --muted colour.
  * Exit 1 on failure. */
 const fs = require('fs');
@@ -17,8 +17,8 @@ if (start < 0 || end < 0) errs.push('Places card render path not found in app.js
 else {
   const block = app.slice(start, end);
   if (/dwell/i.test(block)) errs.push('Places card render path mentions Dwell');
-  const m = block.match(/h\('div',\s*\{\s*class:\s*'([^']*\bplace-closed\b[^']*)'\s*\},\s*'Closed '\s*\+/);
-  if (!m) errs.push("closed hours are not emitted as h('div', {class:'place-closed'}, 'Closed ' + ...)");
+  const m = block.match(/h\('div',\s*\{\s*class:\s*'([^']*\bplace-closed\b[^']*)'\s*\},\s*'Lunch '\s*\+/);
+  if (!m) errs.push("closed hours are not emitted as h('div', {class:'place-closed'}, 'Lunch ' + ...)");
   if (!/\(p\.closedWindows \|\| \[\]\)\.length \? h\('div', \{ class: 'place-closed'/.test(block)) errs.push('closed line is not conditional on closedWindows');
   if (!/p\.whatsapp \? h\('div'/.test(block)) errs.push('WhatsApp line is not its own conditional div');
   if (/'\s*·\s*/.test(block)) errs.push('stray separator dot in the Places card render path');
@@ -32,4 +32,4 @@ if (own.some((r) => /var\(--muted\)/.test(r.body))) errs.push('.place-closed use
 if (!own.some((r) => /color:\s*var\(--text\)/.test(r.body))) errs.push('.place-closed is not coloured var(--text)');
 
 if (errs.length) { console.error('check-places-card FAILED:\n - ' + errs.join('\n - ')); process.exit(1); }
-console.log('check-places-card OK: no Dwell on the card; Closed hours in their own block line');
+console.log('check-places-card OK: no Dwell on the card; Lunch hours in their own block line');

@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '3625d31d'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '41a903dd'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -1496,7 +1496,7 @@
         h('div', { class: 'place-tag' }, h('span', { class: 'chip' }, Messages.typeLabel(p.type))),
         h('div', { class: 'muted' }, p.address || (p.lat.toFixed(4) + ', ' + p.lng.toFixed(4))),
         p.whatsapp ? h('div', { class: 'muted place-wa' }, 'WA ' + Messages.compactNumber(p.whatsapp)) : null,
-        (p.closedWindows || []).length ? h('div', { class: 'place-closed' }, 'Closed ' + p.closedWindows.map((w) => (daysLabel(w.days) ? daysLabel(w.days) + ' ' : '') + w.from + '–' + w.to).join(', ')) : null)) : [h('div', { class: 'empty card' }, none)]));
+        (p.closedWindows || []).length ? h('div', { class: 'place-closed' }, 'Lunch ' + p.closedWindows.map((w) => (daysLabel(w.days) ? daysLabel(w.days) + ' ' : '') + w.from + '–' + w.to).join(', ')) : null)) : [h('div', { class: 'empty card' }, none)]));
     }
     v.append(h('div', { class: 'row' }, h('div', { class: 'grow' }, input), h('button', { class: 'primary', onclick: () => openPlacePicker((p) => openPlaceEditor(p), 'Add place') }, '+ Add')), list);
     drawList();
