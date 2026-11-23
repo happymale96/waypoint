@@ -131,7 +131,21 @@
     dwellMin: info.dwellMin != null ? info.dwellMin : null,
     navStartedAt: info.navStartedAt != null ? info.navStartedAt : null, // first tap on the stop's navigation button (ms)
   });
-  const TIME_SPLIT_V = 2;
+  // 3 = every navigation tap is a day event (type 'nav') and the time split is the day's timeline (Reached.dayTimeline);
+  // 2 = the previous format (one navStartedAt per done stop), converted into nav events when read; none = before any split.
+  const TIME_SPLIT_V = 3;
+  // A tap on a stop's own navigation button (WAZE / MAPS) or on the end point's (end: true). Every tap is recorded, not only the
+  // first per stop; the whole-route "Open in Google Maps" button records nothing. info: {nowIso, at (ms), stopId, end?}
+  function recordNav(day, info) {
+    return appendEvent(day, { t: info.nowIso, type: 'nav', stopId: info.end ? null : info.stopId, end: !!info.end, at: info.at != null ? info.at : Date.parse(info.nowIso) });
+  }
+  // A stop skipped after it had been reached is a departure for the timeline (a skip without Reached changes nothing, so the
+  // app only logs the former). info: {nowIso, stopId, name, reachedAt, places{}}
+  function recordSkip(day, info) {
+    snapPlace(day, info.places, info.stopId);
+    return appendEvent(day, { t: info.nowIso, type: 'skip', stopId: info.stopId, name: info.name || '', reachedAt: info.reachedAt != null ? info.reachedAt : null });
+  }
+  function recordUndoSkip(day, info) { return appendEvent(day, { t: info.nowIso, type: 'undo', of: 'skip', skipStopId: info.stopId }); }
   // The driver's lunch break (Route tab bar): the real interval, on the day record. An assumed break never started is not logged.
   function recordBreakStart(day, info) { day.breakStartedAt = info.nowIso; day.breakEndedAt = null; day.timeSplitV = TIME_SPLIT_V; }
   function recordBreakEnd(day, info) { if (day.breakStartedAt) day.breakEndedAt = info.nowIso; }
@@ -349,8 +363,16 @@
         navStartedAt: e0.navStartedAt != null ? e0.navStartedAt : null };
     });
 
+    // every navigation tap (v3 days) and every skip of a stop that had been reached (an Undo skip cancels the latest of that stop)
+    const navs = (day.events || []).filter((e) => e.type === 'nav').map((e) => ({ stopId: e.end ? null : e.stopId, end: !!e.end, at: e.at != null ? e.at : ms(e.t) }));
+    const skips = [];
+    (day.events || []).forEach((e) => {
+      if (e.type === 'skip') skips.push({ stopId: e.stopId, name: e.name || nameOf(e.stopId), at: ms(e.t), reachedAt: e.reachedAt != null ? e.reachedAt : null });
+      else if (e.type === 'undo' && e.of === 'skip') { for (let i = skips.length - 1; i >= 0; i--) if (skips[i].stopId === e.skipStopId) { skips.splice(i, 1); break; } }
+    });
+
     return {
-      visits, timeSplitV: day.timeSplitV || 1,
+      visits, navs, skips, timeSplitV: day.timeSplitV || 1,
       arrivedEndNavAt: arrEv && arrEv.navStartedAt != null ? arrEv.navStartedAt : null,
       breakStartedAt: ms(day.breakStartedAt || null), breakEndedAt: ms(day.breakEndedAt || null),
       date: day.date, driverId: day.driverId, closed: !!day.closed, closedAt: ms(day.closedAt != null ? day.closedAt : day.endedAt),
@@ -586,14 +608,17 @@
     return lines.join('\r\n') + '\r\n';
   }
 
-  function toWhatsApp(sum) {
+  // timeSplitText = the day's time-split line (Reached.splitLine) when the day has time-split data: it replaces the older
+  // "Drive (est.)" estimate, which is then not shown anywhere.
+  function toWhatsApp(sum, timeSplitText) {
     const L = [];
     const t = (x) => fmtTime(x);
     L.push('*Waypoint day summary - ' + fmtDate(sum.date) + '*', 'Driver: ' + sum.driverId, '');
     L.push('*Totals*', 'Jobs done: ' + sum.jobsDone + ' of ' + sum.jobsTotal, 'Stops visited: ' + sum.stopsVisited);
     L.push('Est. km (road route between stops, not odometer): ' + (sum.km.status === 'ok' ? sum.km.value.toFixed(1) : sum.km.status === 'none' ? '0.0' : 'unavailable'));
     L.push('Hours out: ' + (sum.hoursOutMin == null ? '—' : fmtDur(sum.hoursOutMin)) + (sum.startedAt != null && sum.finishedAt != null ? ' (' + t(sum.startedAt) + '-' + t(sum.finishedAt) + ')' : ''));
-    L.push('Drive (est.): ' + fmtDur(sum.driveMin) + ' | At stops/other: ' + fmtDur(sum.atStopsMin));
+    if (timeSplitText) L.push('Time split: ' + timeSplitText);
+    else L.push('Drive (est.): ' + fmtDur(sum.driveMin) + ' | At stops/other: ' + fmtDur(sum.atStopsMin));
     if (sum.fuel) L.push('Fuel: ' + sum.fuel.place + ' ' + t(sum.fuel.t));
     const sec = (title, lines) => { if (lines.length) L.push('', '*' + title + '*', ...lines); };
     sec('Collected', sum.collected.map((c) => '- ' + t(c.t) + ' ' + c.item + ' - ' + c.place));
@@ -607,7 +632,7 @@
   return {
     SCHEMA, KEEP_DAYS, REASONS, CSV_HEADER,
     dateKey, fmtDate, fmtTime, fmtDur, fmtKm, addDaysKey, dayStartMs, ageDays,
-    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordFuel, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, recordBreakStart, recordBreakEnd, TIME_SPLIT_V, arrivedEnd, doneGroups, hasActiveDone,
+    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordFuel, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, recordNav, recordSkip, recordUndoSkip, recordBreakStart, recordBreakEnd, TIME_SPLIT_V, arrivedEnd, doneGroups, hasActiveDone,
     ptKey, legKey, seqKey, legFromMatrices, captureLeg, plannedFromMatrices,
     summarise, closeDay, reopenDay, refreshTotals, recordFor, activityKey, hasActivity, isEmptyRecord, openDayKey, endDay,
     REPAIR_VERSION, repairHistory, runRepairOnce, exportPayload, importPayload, pruneDates, weekRange, weekTotals, historyKeys, toCSV, csvCell, toWhatsApp,

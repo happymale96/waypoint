@@ -7,7 +7,10 @@
  * (no re-stamp), page hidden -> clearWatch / visible -> one fresh fix and exactly one watch, the 500 ms double-tap guard,
  * REACHED -> DONE with a re-time, the navigation tap on stop 2 (navStartedAt in the plan and the day log), the setting off,
  * the double-tap on leaving (estimated split), the watch cleared with nothing pending, and the End day summary (Driving /
- * On site / Between stops). The server and the browser are always shut down. Exit 1 on failure.
+ * On site / Between stops), then a second world: the DIVERT day driven through the UI (nav tap for one stop, a replan, nav tap for the
+ * other, Reached + Done there, then the first stop), End day at a 360 px viewport: per-stop lines and totals follow the day timeline, no
+ * "null" / "undefined", no "Plan vs actual", a "Replans: N" line, stop names at least 60% of the card. The server and the browser
+ * are always shut down. Exit 1 on failure.
  * Needs Node 22+ (global WebSocket / fetch) and Chrome or Edge (set CHROME=<path> to choose one).
  */
 'use strict';
@@ -70,7 +73,7 @@ const INIT = `(() => {
   try { navigator.permissions.query = async () => ({ state: 'granted', addEventListener() {} }); } catch (e) { /* ignore */ }
   window.__opened = 0; window.__copied = 0;
   window.open = () => { window.__opened++; return null; };
-  try { Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { window.__copied++; } } }); } catch (e) { /* ignore */ }
+  try { Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (t) => { window.__copied++; window.__copiedText = t; } } }); } catch (e) { /* ignore */ }
   const km = (a, b) => { const r = Math.PI / 180, dl = (b.lat - a.lat) * r, dg = (b.lng - a.lng) * r;
     const x = Math.sin(dl / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dg / 2) ** 2; return 12742 * Math.asin(Math.sqrt(x)); };
   const realFetch = window.fetch.bind(window);
@@ -294,6 +297,8 @@ async function main() {
       const sp = Reached.splitOfSummary(DayLog.summarise(d, S.jobs, S.places), Date.now()), r = sp.stops.find((x) => x.stopId === ${JSON.stringify(ids[1])});
       return { nav: e[0] && e[0].navStartedAt, v: sp.v, between: r.betweenMin, drive: r.driveMin, onSite: r.onSiteMin, est: r.splitEstimated }; })()`);
     check(nav2.nav != null && Math.abs(nav2.nav - navAt) < 2000, 'the day log has navStartedAt for stop 2', nav2);
+    const navEv = await ev(`(() => { const d = Object.values(WaypointDebug.S.days)[0]; return { all: d.events.filter((x) => x.type === 'nav').map((x) => x.stopId), v: d.timeSplitV }; })()`);
+    check(navEv.v === 3 && navEv.all.length === 3 && navEv.all.every((x) => x === ids[1]), 'the day log records EVERY tap on stop 2 as a nav event (3 taps), and none for the whole-route button', navEv);
     check(nav2.v === 2 && Math.abs(nav2.drive - 20) < 0.1 && Math.abs(nav2.onSite - 15) < 0.1 && Math.abs(nav2.between - 5) < 0.1 && nav2.est === false,
       'stop 2 split: between 5 min, driving 20 min, on site 15 min, not estimated', nav2);
 
@@ -340,12 +345,94 @@ async function main() {
     const sumLine = await text('#sumSplitLine');
     const D = '(\\d+ h \\d\\d min|\\d+ min)';
     check(new RegExp('^Driving ' + D + ' · On site ' + D + ' · Between stops ' + D + ' \\(part estimated\\)$').test(sumLine), 'summary: "Driving … · On site … · Between stops … (part estimated)"', sumLine);
-    const rows = await ev('[...document.querySelectorAll("#sumSplit .sum-line")].map((r) => r.textContent)');
-    check(rows.length === 3 && rows.every((r) => /left prev \d\d:\d\d( · nav \d\d:\d\d)? · arr ~?\d\d:\d\d · done \d\d:\d\d$/.test(r)), 'per stop "left prev · [nav ·] arr · done" (3 rows)', rows);
+    const rows = await ev('[...document.querySelectorAll("#sumSplit .ts-stop")].map((r) => r.querySelector(".ts-name").textContent + "|" + r.querySelector(".ts-times").textContent)');
+    check(rows.length === 3 && rows.every((r) => /\|left prev \d\d:\d\d( · nav \d\d:\d\d)? · arr ~?\d\d:\d\d · done \d\d:\d\d$/.test(r)), 'per stop "left prev · [nav ·] arr · done" (3 rows: name, then times)', rows);
     check(rows.filter((r) => /arr ~/.test(r)).length === 1, 'exactly the double-tapped stop shows its arrival as "~hh:mm"', rows);
-    check(rows.filter((r) => / · nav \d\d:\d\d · /.test(r)).length === 1 && / · nav /.test(rows.find((r) => r.includes(stopName2)) || ''), 'only stop 2 (navigation tapped) shows "nav hh:mm"', rows);
+    check(!/ · nav /.test(rows[0]) && / · nav /.test(rows.find((r) => r.includes(stopName2)) || ''), 'stop 1 has no nav; stop 2 (navigation tapped) shows "nav hh:mm"', rows);
+    const m3 = /left prev (\d\d:\d\d) · nav (\d\d:\d\d)/.exec(rows[2]);
+    check(!!m3 && m3[1] === m3[2], 'stop 3: the tap made on site at stop 2 starts the driving at DONE (nav = left prev, between 0)', rows[2]);
+    const t1 = await text('.sheet.summary');
+    check(!/null|undefined/.test(t1) && !/Plan vs actual/.test(t1), 'summary: no "null" / "undefined" text, no "Plan vs actual"');
     check(await ev('!!document.querySelector(".sheet.summary .tiles")') && /3 of 3/.test(await text('.sheet.summary .tile.jobs')), 'the existing tiles are still there (jobs 3 of 3)', await text('.sheet.summary .tile.jobs'));
     await click('.sheet.summary .sum-actions .row:last-child button:last-child');
+
+    console.log('8. DIVERT through the UI (fresh world, 360 px wide)');
+    await send('Page.navigate', { url: 'about:blank' }); // no live page left to write state after the wipe
+    await sleep(500);
+    await send('Storage.clearDataForOrigin', { origin: new URL(appUrl).origin, storageTypes: 'local_storage' });
+    await send('Emulation.setDeviceMetricsOverride', { width: 360, height: 800, deviceScaleFactor: 1, mobile: false });
+    await send('Page.navigate', { url: appUrl });
+    await waitFor('document.querySelector("#planBtn")', 'the Plan tab (second world)');
+    await click('#planBtn');
+    await waitFor('window.WaypointDebug && WaypointDebug.S.plan && WaypointDebug.S.tab === "route" && document.querySelector(".timeline .card.stop")', 'the planned route (second world)');
+    const q = await ev('WaypointDebug.S.plan.result.plans[0].stops.map((s) => s.placeId)');
+    check(q.length === 3 && Object.keys(await ev('WaypointDebug.S.days')).length === 1, 'a fresh 3-stop plan with one day record', q);
+    const cardOf = (id) => ev('WaypointDebug.S.plan.result.plans[0].stops.findIndex((s) => s.placeId === ' + JSON.stringify(id) + ')');
+    const navTapOf = async (id) => { const n = await cardOf(id); await ev('(() => { const a = ' + card(n) + '.querySelector(".stop-btns a.nav-btn"); a.click(); return true; })()'); };
+    const reachDone = async (id, gapMin) => { // REACHED now, DONE gapMin minutes later
+      const n = await cardOf(id);
+      await clickPrimary(n); await waitFor(planStop(id) + '.reachedAt', 'Reached on ' + id);
+      await advanceMin(gapMin);
+      await clickPrimary(n); await waitFor(planStop(id) + '.status === "done"', 'Done on ' + id);
+    };
+    await advanceMin(20);                                  // +20  the drive to the first stop (no navigation tap: estimated)
+    await reachDone(q[0], 15);                             // +20 Reached, +35 Done
+    await advanceMin(5);                                   // +40
+    const pendNow = await ev('WaypointDebug.S.plan.result.plans[0].stops.filter((s) => !s.status).map((s) => s.placeId)');
+    const X = pendNow[0], Y = pendNow[1];
+    await navTapOf(X);                                     // +40  navigation for the next stop
+    await advanceMin(5);
+    await ev('WaypointDebug.doPlan({ replan: true })');    // +45  a replan: changes nothing in the timeline
+    await waitFor('!WaypointDebug.S.busy && document.querySelector(".timeline .card.stop")', 'the replan to finish');
+    await sleep(300);
+    check(await ev('WaypointDebug.S.plan.result.plans[0].stops.filter((s) => !s.status).length') === 2, 'after the replan two stops are still pending');
+    await advanceMin(15);                                  // +60
+    await navTapOf(Y);                                     // +60  the diversion: navigation for the other stop
+    await advanceMin(15);                                  // +75
+    await reachDone(Y, 15);                                // +75 Reached, +90 Done (the diverted stop is done first)
+    await advanceMin(2);                                   // +92
+    await navTapOf(X);                                     // +92  now on to the first one
+    await advanceMin(18);                                  // +110
+    await reachDone(X, 20);                                // +110 Reached, +130 Done
+    const nameOf = (id) => ev('WaypointDebug.S.places[' + JSON.stringify(id) + '].name');
+    const tlv = await ev(`(() => { const S = WaypointDebug.S, d = Object.values(S.days)[0], sum = DayLog.summarise(d, S.jobs, S.places), sp = Reached.splitOfSummary(sum, Date.now());
+      return { v: sp.v, nav: d.events.filter((e) => e.type === 'nav').map((e) => e.stopId), order: sp.stops.map((x) => x.stopId), t: sp.totals,
+        per: sp.stops.map((x) => ({ id: x.stopId, b: x.betweenMin, d: x.driveMin, o: x.onSiteMin, est: x.splitEstimated })), replans: sum.plan.replans }; })()`);
+    const near2 = (a, b) => Math.abs(a - b) < 0.3;
+    check(tlv.v === 2 && tlv.order.join() === [q[0], Y, X].join(), 'arrival order: first stop, the diverted stop, then the first one navigated to', tlv.order);
+    const pY = tlv.per.find((x) => x.id === Y), pX = tlv.per.find((x) => x.id === X);
+    check(near2(pY.b, 5) && near2(pY.d, 35) && near2(pY.o, 15) && !pY.est, 'diverted stop: between 5, driving 35 (X\'s old tap does not count), on site 15', pY);
+    check(near2(pX.b, 2) && near2(pX.d, 18) && near2(pX.o, 20) && !pX.est, 'first stop navigated to: between 2, driving 18, on site 20', pX);
+    check(near2(tlv.t.betweenMin, 7) && near2(tlv.t.driveMin, 73) && near2(tlv.t.onSiteMin, 50) && near2(tlv.t.totalMin, 130), 'totals: between 7, driving 73, on site 50, time out 130', tlv.t);
+    check(near2(tlv.t.betweenMin + tlv.t.driveMin + tlv.t.onSiteMin + tlv.t.lunchMin, tlv.t.totalMin), 'the four buckets sum to the time out');
+    check(tlv.nav.length === 3 && tlv.nav.filter((x) => x === X).length === 2 && tlv.nav.filter((x) => x === Y).length === 1, 'the day log has the three nav taps (X twice, Y once)', tlv.nav);
+    await click('#routeEndDay');
+    await waitFor('document.querySelector("#sumSplitLine")', 'the End day summary (second world)');
+    const T = await text('.sheet.summary');
+    check(!/null|undefined/.test(T), 'summary text has no "null" / "undefined"');
+    check(!/Plan vs actual/.test(T) && !/Drive \(est/.test(T), 'no "Plan vs actual" section and no older "Drive (est.)" figure');
+    check(/^Replans: [1-9]\d*$/.test(await text('#sumReplans') || ''), 'a "Replans: N" line (N > 0)', await text('#sumReplans'));
+    check(await ev('document.querySelectorAll("#sumSplitTile .split-legend .lg").length') === 4 && await ev('document.querySelectorAll("#sumSplitTile .split-bar span").length') >= 3, 'the bar shows the four buckets with a legend');
+    const R = await ev('[...document.querySelectorAll("#sumSplit .ts-stop")].map((r) => ({ n: r.querySelector(".ts-name").textContent, t: r.querySelector(".ts-times").textContent }))');
+    check(R.length === 3, 'three per-stop blocks', R);
+    const mins = (t, k) => { const m = new RegExp(k + ' (\\d\\d):(\\d\\d)').exec(t); return m ? Number(m[1]) * 60 + Number(m[2]) : null; };
+    const dm = (a, b) => ((b - a) % 1440 + 1440) % 1440;
+    const within1 = (a, b) => Math.abs(a - b) <= 1;
+    const rY = R[1], rX = R[2];
+    check(rY.n === await nameOf(Y) && rX.n === await nameOf(X), 'the blocks name the stops in arrival order (diverted stop second)', R.map((r) => r.n));
+    check(within1(dm(mins(rY.t, 'left prev'), mins(rY.t, 'nav')), 5) && within1(dm(mins(rY.t, 'nav'), mins(rY.t, 'arr')), 35) && within1(dm(mins(rY.t, 'arr'), mins(rY.t, 'done')), 15), 'diverted stop line: left prev -> nav 5, nav -> arr 35, arr -> done 15', rY.t);
+    check(within1(dm(mins(rX.t, 'left prev'), mins(rX.t, 'nav')), 2) && within1(dm(mins(rX.t, 'nav'), mins(rX.t, 'arr')), 18) && within1(dm(mins(rX.t, 'arr'), mins(rX.t, 'done')), 20), 'first stop navigated to: left prev -> nav 2, nav -> arr 18, arr -> done 20', rX.t);
+    check(mins(rY.t, 'left prev') === mins(R[0].t, 'done') && mins(rX.t, 'left prev') === mins(rY.t, 'done'), 'each "left prev" is the previous stop\'s done time');
+    const sl = await text('#sumSplitLine');
+    const dur = (t) => { const m = /^(?:(\d+) h )?(\d+) min$/.exec(t); return m ? Number(m[1] || 0) * 60 + Number(m[2]) : null; };
+    const ml = /^Driving (.+?) · On site (.+?) · Between stops (.+?)(?: · Lunch (.+?))?(?: \(part estimated\))?$/.exec(sl);
+    check(!!ml && within1(dur(ml[1]), 73) && within1(dur(ml[2]), 50) && within1(dur(ml[3]), 7), 'summary line: Driving 1 h 13 min · On site 50 min · Between stops 7 min', sl);
+    const widths = await ev('(() => { const c = document.querySelector("#sumSplit").getBoundingClientRect().width; return { vw: window.innerWidth, card: c, names: [...document.querySelectorAll("#sumSplit .ts-name")].map((e) => e.getBoundingClientRect().width / c) }; })()');
+    check(widths.vw === 360 && widths.names.length === 3 && widths.names.every((w) => w >= 0.6), 'at 360 px every stop name is at least 60% of the card width', widths);
+    await click('.sheet.summary .sum-actions .row:first-child button:first-child'); // Copy summary
+    await sleep(200);
+    const copied = await ev('window.__copiedText || ""');
+    check(/Time split: Driving/.test(copied) && !/null|undefined|Plan vs actual|Drive \(est/.test(copied), 'Copy summary: the time split instead of the old estimate, no "Plan vs actual", no "null"', copied.slice(0, 200));
 
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {

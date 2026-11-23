@@ -213,6 +213,17 @@ button.end-day { width: 100%; margin: 8px 0 0; min-height: 44px; }
 .split-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; margin-top: 8px; background: var(--chip); }
 .split-bar .drive { background: var(--deliver); }
 .split-bar .stops { background: var(--collect); }
+.split-bar .b-drive, .sw.b-drive { background: var(--deliver); }
+.split-bar .b-site, .sw.b-site { background: var(--collect); }
+.split-bar .b-between, .sw.b-between { background: var(--muted); }
+.split-bar .b-lunch, .sw.b-lunch { background: var(--inhand); }
+.split-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.split-legend .lg { display: inline-flex; align-items: center; gap: 5px; }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.sum-replans { font-size: 13px; margin: 2px 0 6px; }
+.ts-stop { padding: 5px 0; border-top: 1px solid var(--border); }
+.ts-name { font-weight: 700; overflow-wrap: break-word; }
+.ts-times { font-size: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .time-edit { flex-wrap: nowrap; margin: 4px 0 8px; }
 .sum-sec { padding: 10px 12px; border-left: 4px solid var(--border); }
 .sum-sec .eyebrow { font-size: 11px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 6px; color: var(--muted); }

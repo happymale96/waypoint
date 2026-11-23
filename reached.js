@@ -183,22 +183,198 @@
       anyEstimated, anySplitEstimated: anySplit, endDriveMin, endBetweenMin, end } };
   }
 
+  // ---------- the day's timeline (one state machine over the whole day, not per stop) ----------
+  // events = [{type, stopId, at (ms | ISO), name?, fuel?}] in any order (sorted here, stable on ties):
+  //   nav      a tap on a stop's own navigation button (stopId = the stop; null = the end point). Every tap is an event.
+  //   reached  the stop was reached (tap or auto). An undone Reached is simply not an event.
+  //   done     the stop was marked DONE
+  //   skip     the stop was skipped; it only matters when the stop had been reached (then the skip is the departure)
+  //   arrived  ARRIVED on the end point (the timeline stops there)
+  // dwells = {stopId: planned dwell in minutes} (only used to estimate an arrival). dayStart / dayEnd = ms (dayEnd may be null:
+  // the day then ends at its last done / skip / ARRIVED). opts = {breakStartedAt, breakEndedAt} (ms, the real lunch break).
+  //
+  // States: BETWEEN (after a departure, before any navigation tap) -> DRIVING (from the first navigation tap, for ANY stop or the
+  // end point) -> ON SITE (from an arrival until DONE / SKIP). A departure is the day's start, a DONE, or the SKIP of a stop that
+  // had been reached. DRIVING lasts until the next ARRIVAL at ANY stop (Reached, or - when a DONE has no usable Reached (missing, or
+  // under 60 s before it) - done minus the planned dwell, never earlier than the segment start) and is credited to the stop
+  // that ends it, together with the BETWEEN before it. No navigation tap between a departure and an arrival: all of it is DRIVING and
+  // that stop is flagged estimated. A navigation tap while on site takes effect at the departure (driving from DONE, between 0).
+  // Taps for other stops while DRIVING, a stop skipped without being reached, and anything about the plan (stops added, removed,
+  // re-ordered, replans) change nothing. Two stops reached before either is done: on-site time goes to the latest reached; the
+  // departure is when no reached-not-done stop remains. The real break is subtracted from every segment it overlaps and is its
+  // own bucket, so betweenMin + driveMin + onSiteMin + lunchMin = totalMin (start to end) exactly.
+  // Returns {segments:[{kind:'between'|'driving'|'onsite', from, to, stopId, min, lunchMin}], perStop:[one per arrival: {stopId,
+  // name, fuel, driveMin, onSiteMin, betweenMin, lunchMin, estimated, navMissing, splitEstimated, skipped, arrivalMs, departMs,
+  // prevDepartMs, navMs}], end:{prevDepartMs, navMs, arrivalMs, navMissing}|null, totals:{driveMin, onSiteMin, betweenMin, lunchMin,
+  // totalMin, anyEstimated, anySplitEstimated, endDriveMin, endBetweenMin, end}}.
+  const TL_TYPES = { nav: 1, reached: 1, done: 1, skip: 1, arrived: 1 };
+  const KIND_FIELD = { between: 'betweenMin', driving: 'driveMin', onsite: 'onSiteMin' };
+  function dayTimeline(events, dwells, dayStart, dayEnd, opts) {
+    opts = opts || {}; dwells = dwells || {};
+    const start = toMs(dayStart);
+    const noTotals = { driveMin: 0, onSiteMin: 0, betweenMin: 0, lunchMin: 0, totalMin: 0, anyEstimated: false, anySplitEstimated: false, endDriveMin: 0, endBetweenMin: 0, end: null };
+    if (start == null || isNaN(start)) return { segments: [], perStop: [], end: null, totals: noTotals };
+    const bs = toMs(opts.breakStartedAt), be = toMs(opts.breakEndedAt);
+    const hasBreak = bs != null && !isNaN(bs) && be != null && !isNaN(be) && be > bs;
+    const overlap = (a, b) => (hasBreak ? Math.max(0, Math.min(b, be) - Math.max(a, bs)) : 0);
+
+    const evs = (events || []).map((e, i) => ({ type: e && e.type, stopId: e && e.stopId != null ? e.stopId : null, at: toMs(e && e.at), name: e && e.name || null, fuel: !!(e && e.fuel), i }))
+      .filter((e) => TL_TYPES[e.type] === 1 && e.at != null && !isNaN(e.at)).sort((a, b) => a.at - b.at || a.i - b.i);
+    // pair every DONE with its Reached: a missing one, or one under 60 s before the DONE, is not used (the arrival is estimated)
+    const open = {};
+    evs.forEach((e) => {
+      if (e.type === 'reached') { if (open[e.stopId]) open[e.stopId].drop = true; open[e.stopId] = e; }
+      else if (e.type === 'done') {
+        const r = open[e.stopId];
+        if (!(r && e.at - r.at >= MIN_ON_SITE_MS)) { if (r) r.drop = true; }
+        delete open[e.stopId];
+      } else if (e.type === 'skip') delete open[e.stopId];
+    });
+
+    const segs = [], entries = [], stack = [];
+    let state = 'between', t = start, now = start, depart = start, navMs = null, navOnSite = false, legSegs = [], last = start, finished = false;
+    const endEntry = { driveMin: 0, betweenMin: 0, lunchMin: 0 };
+    let end = null;
+    const addSeg = (kind, from, to, entry, stopId) => {
+      if (!(to > from)) return null;
+      const s = { kind, from, to, stopId: stopId != null ? stopId : null, entry: entry || null };
+      segs.push(s);
+      return s;
+    };
+    const closeOnSite = (at) => { const top = stack[stack.length - 1]; if (top) addSeg('onsite', t, at, top, top.stopId); t = at; };
+    function arrive(e, at, estimated) {
+      const entry = { stopId: e.stopId, name: e.name, fuel: e.fuel, driveMin: 0, onSiteMin: 0, betweenMin: 0, lunchMin: 0, estimated: !!estimated, navMissing: false,
+        splitEstimated: false, skipped: false, arrivalMs: at, departMs: null, prevDepartMs: null, navMs: null };
+      if (state === 'onsite') closeOnSite(at); // a second stop reached before the first is done: no leg, the latest reached gets the time
+      else {
+        entry.prevDepartMs = depart;
+        entry.navMissing = state === 'between';
+        entry.navMs = state === 'driving' ? navMs : null;
+        addSeg('driving', t, at, entry, e.stopId);
+        legSegs.forEach((s) => { s.entry = entry; s.stopId = e.stopId; });
+        legSegs = [];
+      }
+      entry.splitEstimated = entry.estimated || entry.navMissing;
+      entries.push(entry); stack.push(entry);
+      state = 'onsite'; t = at;
+      return entry;
+    }
+    function leave(e, at, skipped) {
+      let idx = -1;
+      for (let i = stack.length - 1; i >= 0; i--) if (stack[i].stopId === e.stopId) { idx = i; break; }
+      if (idx < 0) {
+        if (skipped) return; // skipped without having been reached: no effect
+        const dwell = Number(dwells[e.stopId]) || 0;
+        arrive(e, Math.min(at, Math.max(at - dwell * MIN, t)), true);
+        idx = stack.length - 1;
+      }
+      const entry = stack[idx];
+      if (idx === stack.length - 1) closeOnSite(at);
+      stack.splice(idx, 1);
+      entry.departMs = at; entry.skipped = !!skipped;
+      if (e.name) entry.name = e.name;
+      if (e.fuel) entry.fuel = true;
+      if (!stack.length) { // the departure
+        state = 'between'; t = at; depart = at; navMs = null; legSegs = [];
+        if (navOnSite) { state = 'driving'; navMs = at; navOnSite = false; }
+      }
+    }
+    for (const e of evs) {
+      if (e.drop) continue;
+      if (finished) break;
+      const at = Math.max(e.at, now);
+      now = at;
+      if (e.type !== 'nav') last = at;
+      if (e.type === 'nav') {
+        if (state === 'between') { const s = addSeg('between', t, at, null); if (s) legSegs.push(s); state = 'driving'; t = at; navMs = at; }
+        else if (state === 'onsite') navOnSite = true;
+      } else if (e.type === 'reached') {
+        if (!stack.some((x) => x.stopId === e.stopId)) arrive(e, at, false);
+      } else if (e.type === 'done') leave(e, at, false);
+      else if (e.type === 'skip') leave(e, at, true);
+      else if (e.type === 'arrived') {
+        if (state === 'onsite') { closeOnSite(at); stack.length = 0; end = { prevDepartMs: null, navMs: null, arrivalMs: at, navMissing: false }; }
+        else {
+          end = { prevDepartMs: depart, navMs: state === 'driving' ? navMs : null, arrivalMs: at, navMissing: state === 'between' };
+          addSeg('driving', t, at, endEntry);
+          legSegs.forEach((s) => { s.entry = endEntry; });
+          legSegs = [];
+        }
+        finished = true;
+      }
+    }
+    let tEnd = last;
+    if (!finished) { // the day runs on to dayEnd (when given): the open state continues
+      const de = toMs(dayEnd);
+      tEnd = Math.max(last, de != null && !isNaN(de) ? de : last);
+      if (tEnd > t) {
+        if (state === 'onsite') closeOnSite(tEnd);
+        else addSeg(state === 'between' ? 'between' : 'driving', t, tEnd, null);
+      }
+    }
+    const totals = Object.assign({}, noTotals);
+    segs.forEach((s) => {
+      const l = overlap(s.from, s.to), min = (s.to - s.from - l) / MIN;
+      s.min = min; s.lunchMin = l / MIN;
+      totals[KIND_FIELD[s.kind]] += min; totals.lunchMin += s.lunchMin;
+      if (s.entry) { s.entry[KIND_FIELD[s.kind]] += min; s.entry.lunchMin += s.lunchMin; }
+    });
+    totals.totalMin = Math.max(0, (tEnd - start) / MIN);
+    totals.endDriveMin = endEntry.driveMin; totals.endBetweenMin = endEntry.betweenMin;
+    totals.anySplitEstimated = entries.some((x) => x.splitEstimated) || !!(end && end.navMissing);
+    totals.anyEstimated = totals.anySplitEstimated;
+    totals.end = end;
+    return { segments: segs.map((s) => ({ kind: s.kind, from: s.from, to: s.to, stopId: s.stopId, min: s.min, lunchMin: s.lunchMin })), perStop: entries, end, totals };
+  }
+
+  // The day-log summary as timeline events: every navigation tap recorded as an event (sum.navs, v3 days) plus the per-stop
+  // navStartedAt / arrivedEndNavAt of days recorded under the previous format (deduplicated against the events: the same tap
+  // is never counted twice), the Reached + DONE of each visit, the SKIP of a stop that had been reached, ARRIVED.
+  function timelineEventsOfSummary(sum) {
+    const ev = [], seen = {}, dwells = {};
+    const nav = (stopId, at, isEnd) => {
+      if (at == null) return;
+      const k = (isEnd ? '@end' : stopId) + '|' + at;
+      if (seen[k]) return;
+      seen[k] = true;
+      ev.push({ type: 'nav', stopId: isEnd ? null : stopId, at });
+    };
+    ((sum && sum.navs) || []).forEach((n) => nav(n.stopId, n.at, n.end));
+    ((sum && sum.visits) || []).forEach((v) => {
+      nav(v.stopId, v.navStartedAt, false);
+      if (v.dwellMin != null) dwells[v.stopId] = v.dwellMin;
+      if (v.reachedAt != null) ev.push({ type: 'reached', stopId: v.stopId, at: v.reachedAt, name: v.name, fuel: v.fuel });
+      ev.push({ type: 'done', stopId: v.stopId, at: v.doneAt, name: v.name, fuel: v.fuel });
+    });
+    ((sum && sum.skips) || []).forEach((s) => {
+      if (s.reachedAt == null) return; // skipped without being reached: no effect on the timeline
+      ev.push({ type: 'reached', stopId: s.stopId, at: s.reachedAt, name: s.name });
+      ev.push({ type: 'skip', stopId: s.stopId, at: s.at, name: s.name });
+    });
+    if (sum && sum.arrivedEndNavAt != null) nav(null, sum.arrivedEndNavAt, true);
+    if (sum && sum.arrivedEndAt != null) ev.push({ type: 'arrived', stopId: null, at: sum.arrivedEndAt });
+    return { events: ev, dwells };
+  }
+
   // The split for a day-log summary (DayLog.summarise()), or null when there is nothing to split.
-  //   v: 2 (a day recorded with the navigation-tap timing, sum.timeSplitV >= 2): four buckets, the break included;
+  //   v: 2 (a day recorded with the navigation-tap timing, sum.timeSplitV >= 2: the previous format with a per-stop
+  //        navStartedAt, or the current one with nav events): four buckets from dayTimeline, the break included;
   //        a break still running counts up to nowMs.
-  //   v: 1 (a day closed before that): driving vs on site only, and only when some done stop has a Reached time
+  //   v: 1 (a day closed before that): driving vs on site only (daySplit), and only when some done stop has a Reached time
   //        (nothing is backfilled).
   function splitOfSummary(sum, nowMs) {
     const visits = (sum && sum.visits) || [];
     const v2 = !!(sum && sum.timeSplitV >= 2);
     if (v2 ? !visits.length : !visits.some((v) => v.reachedAt != null)) return null;
-    const o = { endArrivedAt: sum.arrivedEndAt };
     if (v2) {
-      o.endNavStartedAt = sum.arrivedEndNavAt;
+      const o = {};
       if (sum.breakStartedAt != null) { o.breakStartedAt = sum.breakStartedAt; o.breakEndedAt = sum.breakEndedAt != null ? sum.breakEndedAt : (nowMs != null ? nowMs : null); }
+      const te = timelineEventsOfSummary(sum);
+      const tl = dayTimeline(te.events, te.dwells, sum.startedAt, null, o);
+      return { v: 2, stops: tl.perStop.map((x) => Object.assign({}, x, { name: x.name || '(stop)' })), totals: tl.totals, breakTaken: sum.breakStartedAt != null, timeline: tl };
     }
-    const sp = daySplit(visits, sum.startedAt, o);
-    return { v: v2 ? 2 : 1, stops: visits.map((v, i) => Object.assign({}, v, sp.stops[i])), totals: sp.totals, breakTaken: v2 && sum.breakStartedAt != null };
+    const sp = daySplit(visits, sum.startedAt, { endArrivedAt: sum.arrivedEndAt });
+    return { v: 1, stops: visits.map((v, i) => Object.assign({}, v, sp.stops[i])), totals: sp.totals, breakTaken: false };
   }
 
   // "Driving 2 h 10 min · On site 1 h 47 min · Between stops 38 min · Lunch 52 min (part estimated)" (dur = minutes -> text)
@@ -216,11 +392,11 @@
     if (x.prevDepartMs != null) p.push('left prev ' + hm(x.prevDepartMs));
     if (x.navMs != null) p.push('nav ' + hm(x.navMs));
     if (x.arrivalMs != null) p.push('arr ' + (x.estimated ? '~' : '') + hm(x.arrivalMs));
-    if (x.departMs != null) p.push('done ' + hm(x.departMs));
+    if (x.departMs != null) p.push((x.skipped ? 'skipped ' : 'done ') + hm(x.departMs));
     return p.join(' · ');
   }
 
   return { RADIUS_M, MAX_ACCURACY_M, TAP_GUARD_MS, MIN_ON_SITE_MS, isReached, buttonLabel, tapIgnored, stampReached, undoReached, undoDone, carryForward,
     keptState, keepStateOf, stampNav, WATCH_OPTS, WATCH_RETIME_MS, shouldWatch, retimeDue,
-    reachedText, onSiteStop, autoReachTarget, daySplit, splitOfSummary, splitLine, stopLine };
+    reachedText, onSiteStop, autoReachTarget, daySplit, dayTimeline, timelineEventsOfSummary, splitOfSummary, splitLine, stopLine };
 });

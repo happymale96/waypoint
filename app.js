@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '2f72fca4'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = 'f7650cb4'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 20, supplier: 5, other: 10, office: 10, home: 0 };
 
@@ -1112,15 +1112,29 @@
       const kmTile = tile('Est. km (road route between stops, not odometer)', kmVal, 'wide km' + (s.km.status === 'unavailable' ? ' unavailable' : ''),
         s.km.status === 'unavailable' && !routing ? () => routeNow(true) : null);
       const total = s.hoursOutMin, drv = s.driveMin;
-      const bar = total && drv != null ? h('div', { class: 'split-bar', 'aria-hidden': 'true' },
-        h('span', { class: 'drive', style: 'flex:' + Math.max(drv, 0.01) }), h('span', { class: 'stops', style: 'flex:' + Math.max(total - drv, 0.01) })) : null;
+      // ONE driving figure: a day with time-split data shows the four buckets of its timeline (the older estimate is not shown);
+      // a day without it keeps the old "Drive (est.) vs at stops/other" bar.
+      const sp = Reached.splitOfSummary(s, Date.now());
+      let splitTile;
+      if (sp && sp.v === 2) {
+        const t = sp.totals;
+        const buckets = [['Driving', t.driveMin, 'b-drive'], ['On site', t.onSiteMin, 'b-site'], ['Between stops', t.betweenMin, 'b-between'], ['Lunch', t.lunchMin, 'b-lunch']];
+        splitTile = h('div', { class: 'tile split', id: 'sumSplitTile' }, h('div', { class: 'tl' }, 'Time split'),
+          h('div', { class: 'split-bar four', 'aria-hidden': 'true' }, buckets.filter((b) => b[1] > 0.0001).map((b) => h('span', { class: b[2], style: 'flex:' + b[1] }))),
+          h('div', { class: 'split-legend' }, buckets.map((b) => h('span', { class: 'lg' }, h('i', { class: 'sw ' + b[2] }), b[0] + ' ' + DL.fmtDur(b[1])))));
+      } else {
+        const bar = total && drv != null ? h('div', { class: 'split-bar', 'aria-hidden': 'true' },
+          h('span', { class: 'drive', style: 'flex:' + Math.max(drv, 0.01) }), h('span', { class: 'stops', style: 'flex:' + Math.max(total - drv, 0.01) })) : null;
+        splitTile = h('div', { class: 'tile split' }, h('div', { class: 'tl' }, 'Drive (est.) vs at stops/other'),
+          h('div', { class: 'tv2' }, h('span', { class: 'dv' }, DL.fmtDur(s.driveMin) + ' est.'), h('span', { class: 'sv' }, DL.fmtDur(s.atStopsMin))), bar);
+      }
       const tiles = h('div', { class: 'tiles' },
         tile('Jobs done', s.jobsDone + ' of ' + s.jobsTotal, 'jobs'),
         tile('Stops visited', String(s.stopsVisited), 'stops'),
         kmTile,
         tile('Hours out', DL.fmtDur(s.hoursOutMin), 'hours'),
-        h('div', { class: 'tile split' }, h('div', { class: 'tl' }, 'Drive (est.) vs at stops/other'),
-          h('div', { class: 'tv2' }, h('span', { class: 'dv' }, DL.fmtDur(s.driveMin) + ' est.'), h('span', { class: 'sv' }, DL.fmtDur(s.atStopsMin))), bar));
+        splitTile);
+      const replansLine = s.plan.replans > 0 ? h('div', { class: 'muted sum-replans', id: 'sumReplans' }, 'Replans: ' + s.plan.replans) : null;
       const timeRow = h('div', { class: 'row time-edit' },
         h('button', { class: 'small grow', disabled: ro(), onclick: () => editTime('startedAt', s.startedAt) }, 'Started ' + (s.startedAt != null ? hm(s.startedAt) : '—') + (ro() ? '' : ' ✎')),
         h('button', { class: 'small grow', disabled: ro(), onclick: () => editTime('finishedAt', s.finishedAt) }, 'Finished ' + (s.finishedAt != null ? hm(s.finishedAt) : '—') + (ro() ? '' : ' ✎')));
@@ -1128,12 +1142,13 @@
       // driving vs on site: only for days where a stop has a Reached time (days closed before this feature show nothing, nothing is backfilled)
       // days recorded with the navigation-tap timing (v2): driving / on site / between stops (+ lunch), per stop
       // "left prev · nav · arr · done"; days closed before it keep the old driving-vs-on-site card (v1)
-      const sp = Reached.splitOfSummary(s, Date.now());
+      // each stop is a block: its name on its own full-width line (normal wrapping), its times on the line below
+      const tsStop = (name, times) => h('div', { class: 'ts-stop' }, h('div', { class: 'ts-name' }, name), h('div', { class: 'ts-times' }, times));
       const ae = DL.arrivedEnd(day), endName = (ae && ae.endPoint && ae.endPoint.name) || 'End';
-      const endLine = sp && sp.v === 2 && sp.totals.end ? line(h('span', null, dName(endName)), Reached.stopLine(sp.totals.end, 2, hm)) : null;
+      const endLine = sp && sp.v === 2 && sp.totals.end ? tsStop(dName(endName), Reached.stopLine(sp.totals.end, 2, hm)) : null;
       const splitCard = sp ? h('div', { class: 'card sum-sec split', id: 'sumSplit' }, h('div', { class: 'eyebrow' }, sp.v === 2 ? 'Time split' : 'Driving vs on site'),
         h('div', { class: 'sum-split', id: 'sumSplitLine' }, Reached.splitLine(sp, DL.fmtDur)),
-        sp.stops.filter((x) => !x.skipped).map((x) => line(h('span', null, x.name), Reached.stopLine(x, sp.v, hm))), endLine) : null;
+        sp.stops.filter((x) => !(x.skipped && x.arrivalMs == null)).map((x) => tsStop(x.name, Reached.stopLine(x, sp.v, hm))), endLine) : null;
 
       const urgentChip = h('span', { class: 'chip urgent' }, 'URGENT'), lateChip = h('span', { class: 'chip late' }, 'LATE');
       const collected = sec('Collected', 'collect', s.collected.map((c) => line(h('span', null, c.item || '(item)', ' - ', c.place), hm(c.t))), 'Nothing collected');
@@ -1157,16 +1172,11 @@
           h('div', { class: 'muted' }, r.from && r.from !== 'in hand' ? 'from ' + r.from : r.type === 'in-hand' ? 'in hand' : ''), chips, carry);
       }), 'Every job is done 🎉');
 
-      const pv = s.plan;
-      const pvl = (label, planned, actual) => h('div', { class: 'pv-row' }, h('span', null, label), h('span', { class: 'pv-vals' }, h('span', { class: 'muted' }, 'plan ' + planned), h('b', null, actual)));
-      const planVs = h('div', { class: 'card sum-sec' }, h('div', { class: 'eyebrow' }, 'Plan vs actual'),
-        pvl('Distance (est. km)', pv.plannedKm != null ? pv.plannedKm.toFixed(1) : '—', s.km.status === 'ok' ? s.km.value.toFixed(1) : s.km.status === 'none' ? '0.0' : '—'),
-        pvl('Drive time (est.)', pv.plannedDriveMin != null ? DL.fmtDur(pv.plannedDriveMin) : '—', DL.fmtDur(s.driveMin)),
-        pvl('Stops done', pv.stopsPlanned + ' planned', String(pv.stopsDone)),
-        pvl('Replans', '', String(pv.replans)),
-        pvl('Stops done out of the first plan’s order', '', String(pv.outOfOrder)));
-
-      const copyBtn = h('button', { class: 'grow', onclick: async () => { toast((await copyText(DL.toWhatsApp(sum()))) ? 'Summary copied — paste into WhatsApp' : 'Could not copy'); } }, 'Copy summary');
+      // (the stored plan-vs-actual data stays in the day log; the section itself is no longer shown)
+      const copyBtn = h('button', { class: 'grow', onclick: async () => {
+        const cs = sum(), csp = Reached.splitOfSummary(cs, Date.now());
+        toast((await copyText(DL.toWhatsApp(cs, csp && csp.v === 2 ? Reached.splitLine(csp, DL.fmtDur) : null))) ? 'Summary copied — paste into WhatsApp' : 'Could not copy');
+      } }, 'Copy summary');
       const csvBtn = h('button', { class: 'grow', onclick: () => downloadCsv(sum()) }, 'Download CSV');
       const main = ro() ? null : day.closed
         ? h('button', { class: 'big grow', id: 'reopenDay', onclick: async () => { await reopenDay(day); render(); draw(); toast('Day reopened'); } }, 'Reopen day')
@@ -1178,10 +1188,11 @@
           await saveDay(day); banner(null); render(); draw();
           toast('Day closed' + (day.carried.length ? ' · ' + day.carried.filter((c) => c.mode !== 'dropped').length + ' job(s) carried' : ''));
         } }, 'Close day');
-      sh.body.replaceChildren(
+      // replaceChildren() turns a null into the text "null": only real nodes go in
+      sh.body.replaceChildren(...[
         h('div', { class: 'muted sum-sub' }, day.driverId + ' · ' + (day.closed ? 'closed ' + (day.endedAt ? DL.fmtDate(DL.dateKey(Date.parse(day.endedAt))) + ' ' + hm(Date.parse(day.endedAt)) : '') : 'open') + (ro() ? ' · read-only' : '')),
-        tiles, timeRow, splitCard, collected, delivered, errands, fuelLine, withYou, notDone, planVs,
-        h('div', { class: 'sum-actions' }, h('div', { class: 'row' }, copyBtn, csvBtn), h('div', { class: 'row' }, main, h('button', { onclick: sh.close }, 'Back'))));
+        tiles, timeRow, replansLine, splitCard, collected, delivered, errands, fuelLine, withYou, notDone,
+        h('div', { class: 'sum-actions' }, h('div', { class: 'row' }, copyBtn, csvBtn), h('div', { class: 'row' }, main, h('button', { onclick: sh.close }, 'Back')))].filter(Boolean));
     }
     draw();
     if (!ro() && !day.closed) routeNow(false);
@@ -1373,11 +1384,22 @@
   }
   // A tap on a stop's own WAZE / MAPS: the FIRST one after the previous departure is that stop's navStartedAt (the link
   // still opens). Later taps, and taps on a reached / done / skipped stop, change nothing (Reached.stampNav).
+  // Every tap is also a day-log event (type nav) - the day's timeline (Reached.dayTimeline) decides what it means.
+  function logNav(stopId, nowMs, isEnd) {
+    try {
+      const day = dayFor(nowMs, false);
+      if (!day) return;
+      DL.recordNav(day, { nowIso: new Date(nowMs).toISOString(), at: nowMs, stopId, end: isEnd });
+      bgSaveDay(day);
+    } catch (e) { /* never block the navigation link */ }
+  }
   function navTap(stop0, i0) {
     try {
       const ls = liveStop(stop0, i0);
       if (!ls) return;
-      const cur = curPlan(), next = Reached.stampNav(ls.stop, Date.now(), prevDepartureMs(cur));
+      const nowMs = Date.now();
+      if (!ls.stop.status) logNav(ls.stop.placeId, nowMs, false);
+      const cur = curPlan(), next = Reached.stampNav(ls.stop, nowMs, prevDepartureMs(cur));
       if (next === ls.stop) return;
       ls.stop.navStartedAt = next.navStartedAt;
       savePlan();
@@ -1387,7 +1409,9 @@
     try {
       const cur = curPlan(), day = dayFor(Date.now(), false);
       if (!cur || (day && DL.arrivedEnd(day))) return; // after ARRIVED: ignored
-      const next = Reached.stampNav({ navStartedAt: cur.endNavStartedAt }, Date.now(), prevDepartureMs(cur));
+      const nowMs = Date.now();
+      logNav(null, nowMs, true);
+      const next = Reached.stampNav({ navStartedAt: cur.endNavStartedAt }, nowMs, prevDepartureMs(cur));
       if (next.navStartedAt === cur.endNavStartedAt) return;
       cur.endNavStartedAt = next.navStartedAt;
       savePlan();
@@ -1731,6 +1755,12 @@
     const P = S.plan;
     const ls = liveStop(stop0, i0);
     if (!ls) return;
+    if (ls.stop.reachedAt != null) { // a stop skipped after it was reached is a departure; one skipped without Reached changes nothing
+      try {
+        const now = Date.now(), day = dayFor(now, false);
+        if (day) { DL.recordSkip(day, { nowIso: new Date(now).toISOString(), stopId: ls.stop.placeId, name: ls.stop.fuel ? 'Fuel: ' + ((coordPlace(ls.stop.placeId) || {}).name || '') : '', reachedAt: ls.stop.reachedAt, places: Object.assign({}, S.plan && S.plan.ctx.places, S.places) }); bgSaveDay(day); }
+      } catch (e) { /* never break SKIP */ }
+    }
     ls.stop.status = 'skipped';
     S.loc.origin = null;
     P.alt = null;
@@ -1745,6 +1775,7 @@
     const P = S.plan, cur = curPlan();
     const stop = cur && cur.stops[i0] && cur.stops[i0].placeId === stop0.placeId ? cur.stops[i0] : null;
     if (!stop || stop.status !== 'skipped') return;
+    if (stop.reachedAt != null) { try { const d = dayFor(Date.now(), false); if (d) { DL.recordUndoSkip(d, { nowIso: new Date().toISOString(), stopId: stop.placeId }); bgSaveDay(d); } } catch (e) { /* ignore */ } }
     delete stop.status;
     S.loc.origin = null;
     P.alt = null;
