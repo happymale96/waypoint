@@ -35,7 +35,7 @@ function mockTomTom(opts) {
     if (opts.fail && opts.fail(a, b)) { const e = new Error('TomTom: HTTP 400 — NO_ROUTE_FOUND'); throw e; }
     const km = Budget.distanceM(a, b) / 1000;
     const s = Math.round(km * 1.3 / 40 * 3600) + 60;
-    return opts.answer ? opts.answer(a, b, at, s) : { seconds: s, metres: Math.round(km * 1300), typicalSeconds: null };
+    return opts.answer ? opts.answer(a, b, at, s) : { seconds: s, metres: Math.round(km * 1300), typicalSeconds: s }; // computeTravelTimeFor=all: the historic time comes back
   };
   return { log, fetchLeg };
 }
@@ -155,9 +155,9 @@ function plan(stopIds, mem, tt, at) {
     const run = async (pt) => { const tt = mockTomTom(); const t = await TT.buildTable({ start: { key: '__start__', pid: TT.snap(pt, list), lat: pt.lat, lng: pt.lng }, stops: [node('A', 'A')], end: node('__end__', 'E'), links: [], mem: m10, bucket: 'day', planMs: NOW, nowMs: NOW, live: false, fetchLeg: tt.fetchLeg }); return { tt, t }; };
     const a = await run(near);
     ok(a.tt.log.length === 0 && a.t.m[0][1] === 700, '80 m: the learned O->A, 0 requests');
-    const before = JSON.stringify(m10);
+    const before = JSON.stringify(m10.pairs);
     const b = await run(far);
-    ok(b.tt.log.length === 1 && b.tt.log[0].a === '__start__' && JSON.stringify(m10) === before, '400 m: fetched (1 request), nothing stored');
+    ok(b.tt.log.length === 1 && b.tt.log[0].a === '__start__' && JSON.stringify(m10.pairs) === before, '400 m: fetched (1 request), nothing stored');
   }
 
   console.log('11. job pickup P -> delivery Q: Q -> P is never fetched');

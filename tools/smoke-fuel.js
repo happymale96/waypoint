@@ -80,7 +80,7 @@ const INIT = `(() => {
       if (url.includes('/calculateRoute/')) { // the Routing API: one leg per request, coordinates in the path
         const q = [0].concat(url.split('/calculateRoute/')[1].split('/')[0].split(/[,:]/).map(Number));
         const k = km({ lat: +q[1], lng: +q[2] }, { lat: +q[3], lng: +q[4] });
-        return json({ routes: [{ summary: { travelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), lengthInMeters: Math.round(k * 1300) } }] });
+        return json({ routes: [{ summary: { travelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), historicTrafficTravelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), lengthInMeters: Math.round(k * 1300) } }] });
       }
       const b = JSON.parse(init.body), data = [];
       b.origins.forEach((o, i) => b.destinations.forEach((d, j) => {
@@ -192,7 +192,7 @@ async function main() {
     const c1 = await calls();
     const searched = await searchedN();
     check(c1 - c0 === expected && searched === expected && c1 - c0 <= 50, 'Places calls (' + (c1 - c0) + ') = the number of sample points (' + expected + '), at most 50', { calls: c1 - c0, searched });
-    check(await ev('WaypointDebug.S.settings.placesCallsToday.count') === c1, 'every call went through the daily counter');
+    check(await ev('Budget.placesCount(WaypointDebug.S.settings.usage, Date.now()).today') === c1 && await ev('Budget.placesCount(WaypointDebug.S.settings.usage, Date.now()).month') === c1, 'every call went through the one counter (today and this month)');
     const name1 = await text('#fuelName'), detour1 = await text('#fuelDetour');
     check(/Caltex/.test(name1) && !/Petron/.test(name1), 'the preview offers a Caltex station (the decoy brand is filtered out)', name1);
     check(/^\+\d+ min · between .+ and .+$/.test(detour1), 'the preview shows "+N min · between A and B"', detour1);
@@ -238,7 +238,7 @@ async function main() {
     await cancelSheet();
 
     console.log('4. counter at 139: the daily guard');
-    await ev('(() => { const d = new Date(); WaypointDebug.S.settings.placesCallsToday = { date: d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate(), count: 139 }; })()');
+    await ev('(() => { WaypointDebug.S.settings.usage = Object.assign({}, WaypointDebug.S.settings.usage, { places: Budget.addCount(null, Date.now(), 139) }); })()');
     await advance(11);
     const c4 = await calls();
     await tap();
@@ -247,7 +247,7 @@ async function main() {
     await cancelSheet();
 
     console.log('5. offline: remembered stations only');
-    await ev('(() => { const d = new Date(); WaypointDebug.S.settings.placesCallsToday = { date: d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate(), count: 0 }; window.__online = false; })()'); // counter 0, so only "offline" can explain 0 calls
+    await ev('(() => { WaypointDebug.S.settings.usage = Object.assign({}, WaypointDebug.S.settings.usage, { places: Budget.addCount(null, Date.now(), 0) }); window.__online = false; })()'); // counter 0, so only "offline" can explain 0 calls
     await advance(11);
     const c5 = await calls();
     await tap();

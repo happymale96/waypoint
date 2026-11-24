@@ -76,7 +76,7 @@ const INIT = `(() => {
       if (url.includes('/calculateRoute/')) { // the Routing API: one leg per request, coordinates in the path
         const q = [0].concat(url.split('/calculateRoute/')[1].split('/')[0].split(/[,:]/).map(Number));
         const k = km({ lat: +q[1], lng: +q[2] }, { lat: +q[3], lng: +q[4] });
-        return json({ routes: [{ summary: { travelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), lengthInMeters: Math.round(k * 1300) } }] });
+        return json({ routes: [{ summary: { travelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), historicTrafficTravelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), lengthInMeters: Math.round(k * 1300) } }] });
       }
       const b = JSON.parse(init.body), data = [];
       b.origins.forEach((o, i) => b.destinations.forEach((d, j) => {

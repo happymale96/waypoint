@@ -71,6 +71,43 @@ console.log('15. counters: per day (Malaysia date) and per UTC calendar month; t
   ok(Budget.DOWN_MSG === 'TomTom unavailable or monthly allowance used up - using estimated times', 'the banner text');
 }
 
+console.log('A. Google Places: today AND this month from one record, counted the way TomTom is');
+{
+  const d1 = Date.UTC(2026, 10, 24, 3, 0, 0); // 24 Nov 11:00 MYT
+  const d2 = Date.UTC(2026, 10, 25, 3, 0, 0); // 25 Nov, same month
+  const d3 = Date.UTC(2026, 11, 1, 3, 0, 0);  //  1 Dec, a new month
+  const card = (u, ms) => Budget.usageLines(u, ms, 20000, 0).places; // an old separate "today" figure (0) must not be used
+  let u = { routing: Budget.addCount(null, d1, 19) };
+  u = Budget.countPlaces(u, d1);
+  const p1 = Budget.placesCount(u, d1);
+  ok(p1.today === 1 && p1.month === 1, 'one Places request: today 1, month 1', p1);
+  ok(card(u, d1) === 'Google Places    1 today · 1 this month  (daily guard 140)', 'the Usage card line: 1 today · 1 this month', card(u, d1));
+  ok(Budget.countOf(u.routing, d1).today === 19 && Budget.countOf(u.routing, d1).month === 19, 'TomTom Routing untouched (19 · 19)');
+  u = Budget.countPlaces(u, d2);
+  const p2 = Budget.placesCount(u, d2);
+  ok(p2.today === 1 && p2.month === 2, 'a second request the next day, same month: today 1, month 2', p2);
+  ok(card(u, d2) === 'Google Places    1 today · 2 this month  (daily guard 140)', 'the card the next day', card(u, d2));
+  u = Budget.countPlaces(u, d3);
+  const p3 = Budget.placesCount(u, d3);
+  ok(p3.today === 1 && p3.month === 1, 'the first request of a new month: today 1, month 1', p3);
+
+  console.log('A3. one-time repair: this month never below today (never lowers a number)');
+  const day = Budget.dayKey(d1), mon = Budget.monthKey(d1);
+  let r = Budget.repairPlacesMonth({ routing: u.routing }, { date: day, count: 1 }, d1); // the phone: old today 1, no month
+  ok(r.changed && Budget.placesCount(r.usage, d1).today === 1 && Budget.placesCount(r.usage, d1).month === 1 && r.usage.routing === u.routing, 'old today 1, month 0 -> today 1, month 1 (Routing kept)', r.usage.places);
+  r = Budget.repairPlacesMonth({ places: { day, d: 1, month: mon, m: 0 } }, null, d1);
+  ok(r.changed && Budget.placesCount(r.usage, d1).month === 1, 'stored month 0 < stored today 1 -> month 1', r.usage.places);
+  r = Budget.repairPlacesMonth({ places: { day, d: 1, month: mon, m: 0 } }, { date: day, count: 3 }, d1);
+  ok(Budget.placesCount(r.usage, d1).today === 3 && Budget.placesCount(r.usage, d1).month === 3, 'the higher of the two "today" figures wins; month raised to it', r.usage.places);
+  const fine = { places: { day, d: 2, month: mon, m: 9 } };
+  r = Budget.repairPlacesMonth(fine, { date: day, count: 1 }, d1);
+  ok(!r.changed && r.usage === fine, 'month 9 >= today 2: nothing changes (never lowers)', r.usage.places);
+  r = Budget.repairPlacesMonth(fine, { date: '2026-11-23', count: 50 }, d1);
+  ok(!r.changed, 'an old counter from another day is ignored');
+  const once = Budget.repairPlacesMonth({}, { date: day, count: 2 }, d1).usage;
+  ok(!Budget.repairPlacesMonth(once, { date: day, count: 2 }, d1).changed, 'running it again changes nothing');
+}
+
 console.log('15. 90% of the monthly allowance pauses the automatic re-times and the look-ahead only');
 {
   const t = Date.UTC(2026, 10, 24, 5, 0, 0);

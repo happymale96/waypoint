@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '03077b48'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = 'fa101395'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -37,7 +37,7 @@
     fuelStations: [], // permanent station memory (see FUEL STOP below); in Export / Import, never shown in the Places tab
     lunch: null, // today's lunch-break state {date, startedAt, endedAt, skipped} (LUNCH BREAK below); stored as meta:lunchBreak
     loose: [], // items collected by a collect-only job, still with the driver (ITEMS WITH YOU below); collection "loose", in Export / Import
-    tt: { down: false, lastLiveAt: null }, // TomTom: out (limit / unavailable) since the last failed call; the last live re-time (TOMTOM below)
+    tt: { down: false, lastLiveAt: null, status: null, noRoute: 0 }, // status: the last failed answer's HTTP status; noRoute: 400 answers seen // TomTom: out (limit / unavailable) since the last failed call; the last live re-time (TOMTOM below)
     mem: null, // the learned travel times (TravelTimes pair memory), meta:travelMemory, in Export / Import
   };
 
@@ -46,7 +46,7 @@
       googleKey: '', tomtomKey: '', defaultLang: 'ms',
       templates: Object.assign({}, Messages.DEFAULT_TEMPLATES),
       etaPaddingMin: 10, dwellDefaults: Object.assign({}, DEFAULT_DWELL),
-      placesCallsToday: { date: todayStr(), count: 0 }, nav: 'waze', seeded: false, driverName: 'Calvin',
+      nav: 'waze', seeded: false, driverName: 'Calvin',
       usage: {}, // {routing, matrix, places}: requests per day and per UTC month on this device (Budget.bump), in Export / Import
       ttService: 'routing', // Settings -> TomTom service: 'routing' (default, Routing API) | 'matrix' (Matrix Routing v2)
       ttAllowance: Budget.ROUTING_ALLOWANCE, // TomTom Routing requests per month (free plan 20,000)
@@ -85,6 +85,7 @@
     const dwellRes = await runDwellMigration(false); // once per device (flag in meta/migrations)
     await runPinMigration(false); // once per device: every office-type place is pinned (no toast)
     await runTomTomMigration(); // once per device: TomTom service = Routing; the Bahasa Malaysia template's old default -> the new one
+    await runPlacesRepair(); // once per device: Google Places "this month" never below "today"
     await loadDays();
     S.loose = (await WPStore.list('loose')).filter((x) => x && x.id);
     await backfillLoose(); // once: today's / the latest closed day's collect-only jobs get their loose item
@@ -134,6 +135,7 @@
   // One-time (2026-11-24): every existing device moves to the Routing API (Matrix Routing's monthly allowance is used up), and
   // the Bahasa Malaysia template becomes the owner's own wording if it is still exactly the old default (an edited one stays).
   const TT_FLAG = 'ttRouting2026_11_24';
+  const PLACES_FLAG = 'placesMonth2026_11_24';
   async function runTomTomMigration() {
     const rec = (await WPStore.get('meta', 'migrations')) || { done: [] };
     let changed = false;
@@ -209,16 +211,23 @@
   }
 
   // ---------- Google calls counter ----------
+  // One record (settings.usage.places) holds today AND this month, bumped through Budget like every TomTom request.
   function bumpPlacesCalls() {
-    const c = S.settings.placesCallsToday;
-    if (c.date !== todayStr()) { c.date = todayStr(); c.count = 0; }
-    c.count++;
-    S.settings.usage = Budget.bump(S.settings.usage, 'places', Date.now(), 1); // the monthly total (Usage card)
+    S.settings.usage = Budget.countPlaces(S.settings.usage, Date.now());
     saveSettings();
   }
-  function placesCallsToday() {
-    const c = S.settings.placesCallsToday;
-    return c.date === todayStr() ? c.count : 0;
+  const placesCallsToday = () => Budget.placesCount(S.settings.usage, Date.now()).today;
+  // One-time (flag meta/migrations.placesMonth2026_11_24): today used to come from the old settings.placesCallsToday and
+  // this month from usage.places; raise this month to today where it is lower (never lowers), then drop the old counter.
+  async function runPlacesRepair() {
+    const rec = (await WPStore.get('meta', 'migrations')) || { done: [] };
+    if (rec[PLACES_FLAG]) return;
+    const r = Budget.repairPlacesMonth(S.settings.usage, S.settings.placesCallsToday, Date.now());
+    S.settings.usage = r.usage;
+    delete S.settings.placesCallsToday;
+    await saveSettings();
+    rec[PLACES_FLAG] = true;
+    await WPStore.set('meta', 'migrations', rec);
   }
 
   // ---------- TOMTOM (rules: budget.js; travel times: traveltimes.js) ----------
@@ -239,12 +248,15 @@
       if (!wasGuard && ttGuard()) ttRepaint();
     },
     ok() { if (S.tt.down) { S.tt.down = false; ttRepaint(); } },
-    down() { if (!S.tt.down) { S.tt.down = true; ttRepaint(); } },
+    down(status) { S.tt.status = status != null ? status : null; if (!S.tt.down) { S.tt.down = true; ttRepaint(); } },
+    bad() { S.tt.noRoute++; }, // a 400 (no route for that leg): that pair uses an estimate; the plan says so in the one notice
   });
   // TomTom counts as out while the last call failed, or while the current plan was made on estimates because TomTom refused
   const ttOut = () => S.tt.down || !!(S.plan && S.plan.provider && S.plan.provider.refused && S.plan.provider.estimatedOrder);
   function ttNotice() { // the ONE TomTom notice (down wins over the guard); the guard one only on the Route tab
-    if (ttOut()) return h('div', { class: 'tt-notice down', id: 'ttNotice', role: 'status' }, Budget.DOWN_MSG);
+    const pv = S.plan && S.plan.provider;
+    if (ttOut()) return h('div', { class: 'tt-notice down', id: 'ttNotice', role: 'status' }, Budget.downNotice(S.tt.down ? S.tt.status : pv && pv.downStatus));
+    if (pv && pv.noRoute) return h('div', { class: 'tt-notice down', id: 'ttNotice', role: 'status' }, Budget.NO_ROUTE_MSG);
     if (S.tab === 'route' && ttGuard()) return h('div', { class: 'tt-notice', id: 'ttNotice', role: 'status' }, Budget.GUARD_MSG);
     return null;
   }
@@ -868,6 +880,7 @@
       const points = Solver.pointsFor(input);
       const prevNoDetour = S.plan ? S.plan.noDetour : false;
       let got, routed = null;
+      const noRoute0 = S.tt.noRoute;
       if (ttService() === 'matrix') { // Settings -> TomTom service: Matrix (the old path: 3 time slices)
         banner('Asking TomTom for travel times (Matrix, 3 time slices)…', 'busy');
         got = await Providers.getMatricesOrEstimate(points, input.departAtISO, s.tomtomKey, { force: replan });
@@ -883,7 +896,7 @@
       const fetchedAt = new Date().toISOString();
       got.matrices.forEach((x) => { if (!x.fetchedAt) x.fetchedAt = fetchedAt; });
       const msgAt = S.plan && S.plan.ctx && S.plan.ctx.msgAt && replan ? S.plan.ctx.msgAt : {}; // MSG taps of the day (look-ahead rule)
-      S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices, dayKey, msgAt }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial, estimated: !!got.estimated, estimatedOrder: !!got.orderEstimated, refused: !!(routed ? routed.down : got.estimated), service: ttService() } };
+      S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices, dayKey, msgAt }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial, estimated: !!got.estimated, estimatedOrder: !!got.orderEstimated, refused: !!(routed ? routed.down : got.estimated), downStatus: routed ? (routed.down ? routed.down.status : null) : (got.error ? got.error.status : null), noRoute: S.tt.noRoute > noRoute0, service: ttService() } };
       if (routed) { S.plan.result = routed.res; S.plan.idx = 0; S.plan.alt = null; } else solveFresh();
       if (jobs !== allJobs) S.plan.ctx.jobs = allJobs; // lookups by job id still find the whole job (the solve above used the trimmed copy)
       if (prevPlan) {
@@ -1111,7 +1124,7 @@
           dur = r.seconds;
           // a sample only between two saved places (the fix within 150 m of one); typical time when TomTom returns it
           const a = nodeOf('fix', fix, null), b = nodeOf('target', target, nx0 ? nx0.placeId : (P.ctx.end && P.ctx.end.id));
-          if (a.pid != null && b.pid != null) { TT.remember(S.mem, a, b, now0, r, now0); saveMemory(); }
+          TT.remember(S.mem, a, b, now0, r, now0); saveMemory(); // a sample only between saved places, and only a typical time
         } catch (e) { return await fail(navigator.onLine === false || /network error/i.test(e.message || '') ? 'offline' : 'routing'); }
       }
       const cur = S.plan === P ? curPlan() : null;
@@ -2768,7 +2781,7 @@
 
   // Settings -> Usage: TomTom Routing (and Matrix, only when used) and Google Places, today and this month, each with a thin bar.
   function usageCard(s) {
-    const L = Budget.usageLines(s.usage, Date.now(), ttAllowance(), placesCallsToday());
+    const L = Budget.usageLines(s.usage, Date.now(), ttAllowance());
     const bar = (id, pct) => h('div', { class: 'usage-bar', id }, h('div', { class: 'usage-fill' + (pct >= 90 ? ' high' : ''), style: 'width:' + pct.toFixed(1) + '%' }));
     const allow = h('input', { type: 'number', id: 'ttAllowance', inputmode: 'numeric', min: '1', value: String(ttAllowance()) });
     allow.addEventListener('change', () => { s.ttAllowance = Budget.allowanceOf(allow.value); allow.value = String(s.ttAllowance); saveSettings(); render(); });
@@ -2797,7 +2810,8 @@
       field('TomTom service', sel('ttServiceSel', 'ttService', [['routing', 'Routing (default)'], ['matrix', 'Matrix']], 'routing')),
       field('After each stop, look for a faster order', sel('afterStopSel', 'afterStop', [['auto', 'Switch automatically'], ['ask', 'Ask me'], ['off', 'Off']], 'auto')),
       h('div', { class: 'row', style: 'margin-top:10px;align-items:center' }, h('span', { class: 'grow', id: 'learnedCount' }, 'Learned travel times: ' + n + ' pair' + (n === 1 ? '' : 's')), forgetTimesAsk ? null : forget),
-      forgetTimesAsk ? forget : null);
+      forgetTimesAsk ? forget : null,
+      h('div', { class: 'muted', id: 'learnedLine' }, TT.learnedLine(S.mem, Date.now())));
   }
 
   // Settings -> Lunch break (the driver's own break; a customer's lunch is the place's closed window). Device-stored, in Export / Import.
@@ -2854,7 +2868,7 @@
         for (const d of dl.records) { S.days[d.date] = d; await WPStore.set('daylogs', d.date, d); }
       }
       if (data.settings) {
-        const keep = { googleKey: S.settings.googleKey, tomtomKey: S.settings.tomtomKey, placesCallsToday: S.settings.placesCallsToday };
+        const keep = { googleKey: S.settings.googleKey, tomtomKey: S.settings.tomtomKey };
         if (!data.settings.usage) keep.usage = S.settings.usage; // older exports have no counters: the device's are kept
         S.settings = Object.assign(defaultSettings(), data.settings, keep);
         delete S.settings.tomtomUsage;

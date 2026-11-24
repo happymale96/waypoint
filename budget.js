@@ -31,6 +31,14 @@
   const DOWN_MSG = 'TomTom unavailable or monthly allowance used up - using estimated times';
   const GUARD_MSG = 'TomTom allowance nearly used - live times paused, PLAN still works';
   const ESTIMATED_ORDER = 'Estimated order - TomTom unavailable';
+  // The ONE TomTom notice names what happened (no raw HTTP text). status = the failed answer's HTTP status (0 = unreachable).
+  const NO_ROUTE_MSG = 'TomTom could not route a leg - using estimated times for it';
+  function downNotice(status) {
+    if (status === 403) return 'TomTom refused the key or the monthly allowance is used up - using estimated times';
+    if (status === 429) return 'TomTom is busy (too many requests) - using estimated times';
+    if (status === 400) return NO_ROUTE_MSG;
+    return DOWN_MSG;
+  }
 
   // ---------- usage counters ----------
   const dayKey = (ms) => new Date(ms + 8 * 3600e3).toISOString().slice(0, 10); // Malaysia date
@@ -50,13 +58,28 @@
     u[kind] = addCount(u[kind], ms, n);
     return u;
   }
+  // Google Places: ONE record (usage.places) holds today AND this month, counted through bump like TomTom.
+  const countPlaces = (usage, ms) => bump(usage, 'places', ms, 1);
+  const placesCount = (usage, ms) => countOf(usage && usage.places, ms);
+  // One-time repair: today and this month used to come from two counters (the old settings.placesCallsToday {date, count}
+  // and usage.places). If this month is lower than today for the current day, raise it (and today) - never lower a number.
+  // legacy = the old {date (local yyyy-mm-dd), count} | null. Returns {usage, changed}.
+  function repairPlacesMonth(usage, legacy, ms) {
+    const c = placesCount(usage, ms);
+    const old = legacy && legacy.date === dayKey(ms) ? Number(legacy.count) || 0 : 0;
+    const today = Math.max(c.today, old);
+    if (c.month >= today && c.today >= today) return { usage, changed: false };
+    const u = Object.assign({}, usage || {});
+    u.places = { day: dayKey(ms), d: today, month: monthKey(ms), m: Math.max(c.month, today) };
+    return { usage: u, changed: true };
+  }
   const allowanceOf = (a) => { const n = Math.round(Number(a)); return isFinite(n) && n > 0 ? n : ROUTING_ALLOWANCE; };
   const guardHit = (usage, ms, allowance) => countOf(usage && usage.routing, ms).month >= GUARD_RATIO * allowanceOf(allowance);
   const n0 = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  // The Usage card's lines: {routing, places, matrix (null while 0), routingPct, placesPct}
-  function usageLines(usage, ms, allowance, placesToday) {
+  // The Usage card's lines: {routing, places, matrix (null while 0), routingPct, placesPct}. Every number comes from `usage`.
+  function usageLines(usage, ms, allowance) {
     const r = countOf(usage && usage.routing, ms), p = countOf(usage && usage.places, ms), mx = countOf(usage && usage.matrix, ms);
-    const a = allowanceOf(allowance), pd = placesToday != null ? placesToday : p.today;
+    const a = allowanceOf(allowance), pd = p.today;
     return {
       routing: 'TomTom Routing   ' + n0(r.today) + ' today · ' + n0(r.month) + ' this month of ' + n0(a),
       places: 'Google Places    ' + n0(pd) + ' today · ' + n0(p.month) + ' this month  (daily guard ' + PLACES_DAILY_GUARD + ')',
@@ -136,8 +159,8 @@
 
   return {
     ROUTING_ALLOWANCE, GUARD_RATIO, PLACES_DAILY_GUARD, MIN_GAP_MS, PERIOD_MS, ORIGIN_KEEP_MS, ROAD_FACTOR, ALWAYS, AUTO,
-    DOWN_MSG, GUARD_MSG, ESTIMATED_ORDER,
-    dayKey, monthKey, countOf, addCount, bump, allowanceOf, guardHit, usageLines,
+    DOWN_MSG, GUARD_MSG, ESTIMATED_ORDER, NO_ROUTE_MSG, downNotice,
+    dayKey, monthKey, countOf, addCount, bump, countPlaces, placesCount, repairPlacesMonth, allowanceOf, guardHit, usageLines,
     retimeDecision, isAlways, originKept, afterStopMode,
     distanceM, speedFor, estMinutesKm, estSec, estMetres, hasEst, estStops,
   };

@@ -53,7 +53,8 @@ console.log('16. regression (24 Nov): TomTom unavailable -> the estimated order 
   console.log('calculateRoute: URL, departAt, typical time, 429 retries, the one friendly error, the usage hook');
   const seen = { count: [], ok: 0, down: [] };
   Providers.setTomTomHook({ count: (k, n) => seen.count.push(k + ':' + n), ok: () => { seen.ok++; }, down: (st) => seen.down.push(st) });
-  Providers.RETRY_MS.splice(0, Providers.RETRY_MS.length, 1, 1); // no real waiting in the test
+  ok(Providers.RETRY_MS.length === 1, 'a 429 is retried at most once (one retry delay)', Providers.RETRY_MS);
+  Providers.RETRY_MS.splice(0, Providers.RETRY_MS.length, 1); // no real waiting in the test (still one retry)
   const urls = [];
   let script = [];
   global.fetch = async (url, init) => {
@@ -74,13 +75,14 @@ console.log('16. regression (24 Nov): TomTom unavailable -> the estimated order 
     await Providers.routeLeg(A, B, Date.UTC(2026, 10, 24, 9, 10), 'KEY'); // 17:10 MYT
     ok(/departAt=2026-11-24T17%3A10%3A00%2B08%3A00/.test(urls[1].url), 'a future departure: RFC 3339 with the +08:00 offset', urls[1].url);
     ok(seen.count.join() === 'routing:1,routing:1' && seen.ok === 2, 'every response counted as a Routing request', seen.count);
-    script = [429, 429];
+    script = [429];
     const r3 = await Providers.routeLeg(A, B, null, 'KEY');
-    ok(r3.seconds === 3000 && urls.length === 5, '429 twice: that leg is retried and answered on the 3rd try', urls.length);
+    ok(r3.seconds === 3000 && urls.length === 4, '429 once: that leg is retried ONCE and answered on the 2nd try', urls.length);
     script = [429, 429, 429];
     let err = null;
     try { await Providers.routeLeg(A, B, null, 'KEY'); } catch (e) { err = e; }
-    ok(err && err.kind === 'limit' && err.message === Budget.DOWN_MSG && urls.length === 8, '429 after 2 retries: the friendly "unavailable" error (3 requests)', err && err.message);
+    ok(err && err.kind === 'limit' && err.message === Budget.DOWN_MSG && urls.length === 6 && seen.down.slice(-1)[0] === 429, '429 twice: never a 2nd retry, the friendly "unavailable" error (2 requests), reported down 429', { n: urls.length, m: err && err.message });
+    script = [];
     script = [403];
     err = null;
     try { await Providers.routeLeg(A, B, null, 'KEY'); } catch (e) { err = e; }
@@ -91,6 +93,78 @@ console.log('16. regression (24 Nov): TomTom unavailable -> the estimated order 
     ok(err && err.kind !== 'limit' && /400/.test(err.message), '400 (no route): an ordinary error, not "TomTom down"', err && err.message);
     ok(!urls.some((x) => /matrix/.test(x.url)), 'no Matrix request by default');
   } finally { Date.now = realNow; }
+
+  console.log('B1. computeTravelTimeFor=all; the learned sample is historicTrafficTravelTimeInSeconds, nothing when it is absent');
+  {
+    const Pa = { lat: 3.1, lng: 101.6 }, Pb = { lat: 3.2, lng: 101.7 };
+    const u = new URL(Providers.routeUrl(Pa, Pb, null, 'KEY', Date.UTC(2026, 10, 24, 2, 0)));
+    ok(u.searchParams.get('computeTravelTimeFor') === 'all' && u.searchParams.get('traffic') === 'true', 'the request asks for all travel times (parsed back with new URL)', u.search);
+    let body = { routes: [{ summary: { lengthInMeters: 9000, travelTimeInSeconds: 2400, historicTrafficTravelTimeInSeconds: 1500 } }] };
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => body });
+    const NOWB = Date.UTC(2026, 10, 24, 2, 5);
+    const a = { key: 'A', pid: 'A', lat: Pa.lat, lng: Pa.lng }, b = { key: 'B', pid: 'B', lat: Pb.lat, lng: Pb.lng };
+    const mem = TT.emptyMemory();
+    const r = await Providers.routeLeg(Pa, Pb, null, 'KEY');
+    TT.remember(mem, a, b, NOWB, r, NOWB);
+    ok(mem.pairs['A>B@day'] && mem.pairs['A>B@day'][0].s === 1500 && r.seconds === 2400, 'stored 1500 (historic), not 2400 (live)', mem.pairs);
+    ok(TT.learnedLine(mem, NOWB) === 'Learned: 1 pair · last typical time from TomTom: today 10:05', 'Settings line after a typical time', TT.learnedLine(mem, NOWB));
+    body = { routes: [{ summary: { lengthInMeters: 9000, travelTimeInSeconds: 2600 } }] }; // no historic field
+    const r2 = await Providers.routeLeg(Pb, Pa, null, 'KEY');
+    TT.remember(mem, b, a, NOWB + 60000, r2, NOWB + 60000);
+    ok(r2.typicalSeconds === null && !mem.pairs['B>A@day'] && mem.pairs['A>B@day'].length === 1, 'no historic field: nothing stored for that pair (the live 2600 is not stored)', mem.pairs);
+    ok(mem.last && mem.last.typical === false, 'the absence is recorded', mem.last);
+    ok(TT.learnedLine(mem, NOWB + 60000) === 'Learned: 1 pair · last typical time from TomTom: today 10:05 · last reply had no typical time', 'Settings line names the missing typical time', TT.learnedLine(mem, NOWB + 60000));
+    ok(TT.learnedLine(mem, NOWB + 86400e3).indexOf('last typical time from TomTom: 24 Nov') > 0 && TT.learnedLine(TT.emptyMemory(), NOWB) === 'Learned: 0 pairs · last typical time from TomTom: none yet', 'another day -> a date; nothing yet -> "none yet"');
+    const back = TT.normaliseMemory(JSON.parse(JSON.stringify(mem)));
+    ok(back.lastTypicalAt === NOWB && back.last.typical === false, 'the record survives a save / Import (normaliseMemory)', back);
+  }
+
+  console.log('B2. departAt parsed back with new URL equals the intended value exactly');
+  {
+    const now = Date.UTC(2026, 10, 24, 2, 0); // 10:00 MYT
+    const dep = (ms) => new URL(Providers.routeUrl({ lat: 3, lng: 101 }, { lat: 3.1, lng: 101.1 }, ms, 'KEY', now)).searchParams.get('departAt');
+    ok(dep(Date.UTC(2026, 10, 24, 9, 10)) === '2026-11-24T17:10:00+08:00', '17:10 MYT -> 2026-11-24T17:10:00+08:00 (the + survives: sent as %2B)', dep(Date.UTC(2026, 10, 24, 9, 10)));
+    ok(dep(Date.UTC(2026, 10, 24, 15, 30)) === '2026-11-24T23:30:00+08:00', '23:30 MYT (15:30 UTC) -> 2026-11-24T23:30 (the Malaysia wall clock, whatever the device zone)', dep(Date.UTC(2026, 10, 24, 15, 30)));
+    ok(dep(Date.UTC(2026, 10, 24, 16, 30)) === '2026-11-25T00:30:00+08:00', '00:30 MYT the next day (16:30 UTC) -> 2026-11-25T00:30', dep(Date.UTC(2026, 10, 24, 16, 30)));
+    ok(dep(null) === 'now' && dep(now - 3600e3) === 'now' && dep(now) === 'now' && dep(now + 30000) === 'now', 'not in the future (or under a minute ahead): "now", never a past time');
+    ok(/^\d{4}-\d\d-\d\dT\d\d:\d\d:00\+08:00$/.test(dep(now + 2 * 3600e3)) && !/ /.test(dep(now + 2 * 3600e3)), 'RFC 3339, no space', dep(now + 2 * 3600e3));
+  }
+
+  console.log('B3. 400 / 403 / 429 from TomTom during PLAN: the plan completes, nothing stored, at most one retry, one plain notice');
+  {
+    const pl = (id, lat, lng) => ({ id, name: id, lat, lng, type: 'factory', dwellMin: 30, closedWindows: [] });
+    const places = { p1: pl('p1', 3.00, 101.60), p2: pl('p2', 3.05, 101.65), p3: pl('p3', 3.10, 101.70), end: Object.assign(pl('end', 3.15, 101.75), { type: 'home', dwellMin: 0 }) };
+    const job = (id, o) => Object.assign({ id, pickups: [], deliveryPlaceId: null, notes: '', urgent: false, urgentRank: 0, arriveBefore: null, arriveAfter: null, status: 'pending', createdAt: id }, o);
+    const jobs = [job('j1', { inHandItem: 'a', deliveryPlaceId: 'p1' }), job('j2', { inHandItem: 'b', deliveryPlaceId: 'p2' }), job('j3', { inHandItem: 'c', deliveryPlaceId: 'p3' })];
+    const start = { lat: 2.95, lng: 101.55 };
+    const NOW = Date.UTC(2026, 10, 24, 1, 0);
+    const nodeOf = (key, p, pid) => ({ key, pid: pid || null, lat: p.lat, lng: p.lng });
+    Providers.RETRY_MS.splice(0, Providers.RETRY_MS.length, 1);
+    for (const st of [400, 403, 429]) {
+      let n = 0; const hk = { down: [], bad: 0, count: 0 };
+      Providers.setTomTomHook({ count: () => { hk.count++; }, ok: () => {}, down: (s) => hk.down.push(s), bad: () => { hk.bad++; } });
+      global.fetch = async () => { n++; return { ok: false, status: st, json: async () => ({ detailedError: { code: 'X', message: 'refused' } }) }; };
+      const mem = TT.emptyMemory();
+      const realNow2 = Date.now; Date.now = () => NOW;
+      let r = null, thrown = null;
+      try {
+        r = await TT.planRoute({
+          Solver, input: { start, end: places.end, jobs, places, departAtISO: new Date(NOW).toISOString(), noDetour: false }, nowMs: NOW, mem,
+          fetchLeg: (a, b, at) => Providers.routeLeg(a, b, at, 'KEY'),
+          start: nodeOf('__start__', start), end: nodeOf('__end__', places.end, 'end'), nodeOfStop: (pid) => nodeOf(pid, places[pid], pid),
+        });
+      } catch (e) { thrown = e; } finally { Date.now = realNow2; }
+      const pairs = 3 + 6 + 3; // start -> 3 stops, 3 x 2 between stops, 3 stops -> end (live table, 3 stops)
+      ok(!thrown && r && !r.res.error && r.res.plans[0].order.length === 3 && r.estimated, st + ': PLAN completes on the estimated fallback (3 stops ordered)', thrown && thrown.message);
+      ok(Object.keys(mem.pairs).length === 0, st + ': no failed answer stored as a learned sample', mem.pairs);
+      if (st === 400) ok(n === pairs && hk.bad === pairs && !hk.down.length, '400: one request per pair, no retry, not "down"', { n, bad: hk.bad });
+      if (st === 403) ok(n <= 4 && hk.down.every((s) => s === 403), '403: no retry; fetching stops at the refusal (<= 4 in flight)', n);
+      if (st === 429) ok(n <= 8 && hk.down.every((s) => s === 429), '429: at most ONE retry per leg; fetching stops (<= 4 legs x 2)', n);
+    }
+    const msgs = [400, 403, 429].map(Budget.downNotice);
+    ok(msgs[0] === Budget.NO_ROUTE_MSG && /refused the key or the monthly allowance/.test(msgs[1]) && /busy \(too many requests\)/.test(msgs[2]) && msgs.every((m) => !/HTTP|\d{3}/.test(m)), 'the one notice names what happened, plainly (no raw HTTP text)', msgs);
+    ok(Budget.downNotice(0) === Budget.DOWN_MSG && Budget.downNotice(503) === Budget.DOWN_MSG, 'unreachable / 5xx: the general notice');
+  }
 
   console.log('\n' + passes + ' passed, ' + failures + ' failed');
   process.exit(failures ? 1 : 0);

@@ -98,6 +98,8 @@
       const list = P[k].filter((s) => s && isFinite(s.s)).slice(-MAX_SAMPLES).map((s) => ({ s: Math.round(s.s), m: s.m != null && isFinite(s.m) ? Math.round(s.m) : null, at: s.at != null ? s.at : null }));
       if (list.length) out.pairs[k] = list;
     });
+    if (x && x.lastTypicalAt != null && isFinite(x.lastTypicalAt)) out.lastTypicalAt = Number(x.lastTypicalAt);
+    if (x && x.last && isFinite(x.last.at)) out.last = { at: Number(x.last.at), typical: x.last.typical !== false };
     return out;
   }
 
@@ -151,11 +153,35 @@
     await Promise.all(Array.from({ length: Math.min(limit, jobs.length) }, worker));
     return { results, down, started };
   }
-  // the sample a TomTom answer leaves (B3): typical time when returned, else the returned time
-  const sampleOf = (r, atMs) => ({ s: r.typicalSeconds != null && isFinite(r.typicalSeconds) ? r.typicalSeconds : r.seconds, m: r.metres, at: atMs });
+  // the sample a TomTom answer leaves: ONLY the typical time (historicTrafficTravelTimeInSeconds, computeTravelTimeFor=all).
+  // No typical time in the answer = no sample (the live figure is never stored as if it were typical).
+  const hasTypical = (r) => !!r && r.typicalSeconds != null && isFinite(r.typicalSeconds);
+  const sampleOf = (r, atMs) => (hasTypical(r) ? { s: r.typicalSeconds, m: r.metres, at: atMs } : null);
+  // r = a successful answer {seconds, metres, typicalSeconds|null}. mem.last = {at, typical} (the most recent answer),
+  // mem.lastTypicalAt = when the last typical time came back (Settings -> Travel times).
   function remember(mem, a, b, departMs, r, nowMs) {
-    if (!mem || !r || a.pid == null || b.pid == null || a.pid === b.pid) return;
+    if (!mem || !r) return;
+    const typ = hasTypical(r);
+    mem.last = { at: nowMs, typical: typ };
+    if (typ) mem.lastTypicalAt = nowMs;
+    if (!typ || !a || !b || a.pid == null || b.pid == null || a.pid === b.pid) return;
     addSample(mem, a.pid, b.pid, bucketOf(departMs), sampleOf(r, nowMs));
+  }
+  // Settings -> Travel times: "Learned: N pairs · last typical time from TomTom: today HH:MM | 23 Nov | none yet"
+  // (+ " · last reply had no typical time" when the most recent answer had none). Malaysia time.
+  const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  function learnedLine(mem, nowMs) {
+    const n = pairCount(mem), at = mem && mem.lastTypicalAt;
+    let when = 'none yet';
+    if (at != null && isFinite(at)) {
+      const d = new Date(at + MYT_MS), now = new Date(nowMs + MYT_MS);
+      const p2 = (x) => (x < 10 ? '0' : '') + x;
+      when = d.toISOString().slice(0, 10) === now.toISOString().slice(0, 10)
+        ? 'today ' + p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes())
+        : d.getUTCDate() + ' ' + MON[d.getUTCMonth()] + (d.getUTCFullYear() !== now.getUTCFullYear() ? ' ' + d.getUTCFullYear() : '');
+    }
+    return 'Learned: ' + n + ' pair' + (n === 1 ? '' : 's') + ' · last typical time from TomTom: ' + when +
+      (mem && mem.last && mem.last.typical === false ? ' · last reply had no typical time' : '');
   }
 
   // ---------- the plan's table ----------
@@ -416,7 +442,7 @@
   return {
     BUCKETS, LABEL, MAX_SAMPLES, SNAP_M, CONCURRENCY, CHECK_RATIO, SWITCH_MIN_SEC, FULL_REFRESH_MAX, LIVE_TABLE_MAX, ORIGIN, END,
     bucketOf, bucketDepart, planBucket, minOfDay,
-    emptyMemory, memKey, medianSample, addSample, learned, pairCount, normaliseMemory, sampleOf, remember,
+    emptyMemory, memKey, medianSample, addSample, learned, pairCount, normaliseMemory, sampleOf, remember, learnedLine,
     snap, neededPairs, runFetches, buildTable, checkLegs, twoStep, planRoute, agreement, nextCandidates, lookAhead, decide, reorderText, reorderStops, solverAdapter,
   };
 });

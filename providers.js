@@ -22,14 +22,14 @@
   }
 
   // ---------- TomTom usage hook (the app counts every request per day / month and tracks the "down" state) ----------
-  // hook = {count(kind 'routing'|'matrix', n), ok(), down(status)}. Every response that came back is counted (whatever its status).
+  // hook = {count(kind 'routing'|'matrix', n), ok(), down(status), bad(400)}. Every response that came back is counted (whatever its status).
   let hook = null;
   function setTomTomHook(h) { hook = h || null; }
   const hookCall = (name, ...a) => { try { if (hook && hook[name]) hook[name](...a); } catch (e) { /* never break a lookup */ } };
   // 401 / 403 (bad key, not allowed, allowance used up) / 429 (after the retries) / 5xx / unreachable: one friendly error
   const isDown = (status) => status === 0 || status === 401 || status === 403 || status === 429 || status >= 500;
   const downError = (status) => new ProviderError('TomTom', Budget.DOWN_MSG, 'limit', status);
-  const RETRY_MS = [1500, 3000]; // a 429 waits and retries that leg up to 2 times
+  const RETRY_MS = [1500]; // a 429 waits and retries that leg ONCE (never more); a second 429 = TomTom out
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ---------- TomTom Routing API: one leg ----------
@@ -58,7 +58,8 @@
       if (!res.ok && isDown(res.status)) { hookCall('down', res.status); throw downError(res.status); }
       if (!res.ok) {
         const de = body.detailedError || (body.error && typeof body.error === 'object' ? body.error : null);
-        throw new ProviderError('TomTom', 'HTTP ' + res.status + (de ? ' — ' + (de.message || de.code) : ''));
+        if (res.status === 400) hookCall('bad', 400); // no route / bad input for this leg: that pair gets no real time
+        throw new ProviderError('TomTom', 'HTTP ' + res.status + (de ? ' — ' + (de.message || de.code) : ''), null, res.status);
       }
       hookCall('ok');
       const sm = body.routes && body.routes[0] && body.routes[0].summary;

@@ -99,7 +99,7 @@ const INIT = `(() => {
       const k = km(a, b);
       let s = Math.round(k * 1.3 / 40 * 3600);
       if (window.__slow && same(a, window.__slow[0]) && same(b, window.__slow[1])) s += 3 * 3600;
-      return new Response(JSON.stringify({ formatVersion: '0.0.12', routes: [{ summary: { lengthInMeters: Math.round(k * 1300), travelTimeInSeconds: s, trafficDelayInSeconds: 0, departureTime: '', arrivalTime: '' } }] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ formatVersion: '0.0.12', routes: [{ summary: { lengthInMeters: Math.round(k * 1300), travelTimeInSeconds: s, historicTrafficTravelTimeInSeconds: s, trafficDelayInSeconds: 0, departureTime: '', arrivalTime: '' } }] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     if (url.includes('api.tomtom.com')) { window.__mx++; return new Response('{}', { status: 500 }); }
     if (url.includes('places.googleapis.com')) { window.__places++; return new Response(JSON.stringify({ places: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } }); }
@@ -291,7 +291,7 @@ async function main() {
     const left = (await pending()).length;
     await plan(await ev('WaypointDebug.S.plan.result.plans[0].stops.length') + 1); // the done stops stay on top, + the new stop G
     const notices = await ev('[...document.querySelectorAll("#ttNotice")].map((e) => e.textContent)');
-    check(notices.length === 1 && notices[0] === 'TomTom unavailable or monthly allowance used up - using estimated times', 'ONE notice with the new text', notices);
+    check(notices.length === 1 && notices[0] === 'TomTom refused the key or the monthly allowance is used up - using estimated times', 'ONE notice, naming what happened (403)', notices);
     check(!/08:00|resets/.test(await ev('document.body.innerText')), 'no "08:00" / reset wording anywhere on the page');
     check(await ev('WaypointDebug.S.plan.result.plans[0].stops.filter((s) => !s.status).length') === left + 1, 'a route is still produced (with the new stop)');
     check(await ev('(document.getElementById("estHeader") || {}).textContent') === 'Estimated order - TomTom unavailable', 'the header shows "Estimated order - TomTom unavailable"');
@@ -313,6 +313,8 @@ async function main() {
     check(await ev('!document.getElementById("usageMatrix")') && await ev('window.__mx') === 0, 'Matrix: 0 calls, not shown');
     check(await ev('document.querySelectorAll("#usageCard .usage-bar").length') === 2, 'a thin bar for each');
     check(/^Learned travel times: \d+ pairs?$/.test(await ev('document.getElementById("learnedCount").textContent')), 'Settings: "Learned travel times: N pairs"', await ev('document.getElementById("learnedCount").textContent'));
+    const ll = await ev('document.getElementById("learnedLine").textContent');
+    check(/^Learned: [1-9]\d* pairs? · last typical time from TomTom: today \d\d:\d\d$/.test(ll) && ll.indexOf('Learned: ' + await ev('TravelTimes.pairCount(WaypointDebug.S.mem)') + ' pair') === 0, 'Settings -> Travel times: "Learned: N pairs · last typical time from TomTom: today HH:MM"', ll);
     check(await ev('window.__other') === 0, 'no other network calls left the page');
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {
