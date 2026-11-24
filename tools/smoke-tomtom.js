@@ -5,8 +5,9 @@
  * TomTom (calculateRoute and Matrix are counted per endpoint, every departAt recorded; one leg can be made very slow; any
  * request touching a chosen point can answer 403), geolocation incl. watchPosition, the clipboard and the clock (pinned to
  * 24 Nov 2026 10:00 Malaysia time). Walks:
- *   1. PLAN 6 stops A..F from O (my location) to E: exactly 49 Routing calls (42 table + 7 check), 0 Matrix, the progress
- *      text "Getting travel times n of N…", no "est." on any ETA.     2. PLAN again: 7 calls (the learned table + the check).
+ *   1. PLAN 6 stops A..F from O (my location) to E: exactly 48 Routing calls (42 table + 7 check legs, the first of them the
+ *      table's own O -> first stop "now" request, answered from memory), 0 Matrix, the banner = 48, the progress text
+ *      "Getting travel times n of N…", no "est." on any ETA.     2. PLAN again: 7 calls (the learned table + the check).
  *   3. 60 GPS-watch updates over a mocked 10 minutes: at most 1 Routing call (the 10-minute re-time).
  *   4. DONE on the first stop (5 pending -> full refresh): exactly 5 + 20 + 5 = 30 calls; a later leg made very slow -> the
  *      order changes by itself, the "Order updated … · Undo" notice, Replans +1; Undo -> the previous order back.
@@ -14,6 +15,14 @@
  *   6. MSG on a customer stop: the copied text is the owner's wording (Salam …, sebelum pukul …, Tq👍).
  *   7. 403 for a new pair: the ONE notice with the new text (no "08:00"), a route, "Estimated order" in the header, no look-ahead.
  *   8. Settings "Usage": TomTom Routing and Google Places, today and this month, equal to the mock's counts.
+ *   9. A fresh world: 3 stops + the end point (Home) from a GPS origin that is no saved place, one leg answered 429 once:
+ *      mocked fetches == the banner number == the Usage counter's rise (12 pairs + 1 retry = 13), the same after opening the
+ *      Route tab again; then PLAN from the Office place (the Route tab's first re-time from the GPS fix is part of the
+ *      PLAN): 12 + 1 = 13 again, and the banner says so.
+ *  10. A fresh world (5 stops from a GPS origin that is no saved place): DONE, a PLAN on the running day from a point off
+ *      every stop, DONE, End day with 3 stops remaining -> the km tile shows km (not "unavailable"), 0 TomTom requests for
+ *      it; Close day; the history row has km and no "day(s) without km"; PLAN again the same date at 19:54 -> the km stays;
+ *      a DONE after it merges into the closed day and the km grows.
  * Exit 1 on failure. Needs Node 22+ (global WebSocket / fetch) and Chrome or Edge (set CHROME=<path> to choose one).
  */
 'use strict';
@@ -52,6 +61,15 @@ PLACES.forEach((p) => { SEED['waypoint:places:' + p.id] = p; });
 ['pA', 'pB', 'pC', 'pD', 'pF', 'pH', 'pG'].forEach((pid, i) => { SEED['waypoint:jobs:j' + (i + 1)] = job('j' + (i + 1), pid, 'Part ' + (i + 1)); });
 const O = PLACES[0];
 const GPS0 = { lat: O.lat, lng: O.lng, accuracy: 15 }; // "My location" = the office
+// step 9's world: three customer stops A, B, C and Home; "My location" is a point that is no saved place (about 4 km W of O)
+const GPS3 = { lat: 3.0900, lng: 101.7000, accuracy: 15 };
+const WORLD3 = { 'waypoint:settings:main': Object.assign({}, SEED['waypoint:settings:main']) };
+PLACES.forEach((p) => { WORLD3['waypoint:places:' + p.id] = p; });
+['pA', 'pB', 'pC'].forEach((pid, i) => { WORLD3['waypoint:jobs:j' + (i + 1)] = job('j' + (i + 1), pid, 'Box ' + (i + 1)); });
+// step 10's world: five customer stops, the same GPS origin
+const WORLD5 = { 'waypoint:settings:main': Object.assign({}, SEED['waypoint:settings:main']) };
+PLACES.forEach((p) => { WORLD5['waypoint:places:' + p.id] = p; });
+['pA', 'pB', 'pC', 'pD', 'pF'].forEach((pid, i) => { WORLD5['waypoint:jobs:j' + (i + 1)] = job('j' + (i + 1), pid, 'Crate ' + (i + 1)); });
 
 const INIT = `(() => {
   const RealDate = Date;
@@ -87,7 +105,7 @@ const INIT = `(() => {
   const realFetch = window.fetch.bind(window);
   const same = (p, q) => Math.abs(p.lat - q.lat) < 1e-4 && Math.abs(p.lng - q.lng) < 1e-4;
   // __rt: every Routing call {a, b, departAt}; __mx: Matrix calls; __slow: [from, to] made 3 h slower; __deny: a point -> 403
-  window.__rt = []; window.__mx = 0; window.__places = 0; window.__other = 0; window.__slow = null; window.__deny = null;
+  window.__rt = []; window.__mx = 0; window.__places = 0; window.__other = 0; window.__slow = null; window.__deny = null; window.__once429 = null;
   window.fetch = async (url, init) => {
     url = String(url);
     if (url.includes('api.tomtom.com/routing/1/calculateRoute/')) {
@@ -95,6 +113,7 @@ const INIT = `(() => {
       const a = { lat: q[0], lng: q[1] }, b = { lat: q[2], lng: q[3] };
       const dep = decodeURIComponent((url.split('departAt=')[1] || '').split('&')[0]);
       window.__rt.push({ a, b, departAt: dep, at: Date.now() });
+      if (window.__once429 && same(a, window.__once429[0]) && same(b, window.__once429[1])) { window.__once429 = null; return new Response('{}', { status: 429, headers: { 'Content-Type': 'application/json' } }); }
       if (window.__deny && (same(a, window.__deny) || same(b, window.__deny))) return new Response(JSON.stringify({ detailedError: { code: 'Forbidden', message: 'You do not have enough credits to perform this action' } }), { status: 403, headers: { 'Content-Type': 'application/json' } });
       const k = km(a, b);
       let s = Math.round(k * 1.3 / 40 * 3600);
@@ -211,9 +230,10 @@ async function main() {
     check(await ev('new Date().toISOString()').then((t) => t.startsWith('2026-11-24T02:0')), 'the clock is pinned to 24 Nov 2026 10:00 MYT');
     await plan(6);
     const c1 = await ev('window.__rt.map((c) => c.departAt)');
-    check(c1.length === 49 && await ev('window.__mx') === 0, 'exactly 49 Routing calls (42 table + 7 check) and 0 Matrix calls', { routing: c1.length, matrix: await ev('window.__mx') });
-    check(c1.slice(0, 43).every((d) => d === 'now') && c1.slice(43).every((d) => /^2026-11-24T1[0-3]:[0-5][0-9]:00\+08:00$/.test(d)), 'the table departs now (10:00 is inside its Day bucket); the first check leg departs now, the later ones at their planned departures (+08:00)', [c1[0], c1[42], c1[43], c1[48]]);
+    check(c1.length === 48 && await ev('window.__mx') === 0, 'exactly 48 Routing calls (42 table + 7 check legs, the first one answered from memory) and 0 Matrix calls', { routing: c1.length, matrix: await ev('window.__mx') });
+    check(c1.slice(0, 42).every((d) => d === 'now') && c1.slice(42).every((d) => /^2026-11-24T1[0-3]:[0-5][0-9]:00\+08:00$/.test(d)), 'the table departs now (10:00 is inside its Day bucket); the check legs after the first at their planned departures (+08:00)', [c1[0], c1[41], c1[42], c1[47]]);
     const banners = await ev('window.__banners');
+    check(banners.filter((b) => /^Travel times/.test(b)).slice(-1)[0] === 'Travel times: TomTom Routing — 48 requests (route checked).OK', 'the banner says 48 requests (route checked)', banners.filter((b) => /^Travel times/.test(b)).slice(-1));
     check(banners.some((b) => /^Getting travel times \d+ of \d+…/.test(b)), 'the progress text "Getting travel times n of N…" appears', banners.filter((b) => /Getting/.test(b)).slice(-2));
     check(banners.some((b) => /Getting travel times 42 of 42…/.test(b)), '... counting up to 42 of 42 for the table');
     const etas = await etaTexts();
@@ -316,6 +336,89 @@ async function main() {
     const ll = await ev('document.getElementById("learnedLine").textContent');
     check(/^Learned: [1-9]\d* pairs? · last typical time from TomTom: today \d\d:\d\d$/.test(ll) && ll.indexOf('Learned: ' + await ev('TravelTimes.pairCount(WaypointDebug.S.mem)') + ' pair') === 0, 'Settings -> Travel times: "Learned: N pairs · last typical time from TomTom: today HH:MM"', ll);
     check(await ev('window.__other') === 0, 'no other network calls left the page');
+
+    console.log('9. A fresh world: 3 stops + Home from a GPS origin (no saved place), one leg answered 429 once');
+    await send('Page.navigate', { url: appUrl.replace('index.html', '__blank') }); // same origin, no app: nothing writes the storage meanwhile
+    await sleep(500);
+    await ev('(() => { localStorage.clear(); const w = ' + JSON.stringify(WORLD3) + '; Object.keys(w).forEach((k) => localStorage.setItem(k, JSON.stringify(w[k]))); localStorage.setItem("__seeded", "1"); return true; })()');
+    await send('Page.navigate', { url: appUrl });
+    await waitFor('window.WaypointDebug && WaypointDebug.S.jobs.length === 3 && document.querySelector("#planBtn")', 'the 3-stop world');
+    await ev('(() => { window.__gps = ' + JSON.stringify(GPS3) + '; const P = WaypointDebug.S.places; window.__once429 = [P.pB, P.pC]; return true; })()');
+    const used = () => ev('(() => { const u = WaypointDebug.S.settings.usage.routing; return u ? u.d : 0; })()');
+    const lastBanner = () => ev('window.__banners.filter((b) => /^Travel times/.test(b)).slice(-1)[0] || ""');
+    const bannerN = async () => { const m = /— (\d+) requests? /.exec(await lastBanner()); return m ? Number(m[1]) : null; };
+    const shown = () => ev('(document.getElementById("banner") || {}).textContent || ""');
+    let u0 = await used(), f0 = await rt();
+    check(u0 === 0 && f0 === 0, 'a fresh world: 0 used, 0 fetched', { u0, f0 });
+    await plan(3);
+    await sleep(500); await settle();
+    let f = (await rt()) - f0, u = (await used()) - u0, bn = await bannerN();
+    check(f === 13 && bn === f && u === f, 'mocked fetches == banner number == Usage counter rise (12 pairs + the 429 and its retry = 13)', { fetched: f, banner: bn, counter: u });
+    check(await lastBanner() === 'Travel times: TomTom Routing — 13 requests (live).OK', 'the banner wording is unchanged, only the number', await lastBanner());
+    await tab('plan'); await sleep(300); await tab('route'); await sleep(1500); await settle();
+    f = (await rt()) - f0; u = (await used()) - u0;
+    check(f === 13 && u === 13 && (await bannerN()) === 13, 'after opening the Route tab again: still 13 fetched == 13 counted == banner 13', { fetched: f, counter: u });
+    console.log('   ... PLAN again from the Office place: the Route tab\'s first re-time (from the GPS fix) belongs to the PLAN');
+    await ev('(() => { WaypointDebug.S.startSel = "pO"; return true; })()');
+    u0 = await used(); f0 = await rt();
+    await plan(3);
+    await sleep(800); await settle();
+    f = (await rt()) - f0; u = (await used()) - u0; bn = await bannerN();
+    check(f === 13 && bn === f && u === f, 'from Office: 12 pairs + 1 first re-time = 13 fetched == banner == counter', { fetched: f, banner: bn, counter: u });
+    check(/^Travel times: TomTom Routing — 13 requests \(live\)\.OK$/.test(await shown()), 'the banner on screen was updated to 13', await shown());
+    await tab('plan'); await sleep(300); await tab('route'); await sleep(1500); await settle();
+    check((await rt()) - f0 === 13 && (await used()) - u0 === 13, 'after opening the Route tab again: still 13 and 13', { fetched: (await rt()) - f0, counter: (await used()) - u0 });
+    check(await ev('window.__other') === 0, 'no other network calls left the page (world 2)');
+
+    console.log('10. End day with stops remaining, then PLAN again the same date: the km');
+    await send('Page.navigate', { url: appUrl.replace('index.html', '__blank') });
+    await sleep(500);
+    await ev('(() => { localStorage.clear(); const w = ' + JSON.stringify(WORLD5) + '; Object.keys(w).forEach((k) => localStorage.setItem(k, JSON.stringify(w[k]))); localStorage.setItem("__seeded", "1"); return true; })()');
+    await send('Page.navigate', { url: appUrl });
+    await waitFor('window.WaypointDebug && WaypointDebug.S.jobs.length === 5 && document.querySelector("#planBtn")', 'the 5-stop world');
+    await ev('(() => { window.__gps = ' + JSON.stringify(GPS3) + '; return true; })()');
+    const dayKm = () => ev('(() => { const S = WaypointDebug.S, d = S.days["2026-11-24"]; if (!d) return null; const s = DayLog.summarise(d, S.jobs, S.places); return { status: s.km.status, km: s.km.value, closed: !!d.closed, legs: s.route.points.length - 1 }; })()');
+    await plan(5);
+    let o5 = await pending();
+    await ev('window.__off += 20 * 60000');
+    await gpsAt(o5[0]); await reachDone(o5[0]); await settle();
+    const k1 = await dayKm();
+    check(k1 && k1.status === 'ok' && k1.legs === 1, 'DONE 1: the first leg is held, km ok', k1);
+    await ev('window.__off += 10 * 60000');
+    await ev('(() => { window.__gps = { lat: window.__gps.lat + 0.003, lng: window.__gps.lng + 0.002, accuracy: 15 }; return true; })()'); // ~400 m on, off every stop
+    await plan(5); // PLAN on the running day (the done stop stays on top)
+    o5 = await pending();
+    await ev('window.__off += 20 * 60000');
+    await gpsAt(o5[0]); await reachDone(o5[0]); await settle();
+    const k2 = await dayKm();
+    check(k2 && k2.status === 'ok' && k2.legs === 2 && k2.km > k1.km, 'DONE 2 after that PLAN: the leg just driven is held too (before the fix: km unavailable)', k2);
+    const nEnd = await rt();
+    await ev('window.__off += 30 * 60000');
+    await tab('route'); await sleep(300);
+    await click('#routeEndDay');
+    await waitFor('document.getElementById("closeDay")', 'the End day summary');
+    await sleep(500);
+    const tileKm = await ev('(document.querySelector(".tile.km .tv") || {}).textContent');
+    check(tileKm === k2.km.toFixed(1) + ' km', 'End day with 3 stops remaining: the km tile shows ' + k2.km.toFixed(1) + ' km', tileKm);
+    await click('#closeDay'); await sleep(600);
+    check((await rt()) === nEnd, 'End day / Close day: 0 TomTom requests', (await rt()) - nEnd);
+    const k3 = await dayKm();
+    check(k3.closed && k3.status === 'ok' && Math.abs(k3.km - k2.km) < 1e-9, 'closed with stops remaining: km kept', k3);
+    await ev('document.querySelectorAll(".backdrop").forEach((b) => b.remove())');
+    await tab('settings');
+    await waitFor('document.querySelector(".hk")', 'the day history');
+    const hist = await ev('[...document.querySelectorAll(".hk")].map((e) => e.textContent)');
+    check(hist.length >= 1 && hist[0] === k2.km.toFixed(1) + ' km', 'the history row shows the km (not "km —")', hist);
+    check(!/without km/.test(await ev('document.body.innerText')), 'no "day(s) without km" line');
+    await ev('window.__off = Date.UTC(2026, 10, 24, 11, 54, 0) - (Date.now() - window.__off)'); // 19:54 Malaysia time
+    await plan(3); // PLAN again for the 3 stops left, the same date
+    const k4 = await dayKm();
+    check(k4.closed && k4.status === 'ok' && Math.abs(k4.km - k2.km) < 1e-9, 'PLAN again the same date (19:54): the closed day keeps its km', k4);
+    o5 = await pending();
+    await ev('window.__off += 20 * 60000');
+    await gpsAt(o5[0]); await reachDone(o5[0]); await settle();
+    const k5 = await dayKm();
+    check(k5.status === 'ok' && k5.legs === 3 && k5.km > k2.km, 'a DONE after it merges into that day: km still there and grows', k5);
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {
     await cleanup();

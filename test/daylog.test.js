@@ -343,5 +343,55 @@ console.log('hours out ends at the last DONE; replans via avoid-lunch / no-detou
   ok(DL.summarise(day, jobs, places).plan.replans === 3, 'summary replan count matches: replan-from-here + no-detour + avoid-lunch = 3');
 }
 
+console.log('End day km: the leg driven after a PLAN on a running day, End day with stops left, PLAN again the same date');
+{
+  const day = DL.newDay(DATE, 'Calvin');
+  const GPS = { lat: 2.99, lng: 100.98 }; // the morning start: no saved place
+  const pts1 = [GPS, places.A, places.B, places.C, { lat: 3.06, lng: 101.06 }]; // plan 1: start, A, B, C, end
+  const d = pts1.map((p, i) => pts1.map((q, j) => (i === j ? 0 : 1000 * (i + j))));
+  const mats1 = [{ departAt: T(7, 0), m: d.map((r) => r.map((x) => x / 10)), d }];
+  // plan 1's own matrices cover GPS -> A
+  const h1 = DL.holdLeg(day, GPS, places.A, { matrices: mats1, points: pts1, atMs: Date.parse(T(8, 0)) });
+  ok(h1 && h1.via === 'plan' && h1.leg.m === 1000, 'DONE at A: held from the plan\'s matrices', h1);
+  // PLAN on the running day from a live fix off every stop: plan 2 = [fix, B, C, end]; A is not in it
+  const fix = { lat: 3.013, lng: 101.012 };
+  const pts2 = [fix, places.B, places.C, pts1[4]];
+  const mats2 = [{ departAt: T(9, 0), m: pts2.map(() => pts2.map(() => 99)), d: pts2.map(() => pts2.map(() => 9999)) }];
+  ok(DL.legFromMatrices(mats2, pts2, places.A, places.B, Date.parse(T(9, 0))) === null, 'plan 2\'s matrices do not hold A -> B (the old gap)');
+  const carry = DL.legsFrom(mats1, pts1, places.A, [places.B, places.C, pts1[4]], Date.parse(T(9, 0)));
+  ok(Object.keys(carry).length === 3 && carry[DL.legKey(places.A, places.B)].m === 3000, 'legsFrom: plan 1\'s legs from A to every stop left and the end', carry);
+  const h2 = DL.holdLeg(day, places.A, places.B, { matrices: mats2, points: pts2, atMs: Date.parse(T(9, 30)), carry, learned: () => ({ m: 1, s: 1 }) });
+  ok(h2 && h2.via === 'carry' && day.legs[DL.legKey(places.A, places.B)].m === 3000, 'DONE at B: held from the carried legs (before the learned memory)', h2);
+  const h3 = DL.holdLeg(day, places.B, places.D, { matrices: mats2, points: pts2, atMs: 0, carry, learned: (a, b) => (b === places.D ? { m: 4200, s: 420 } : null) });
+  ok(h3 && h3.via === 'learned' && h3.leg.m === 4200 && h3.leg.s === 420, 'not in the matrices nor carried: the learned distance', h3);
+  ok(DL.holdLeg(day, places.D, places.E, { learned: () => null }) === null && !day.legs[DL.legKey(places.D, places.E)], 'nowhere: nothing held, nothing invented');
+  // the day's summary: GPS -> A -> B held, then End day with stops left; a later DONE / PLAN keeps it
+  DL.recordPlan(day, { nowIso: T(7, 9), replan: false, start: GPS, departAtIso: T(7, 9), jobs: mkJobs(), places, stopOrder: ['A', 'B', 'C'] });
+  DL.recordDone(day, { nowIso: T(8, 0), stopId: 'A', actions: [{ jobId: 'j1', kind: 'pickup', item: 'Sensor, 2 pcs' }], places });
+  DL.recordDone(day, { nowIso: T(9, 30), stopId: 'B', actions: [{ jobId: 'j1', kind: 'deliver' }], places });
+  let sm = DL.summarise(day, mkJobs(), places);
+  ok(sm.km.status === 'ok' && Math.abs(sm.km.value - 4) < 1e-9 && DL.missingLegs(day, sm).length === 0, 'End day with stops remaining: km = 4.0 (1.0 + 3.0), nothing missing', sm.km);
+  DL.closeDay(day, mkJobs(), places, T(16, 28));
+  DL.recordPlan(day, { nowIso: T(19, 54), replan: false, start: places.B, departAtIso: T(19, 54), jobs: mkJobs(), places, stopOrder: ['C', 'D'] });
+  sm = DL.summarise(day, mkJobs(), places);
+  ok(day.closed && sm.km.status === 'ok' && Math.abs(sm.km.value - 4) < 1e-9, 'PLAN again the same date: the closed day keeps its km', sm.km);
+  // an older record whose km came from day.routed (one chain): a longer chain the same date still uses those legs, per pair
+  const old = DL.newDay(DATE, 'Calvin');
+  DL.recordPlan(old, { nowIso: T(7, 0), replan: false, start: GPS, departAtIso: T(7, 0), jobs: mkJobs(), places, stopOrder: ['A', 'B', 'C'] });
+  DL.recordDone(old, { nowIso: T(8, 0), stopId: 'A', actions: [{ jobId: 'j1', kind: 'pickup', item: 'Sensor, 2 pcs' }], places });
+  DL.recordDone(old, { nowIso: T(9, 0), stopId: 'B', actions: [{ jobId: 'j1', kind: 'deliver' }], places });
+  const s0 = DL.summarise(old, mkJobs(), places);
+  old.routed = { key: s0.route.key, legs: [{ m: 1500, s: 150 }, { m: 2500, s: 250 }], at: T(16, 0) };
+  ok(DL.summarise(old, mkJobs(), places).km.value === 4, 'routed: 1.5 + 2.5 = 4.0 km');
+  DL.recordDone(old, { nowIso: T(20, 30), stopId: 'C', actions: [{ jobId: 'j2', kind: 'pickup', item: 'Pump' }], places });
+  let s1 = DL.summarise(old, mkJobs(), places);
+  const miss = DL.missingLegs(old, s1);
+  ok(s1.km.status === 'unavailable' && miss.length === 1 && miss[0].key === DL.legKey(places.B, places.C), 'a stop done later that date: only B -> C is missing (A, B legs still come from routed, per pair)', miss.map((x) => x.key));
+  old.legs[DL.legKey(places.B, places.C)] = { m: 1000, s: 100 };
+  s1 = DL.summarise(old, mkJobs(), places);
+  ok(s1.km.status === 'ok' && s1.km.value === 5, '... and once B -> C is held: 5.0 km', s1.km);
+  ok(Object.keys(DL.routedPairs({ routed: { key: 'stale', legs: [{ m: 1, s: 1 }] } })).length === 0 && Object.keys(DL.routedPairs({})).length === 0, 'routedPairs: a one-point key or none -> no pairs');
+}
+
 console.log('\n' + passes + ' passed, ' + failures + ' failed');
 process.exit(failures ? 1 : 0);

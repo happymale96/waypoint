@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = 'fa101395'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = 'd025e952'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -37,7 +37,7 @@
     fuelStations: [], // permanent station memory (see FUEL STOP below); in Export / Import, never shown in the Places tab
     lunch: null, // today's lunch-break state {date, startedAt, endedAt, skipped} (LUNCH BREAK below); stored as meta:lunchBreak
     loose: [], // items collected by a collect-only job, still with the driver (ITEMS WITH YOU below); collection "loose", in Export / Import
-    tt: { down: false, lastLiveAt: null, status: null, noRoute: 0 }, // status: the last failed answer's HTTP status; noRoute: 400 answers seen // TomTom: out (limit / unavailable) since the last failed call; the last live re-time (TOMTOM below)
+    tt: { down: false, lastLiveAt: null, status: null, noRoute: 0, planSess: null }, // status: the last failed answer's HTTP status; noRoute: 400 answers seen // TomTom: out (limit / unavailable) since the last failed call; the last live re-time (TOMTOM below)
     mem: null, // the learned travel times (TravelTimes pair memory), meta:travelMemory, in Export / Import
   };
 
@@ -69,6 +69,9 @@
     s.templates = Object.assign({}, Messages.DEFAULT_TEMPLATES, stored.templates || {});
     S.settings = s;
     delete s.tomtomUsage; // the old daily counter (replaced by settings.usage)
+    // once per device: the learned samples saved before the historic-only rule (03077b48 stored the live figure) can't be told
+    // from the later ones, so all of them go once (flag meta/migrations.learnedClear2026_11_24); places, jobs, days and counters untouched
+    try { await TravelTimes.runLearnedClearOnce(WPStore); } catch (e) { /* never block the launch */ }
     try { S.mem = TravelTimes.normaliseMemory(await WPStore.get('meta', 'travelMemory')); } catch (e) { S.mem = TravelTimes.emptyMemory(); }
     const fm = await WPStore.get('meta', 'fuelStations');
     S.fuelStations = fm && Array.isArray(fm.list) ? fm.list : [];
@@ -266,9 +269,21 @@
     if (d.call) S.tt.lastLiveAt = d.state.lastAt;
     return d.call;
   }
-  // one leg from the chosen TomTom service -> {seconds, metres, typicalSeconds}
-  function ttLeg(a, b, departMs) {
-    return ttService() === 'matrix' ? Providers.matrixLeg(a, b, departMs, S.settings.tomtomKey) : Providers.routeLeg(a, b, departMs, S.settings.tomtomKey);
+  // one leg from the chosen TomTom service -> {seconds, metres, typicalSeconds}; onCount(n) = every HTTP attempt (Routing)
+  function ttLeg(a, b, departMs, onCount) {
+    return ttService() === 'matrix' ? Providers.matrixLeg(a, b, departMs, S.settings.tomtomKey) : Providers.routeLeg(a, b, departMs, S.settings.tomtomKey, onCount);
+  }
+  // ONE PLAN's TomTom requests, from the PLAN tap to the end of the Route tab's first re-time (TT.planSession): the banner
+  // number is every request it sent (a 429's retry included, as the Usage counter counts it), an identical request is
+  // answered from memory, a learned sample is kept once per pair.
+  const planFetch = (sess) => TT.sessionFetch(sess, ttLeg, Providers.legKey);
+  function planBannerShow() { // (re)paint the PLAN banner with the session's count, only while it is still the one shown
+    const pb = S.planBanner;
+    if (!pb) return;
+    const b = document.getElementById('banner'), text = TT.bannerText(pb.sess.requests, pb.live, pb.checked);
+    if (pb.text != null && (!b || b.hidden || (b.firstChild && b.firstChild.textContent) !== pb.text)) return; // replaced or closed
+    pb.text = text;
+    banner(text, 'info');
   }
   // The learned travel times (meta:travelMemory, in Export / Import). A point within 150 m of a saved place IS that place.
   const saveMemory = () => WPStore.set('meta', 'travelMemory', S.mem).catch(() => {});
@@ -858,6 +873,7 @@
     if (!stopIds.length) { toast('No pending jobs to plan.'); return; }
     if (stopIds.length > Solver.MAX_STOPS) { banner('Too many stops: ' + stopIds.length + ' distinct places (max ' + Solver.MAX_STOPS + '). Park some jobs first.', 'error'); return; }
     S.busy = true;
+    S.tt.planSess = TT.planSession(); S.planBanner = null; // this PLAN's requests (the banner number)
     if (S.tab === 'plan') render();
     try {
       let start;
@@ -890,6 +906,7 @@
         got = { matrices: routed.matrices, calls: routed.requests, fromCache: false, partial: false, estimated: routed.estimated, orderEstimated: routed.estimated };
       }
       const prevPlan = replan ? curPlan() : null; // a replan keeps the stops already done on top
+      const carryLegs = prevPlan ? carriedLegs(prevPlan) : null; // the leg being driven stays held after this PLAN (End day km)
       const prevCtxPlaces = replan && S.plan ? S.plan.ctx.places : null; // (the fuel station lives there)
       // the run's day = local date it departed; a replan stays in its run's day (even past midnight)
       const dayKey = replan && planDayKey() ? planDayKey() : DL.dateKey(departAt.getTime());
@@ -899,12 +916,13 @@
       S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices, dayKey, msgAt }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial, estimated: !!got.estimated, estimatedOrder: !!got.orderEstimated, refused: !!(routed ? routed.down : got.estimated), downStatus: routed ? (routed.down ? routed.down.status : null) : (got.error ? got.error.status : null), noRoute: S.tt.noRoute > noRoute0, service: ttService() } };
       if (routed) { S.plan.result = routed.res; S.plan.idx = 0; S.plan.alt = null; } else solveFresh();
       if (jobs !== allJobs) S.plan.ctx.jobs = allJobs; // lookups by job id still find the whole job (the solve above used the trimmed copy)
+      if (carryLegs) S.plan.ctx.carryLegs = carryLegs;
       if (prevPlan) {
         S.plan.result.plans = S.plan.result.plans.map((p) => compose(prevPlan, p));
         await keepFuelAfterReplan(prevPlan, prevCtxPlaces, points); // silent: the chosen station only, no Places calls
       }
       if (got.estimated) banner(null); // the one TomTom notice / the "Estimated order" header say it; no second banner
-      else if (routed) banner('Travel times: TomTom Routing — ' + routed.requests + ' request' + (routed.requests === 1 ? '' : 's') + (routed.live ? ' (live)' : routed.checks ? ' (route checked)' : '') + '.', 'info');
+      else if (routed) { S.planBanner = { sess: S.tt.planSess, live: !!routed.live, checked: !!routed.checks, text: null }; planBannerShow(); }
       else banner('Travel times: TomTom Matrix — ' + (got.fromCache ? 'from session cache (0 calls)' : got.calls + ' calls') + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
       S.loc.origin = null; S.loc.lastAt = null; S.loc.reason = null;
       // the first leg was just fetched live from where you are (depart now): it is the live re-time, no second request
@@ -922,7 +940,13 @@
     } finally {
       S.busy = false;
       render();
-      if (S.tab === 'route' && S.plan && !(S.loc.origin && S.tt.lastLiveAt != null && Date.now() - S.tt.lastLiveAt < 5000)) refreshFromLocation({ trigger: 'plan' });
+      const sess = S.tt.planSess;
+      const first = S.tab === 'route' && S.plan && !(S.loc.origin && S.tt.lastLiveAt != null && Date.now() - S.tt.lastLiveAt < 5000)
+        ? refreshFromLocation({ trigger: 'plan', sess }) : null; // the Route tab's first re-time is part of this PLAN
+      Promise.resolve(first).catch(() => {}).then(() => {
+        if (S.planBanner && S.planBanner.sess === sess) planBannerShow(); // its request (if one was sent) is in the number
+        if (S.tt.planSess === sess) S.tt.planSess = null;
+      });
     }
   }
 
@@ -934,8 +958,9 @@
     const nowMs = Date.now(), t0 = departAt.getTime();
     const progress = (d, n) => banner('Getting travel times ' + d + ' of ' + n + '…', 'busy');
     banner('Getting travel times…', 'busy');
+    const sess = S.tt.planSess || (S.tt.planSess = TT.planSession());
     const r = await TT.planRoute({
-      Solver, input: Object.assign({}, input, { noDetour }), nowMs, mem: S.mem, fetchLeg: ttLeg, onProgress: progress,
+      Solver, input: Object.assign({}, input, { noDetour }), nowMs, mem: S.mem, fetchLeg: planFetch(sess), seen: sess.learned, onProgress: progress,
       start: nodeOf('__start__', input.start, S.startSel !== 'gps' ? S.startSel : null),
       end: nodeOf('__end__', input.end, input.end.id),
       nodeOfStop: (pid) => nodeOf(pid, input.places[pid], pid),
@@ -1091,6 +1116,7 @@
     if (routeClosed()) return; // a closed day with no plan since: no live times, no routing request
     const plan0 = curPlan();
     if (!plan0) return;
+    if (S.tt.planSess && opts.sess !== S.tt.planSess) return; // a PLAN is still counting its own requests (seconds)
     if (!liveDue(opts.trigger || 'visible')) return;
     opts.force = Budget.isAlways(opts.trigger);
     const nx0 = plan0.stops.find((s) => !s.status), tid = targetId(plan0);
@@ -1119,12 +1145,13 @@
         if (navigator.onLine === false) return await fail('offline');
         try {
           const now0 = Date.now();
-          const r = await ttLeg({ lat: fix.lat, lng: fix.lng }, { lat: target.lat, lng: target.lng }, null); // ONE request, depart now
+          const leg = opts.sess ? planFetch(opts.sess) : ttLeg; // the PLAN's re-time: an identical request it already sent is not sent again
+          const r = await leg({ lat: fix.lat, lng: fix.lng }, { lat: target.lat, lng: target.lng }, null); // ONE request, depart now
           if (!r || r.seconds == null) throw new Error('no duration');
           dur = r.seconds;
           // a sample only between two saved places (the fix within 150 m of one); typical time when TomTom returns it
           const a = nodeOf('fix', fix, null), b = nodeOf('target', target, nx0 ? nx0.placeId : (P.ctx.end && P.ctx.end.id));
-          TT.remember(S.mem, a, b, now0, r, now0); saveMemory(); // a sample only between saved places, and only a typical time
+          TT.remember(S.mem, a, b, now0, r, now0, opts.sess ? opts.sess.learned : null); saveMemory(); // a sample only between saved places, only a typical time, once per pair per PLAN
         } catch (e) { return await fail(navigator.onLine === false || /network error/i.test(e.message || '') ? 'offline' : 'routing'); }
       }
       const cur = S.plan === P ? curPlan() : null;
@@ -1288,6 +1315,34 @@
 
   const coordPlace = (id) => S.places[id] || (S.plan && S.plan.ctx.places[id]) || null;
   function coordOf(id, day) { const p = S.places[id] || (S.plan && S.plan.ctx.places[id]) || day.places[id]; return p ? { lat: p.lat, lng: p.lng } : null; }
+  // A leg between two saved places from the learned memory (metres + seconds, any part of the day), else null. No request.
+  function learnedLeg(a, b) {
+    const list = Object.values(S.places), pa = TT.snap(a, list), pb = TT.snap(b, list);
+    if (pa == null || pb == null) return null;
+    if (pa === pb) return { m: 0, s: 0 };
+    const l = TT.learned(S.mem, pa, pb, TT.bucketOf(Date.now()));
+    return l && l.m != null ? { m: l.m, s: l.s } : null;
+  }
+  // The leg just driven (DONE / ARRIVED) into the day record: the plan's matrices, else the legs carried across a PLAN on a
+  // running day (the plan made from a live position no longer holds the done stop), else the learned memory. Before this,
+  // only the first was tried, so the first leg after such a PLAN was never held and the day's km stayed blank.
+  function holdDriven(day, plan, prev, to, coord, nowMs) {
+    const m = plan.model, pts = [m.start].concat(m.stopIds.map(coord), [m.end]);
+    return DL.holdLeg(day, prev, to, { matrices: pts.every(Boolean) ? m.matrices : null, points: pts, atMs: nowMs, carry: S.plan && S.plan.ctx.carryLegs, learned: learnedLeg });
+  }
+  // PLAN on a running day: the previous plan's own legs from where you left (its last done stop, else its start) to every stop
+  // not done and its end, kept with the new plan (ctx.carryLegs, with what an earlier PLAN carried).
+  function carriedLegs(plan) {
+    const prev = (S.plan && S.plan.ctx && S.plan.ctx.carryLegs) || {};
+    const m = plan && plan.model;
+    if (!m || !m.matrices) return prev;
+    const c = (id) => { const p = coordPlace(id); return p ? { lat: p.lat, lng: p.lng } : null; };
+    const pts = [m.start].concat(m.stopIds.map(c), [m.end]);
+    if (!pts.every(Boolean)) return prev;
+    const di = lastDoneIdx(plan, true), from = di >= 0 ? c(plan.stops[di].placeId) : { lat: m.start.lat, lng: m.start.lng };
+    const tos = plan.stops.filter((s) => !s.status && !s.fuel).map((s) => c(s.placeId)).concat([{ lat: m.end.lat, lng: m.end.lng }]);
+    return Object.assign({}, prev, DL.legsFrom(m.matrices, pts, from, tos, Date.now()));
+  }
   function logDone(stop, nowIso) {
     try {
       const nowMs = Date.parse(nowIso), day = dayFor(nowMs, true);
@@ -1301,11 +1356,7 @@
       const evs = stop.fuel // the fuel stop is logged as a stop (kind 'fuel'), never as a job action
         ? [DL.recordFuel(day, Object.assign({ nowIso, stopId: stop.placeId, name: (coordPlace(stop.placeId) || {}).name || '', places: Object.assign({}, S.plan && S.plan.ctx.places, S.places) }, rch))]
         : DL.recordDone(day, Object.assign({ nowIso, stopId: stop.placeId, actions: stop.actions, places: S.places }, rch));
-      if (plan && prev && to) { // keep the leg just driven if the plan's own routing matrices cover that exact pair
-        const m = plan.model;
-        const pts = [m.start].concat(m.stopIds.map(coord), [m.end]);
-        if (pts.every(Boolean)) DL.captureLeg(day, prev, to, m.matrices, pts, nowMs);
-      }
+      if (plan && prev && to) holdDriven(day, plan, prev, to, coord, nowMs); // keep the leg just driven (zero requests)
       bgSaveDay(day);
       attachFix(evs, day);
     } catch (e) { /* never break DONE */ }
@@ -1365,10 +1416,7 @@
     try { // keep the final leg if the plan's own routing matrices cover that exact pair (else the summary routes it once)
       const plan = curPlan(), groups = DL.doneGroups(day), lastG = groups[groups.length - 1];
       const prev = lastG ? coordOf(lastG.stopId, day) : (day.planSnapshot && day.planSnapshot.start);
-      if (plan && prev) {
-        const m = plan.model, pts = [m.start].concat(m.stopIds.map((id) => coordOf(id, day)), [m.end]);
-        if (pts.every(Boolean)) DL.captureLeg(day, prev, { lat: end.lat, lng: end.lng }, m.matrices, pts, nowMs);
-      }
+      if (plan && prev) holdDriven(day, plan, prev, { lat: end.lat, lng: end.lng }, (id) => coordOf(id, day), nowMs);
     } catch (e) { /* the summary falls back to one routing request */ }
     bgSaveDay(day);
     attachFix([ev], day);
@@ -1411,17 +1459,20 @@
     const ro = () => !!opts.readOnly;
     const hm = DL.fmtTime;
 
-    async function routeNow(manual) { // NO request: legs not held from the day's own routing answers come from the learned times
+    async function routeNow(manual) { // NO request: only the legs not held yet, from the learned times, kept per pair
+      // (before: every leg of the chain had to be found in the learned times, held ones and the GPS start included, and the
+      // result only counted for that exact chain, so one gap or a later stop on the same date left the km blank)
       const s = sum();
       if (!s.route.needs || routing) return;
-      const pts = s.route.points, places = Object.values(S.places), legs = [];
-      for (let i = 0; i + 1 < pts.length; i++) {
-        const a = TT.snap(pts[i], places), b = TT.snap(pts[i + 1], places);
-        const l = a != null && b != null ? (a === b ? { s: 0, m: 0 } : TT.learned(S.mem, a, b, TT.bucketOf(Date.now()))) : null;
-        if (!l || l.m == null) { if (manual) toast('km unavailable: no stored distance for every leg driven'); return; }
-        legs.push({ m: l.m, s: l.s });
-      }
-      day.routed = { key: s.route.key, legs, at: new Date().toISOString() };
+      let added = 0, left = 0;
+      DL.missingLegs(day, s).forEach((g) => {
+        const l = learnedLeg(g.a, g.b), held = day.legs[g.key] || {};
+        if (!l) { left++; return; }
+        day.legs[g.key] = { m: held.m != null ? held.m : l.m, s: held.s != null ? held.s : (l.s != null ? l.s : null) };
+        added++;
+      });
+      if (left && manual) toast('km unavailable: no stored distance for every leg driven');
+      if (!added) return;
       await saveDay(day);
       draw();
     }
@@ -2845,7 +2896,7 @@
 
   function exportJson() {
     const settings = Object.assign({}, S.settings); delete settings.googleKey; delete settings.tomtomKey;
-    const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), dwellMigrated: true, pinMigrated: true, places: Object.values(S.places), jobs: S.jobs, settings, fuelStations: S.fuelStations, travelTimes: S.mem },
+    const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), dwellMigrated: true, pinMigrated: true, learnedCleared: true, places: Object.values(S.places), jobs: S.jobs, settings, fuelStations: S.fuelStations, travelTimes: S.mem },
       OnBoard.exportLoose(S.loose), // looseItems: the items still with you
       DL.exportPayload(S.days, S.jobs, S.places)); // + dayLog (records) and dayHistory (per-day totals); keys never included
     const a = h('a', { href: URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })), download: 'waypoint-' + new Date().toISOString().slice(0, 10) + '.json' });
@@ -2877,6 +2928,7 @@
       }
       if (data.travelTimes && typeof data.travelTimes === 'object') { // older exports have none: the learned times are kept
         S.mem = TT.normaliseMemory(data.travelTimes);
+        if (!data.learnedCleared) S.mem = TT.clearSamples(S.mem); // an export from before the one-time clear may hold live figures
         await saveMemory();
       }
       if (Array.isArray(data.fuelStations)) { // older exports have none: the current memory is kept

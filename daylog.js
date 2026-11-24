@@ -17,7 +17,8 @@
  *   summarise().visits lists them per done stop; reached.js turns that into the driving / on-site split.
  *   edits.startedAt / edits.finishedAt = user overrides (ISO) of Started / Finished.
  *   legs  = per-leg metres/seconds already held from routing responses: "lat,lng>lat,lng" -> {m, s}
- *   routed = result of the ONE routing request made at End Day: {key, legs:[{m,s}], at}
+ *   routed = (older records) the legs filled at End Day for one sequence: {key, legs:[{m,s}], at}; read per pair (leg i =
+ *            point i -> point i + 1 of its key), so a longer sequence later the same date still uses them. New fills go to legs{}.
  * Exports via module.exports (node) or window.DayLog.
  */
 (function (root, factory) {
@@ -235,6 +236,48 @@
     if (leg) day.legs[legKey(a, b)] = leg;
     return leg;
   }
+  // The leg just driven, held from the day's OWN answers (zero requests), first that has it: the plan's matrices (exact
+  // points), o.carry (the previous plan's legs kept across a PLAN on a running day: legKey -> {m, s}), o.learned(a, b) ->
+  // {m, s} | null (the learned pair memory). o = {matrices, points, atMs, carry, learned}. -> {leg, via} | null
+  function holdLeg(day, a, b, o) {
+    if (!day || !a || !b) return null;
+    o = o || {};
+    const k = legKey(a, b);
+    let leg = o.matrices && o.points ? legFromMatrices(o.matrices, o.points, a, b, o.atMs) : null, via = 'plan';
+    if (!(leg && leg.m != null) && o.carry && o.carry[k] && o.carry[k].m != null) { leg = o.carry[k]; via = 'carry'; }
+    if (!(leg && leg.m != null) && o.learned) { let l = null; try { l = o.learned(a, b); } catch (e) { l = null; } if (l && l.m != null) { leg = { m: l.m, s: l.s != null ? l.s : null }; via = 'learned'; } }
+    if (!leg) return null;
+    day.legs[k] = { m: leg.m != null ? leg.m : null, s: leg.s != null ? leg.s : null };
+    return { leg: day.legs[k], via };
+  }
+  // {legKey: {m, s}} for from -> each of tos, from the matrices (exact points); pairs they don't cover are left out
+  function legsFrom(matrices, points, from, tos, atMs) {
+    const out = {};
+    if (!from) return out;
+    (tos || []).forEach((t) => { if (!t) return; const l = legFromMatrices(matrices, points, from, t, atMs); if (l && l.m != null) out[legKey(from, t)] = l; });
+    return out;
+  }
+  // the legs of a summary's chain still without metres or seconds: [{i, a, b, key}]
+  function missingLegs(day, sum) {
+    const pts = (sum && sum.route && sum.route.points) || [], out = [];
+    const byPair = routedPairs(day);
+    for (let i = 0; i + 1 < pts.length; i++) {
+      if (ptKey(pts[i]) === ptKey(pts[i + 1])) continue;
+      const k = legKey(pts[i], pts[i + 1]), held = day.legs[k] || null, r = byPair[k] || null;
+      const m = held && held.m != null ? held.m : r && r.m != null ? r.m : null;
+      const s = held && held.s != null ? held.s : r && r.s != null ? r.s : null;
+      if (m == null || s == null) out.push({ i, a: pts[i], b: pts[i + 1], key: k });
+    }
+    return out;
+  }
+  // day.routed (older records) per pair: leg i of its key = point i -> point i + 1
+  function routedPairs(day) {
+    const out = {}, R = day && day.routed;
+    if (!R || typeof R.key !== 'string' || !Array.isArray(R.legs)) return out;
+    const ks = R.key.split('|');
+    for (let i = 0; i + 1 < ks.length; i++) if (R.legs[i]) out[ks[i] + '>' + ks[i + 1]] = R.legs[i];
+    return out;
+  }
   // planned km / drive minutes over start -> stops in order (null when the matrices hold no distances)
   function plannedFromMatrices(matrices, points, seq, atMs) {
     let m = 0, s = 0, mOk = true, sOk = true;
@@ -345,11 +388,11 @@
     doneSeq.forEach((id) => { const p = placeOf(id); if (p) pts.push({ lat: p.lat, lng: p.lng }); else pointsOk = false; });
     if (arrEv && arrEv.endPoint && pointsOk && pts.length) pts.push({ lat: arrEv.endPoint.lat, lng: arrEv.endPoint.lng }); // final leg: last done stop -> end point
     const key = seqKey(pts);
-    const routed = day.routed && day.routed.key === key ? day.routed.legs : null;
+    const routed = routedPairs(day); // filled legs of an older record, per pair (still valid when the sequence grew)
     let kmM = 0, driveS = 0, mOk = true, sOk = true;
     for (let i = 0; i + 1 < pts.length; i++) {
       const held = day.legs[legKey(pts[i], pts[i + 1])] || null;
-      const r = routed && routed[i] ? routed[i] : null;
+      const r = routed[legKey(pts[i], pts[i + 1])] || null;
       const same = ptKey(pts[i]) === ptKey(pts[i + 1]);
       const m = same ? 0 : held && held.m != null ? held.m : r && r.m != null ? r.m : null;
       const s = same ? 0 : held && held.s != null ? held.s : r && r.s != null ? r.s : null;
@@ -652,7 +695,7 @@
     SCHEMA, KEEP_DAYS, REASONS, CSV_HEADER,
     dateKey, fmtDate, fmtTime, fmtDur, fmtKm, addDaysKey, dayStartMs, ageDays,
     newDay, appendEvent, recordPlan, recordReplan, recordDone, recordFuel, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, recordNav, recordSkip, recordUndoSkip, recordDropoff, recordUndoDropoff, recordBreakStart, recordBreakEnd, TIME_SPLIT_V, arrivedEnd, doneGroups, hasActiveDone,
-    ptKey, legKey, seqKey, legFromMatrices, captureLeg, plannedFromMatrices,
+    ptKey, legKey, seqKey, legFromMatrices, captureLeg, holdLeg, legsFrom, missingLegs, routedPairs, plannedFromMatrices,
     summarise, closeDay, reopenDay, refreshTotals, recordFor, activityKey, hasActivity, isEmptyRecord, openDayKey, endDay,
     REPAIR_VERSION, repairHistory, runRepairOnce, exportPayload, importPayload, pruneDates, weekRange, weekTotals, historyKeys, toCSV, csvCell, toWhatsApp,
   };

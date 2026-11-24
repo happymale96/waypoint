@@ -208,6 +208,111 @@ function plan(stopIds, mem, tt, at) {
     ok(rd.estimated && !rd.res.error && rd.res.plans[0].order.length === 6 && ttDown.log.length <= 4, 'TomTom down: a route on estimates, flagged, and the remaining fetches stop at once', { est: rd.estimated, calls: ttDown.log.length });
   }
 
+  console.log('15. one PLAN\'s session: every HTTP attempt counted, an identical request answered from memory, one sample per pair');
+  {
+    const Providers = require('../providers.js');
+    // tally: the one counter behind the banner number
+    const s0 = TT.planSession();
+    ok(TT.tally(s0) === 1 && TT.tally(s0, 2) === 3 && TT.tally(s0, 0) === 3 && TT.tally(s0, -1) === 3 && TT.tally(s0, NaN) === 3 && TT.tally(null, 1) === 0, 'tally: +1 by default, +n, ignores 0 / negative / NaN / no session');
+    ok(TT.bannerText(12, true, false) === 'Travel times: TomTom Routing — 12 requests (live).' && TT.bannerText(1, false, true) === 'Travel times: TomTom Routing — 1 request (route checked).' && TT.bannerText(7, false, false) === 'Travel times: TomTom Routing — 7 requests.', 'bannerText: the wording kept, only the number');
+    // a fetcher like Providers.routeLeg: onCount once per HTTP attempt; the pair B>C answers 429 once (2 attempts)
+    const calls = [];
+    let fourTwoNine = true;
+    const leg = async (a, b, at, onCount) => {
+      calls.push(a.key + '>' + b.key);
+      onCount(1);
+      if (a.key === 'B' && b.key === 'C' && fourTwoNine) { fourTwoNine = false; onCount(1); }
+      const km = Budget.distanceM(a, b) / 1000, sec = Math.round(km * 1.3 / 40 * 3600) + 60;
+      return { seconds: sec, metres: Math.round(km * 1300), typicalSeconds: sec };
+    };
+    const clock = () => NOW;
+    const sess = TT.planSession();
+    const f = TT.sessionFetch(sess, leg, Providers.legKey, clock);
+    const [x1, x2] = await Promise.all([f(node('A', 'A'), node('B', 'B'), null), f(node('A', 'A'), node('B', 'B'), NOW + 30000)]); // both "now" as sent
+    ok(calls.length === 1 && sess.requests === 1 && sess.reused === 1 && x1 === x2, 'the same pair, both departing "now" (even in flight): fetched once, counted once', { calls, n: sess.requests });
+    await f(node('A', 'A'), node('B', 'B'), MYT(13, 0));
+    await f(node('B', 'B'), node('A', 'A'), null);
+    ok(calls.length === 3 && sess.requests === 3, 'a different departAt (13:00) or the other direction: a new request each', calls);
+    await f(node('B', 'B'), node('C', 'C'), null);
+    ok(calls.length === 4 && sess.requests === 5, 'a 429 and its retry: 2 requests counted (what the Usage counter and TomTom see)', sess.requests);
+    const fix = { key: 'fix', pid: null, lat: places.A.lat + 0.001, lng: places.A.lng };
+    await f(fix, node('B', 'B'), null);
+    ok(calls.length === 5 && sess.requests === 6, 'a different origin (a GPS fix 110 m from A): fetched', calls.length);
+    const bad = TT.sessionFetch(TT.planSession(), async () => { throw new Error('down'); }, Providers.legKey, clock);
+    let e1 = null, e2 = null;
+    await bad(node('A', 'A'), node('B', 'B'), null).catch((e) => { e1 = e; });
+    await bad(node('A', 'A'), node('B', 'B'), null).catch((e) => { e2 = e; });
+    ok(e1 && e1 === e2, 'a failed request is not re-sent within the PLAN (the same failure)');
+    // remember(..., seen): once per pair per PLAN
+    const m = TT.emptyMemory(), seen = new Set(), r = { seconds: 600, metres: 5000, typicalSeconds: 550 };
+    TT.remember(m, node('A', 'A'), node('B', 'B'), NOW, r, NOW, seen);
+    TT.remember(m, node('A', 'A'), node('B', 'B'), MYT(17, 0), r, NOW, seen); // the same pair later in the same PLAN (PM bucket)
+    TT.remember(m, node('B', 'B'), node('A', 'A'), NOW, r, NOW, seen);
+    const total = Object.keys(m.pairs).reduce((a, k) => a + m.pairs[k].length, 0);
+    ok(total === 2 && m.pairs['A>B@day'].length === 1 && !m.pairs['A>B@pm'] && m.pairs['B>A@day'][0].s === 550, 'a sample once per pair per PLAN, the historic figure only', m.pairs);
+    TT.remember(m, node('A', 'A'), node('B', 'B'), NOW, r, NOW, new Set());
+    ok(m.pairs['A>B@day'].length === 2, 'the next PLAN (a new set) may sample the pair again');
+    // the 6-stop PLAN through a session: 48 fetched (the first check leg = the table's O -> first stop "now"), same order and ETAs
+    const ttRaw = mockTomTom();
+    const raw = await plan(['A', 'B', 'C', 'D', 'Fp', 'F'], TT.emptyMemory(), ttRaw);
+    const sx = TT.planSession(), log = [];
+    const counted = async (a, b, at, onCount) => { log.push(a.key + '>' + b.key + '@' + at); onCount(1); return ttRaw.fetchLeg(a, b, at); };
+    const input = { start: places.O, end: places.E, jobs: errands(['A', 'B', 'C', 'D', 'Fp', 'F']), places, departAtISO: new Date(NOW).toISOString(), noDetour: false };
+    const mx = TT.emptyMemory();
+    const rs = await TT.planRoute({ Solver, input, nowMs: NOW, mem: mx, fetchLeg: TT.sessionFetch(sx, counted, Providers.legKey, clock), seen: sx.learned, start: node('__start__', 'O'), end: node('__end__', 'E'), nodeOfStop: (pid) => node(pid, pid) });
+    ok(log.length === 48 && sx.requests === 48 && sx.reused === 1, '6 stops: 48 fetched == 48 counted (42 table + 7 check, one answered from memory)', { log: log.length, n: sx.requests, reused: sx.reused });
+    ok(rs.res.plans[0].order.join() === raw.res.plans[0].order.join() && rs.res.plans[0].endArrival === raw.res.plans[0].endArrival && rs.res.plans[0].stops.every((st, i) => st.arriveAt === raw.res.plans[0].stops[i].arriveAt), 'the same order and the same ETAs as without the session');
+    const per = {};
+    Object.keys(mx.pairs).forEach((k) => { const p = k.slice(0, k.lastIndexOf('@')); per[p] = (per[p] || 0) + mx.pairs[k].length; });
+    ok(Object.keys(per).length > 0 && Object.values(per).every((n) => n === 1), 'every pair sampled at most once in that PLAN (table + check)', per);
+  }
+
+  console.log('16. one-time clear of the learned samples saved before this build (flag learnedClear2026_11_24)');
+  {
+    // a store like WPStore: every record a device holds (places, jobs, day history, settings with the usage counters, ...)
+    const data = new Map();
+    const store = {
+      writes: [],
+      async get(col, id) { const v = data.get(col + ':' + id); return v == null ? null : JSON.parse(v); },
+      async set(col, id, v) { this.writes.push(col + ':' + id); data.set(col + ':' + id, JSON.stringify(v)); },
+    };
+    const old = TT.emptyMemory();
+    ['O>A@day', 'A>B@day', 'A>B@pm', 'B>E@night'].forEach((k) => { old.pairs[k] = [{ s: 600, m: 5000, at: NOW - 86400e3 }, { s: 640, m: 5000, at: NOW - 3600e3 }]; });
+    old.lastTypicalAt = NOW - 3600e3; old.last = { at: NOW - 3600e3, typical: true };
+    data.set('meta:travelMemory', JSON.stringify(old));
+    data.set('meta:migrations', JSON.stringify({ done: ['seed-jemaramas-lunch-2026-11'], dwell2026_11_23: true }));
+    const others = {
+      'places:pA': { id: 'pA', name: 'Alpha', lat: 3.1, lng: 101.7, dwellMin: 30 }, 'jobs:j1': { id: 'j1', deliveryPlaceId: 'pA', status: 'pending' },
+      'days:2026-11-23': { date: '2026-11-23', closed: true, legs: { 'x>y': { m: 4000, s: 300 } } },
+      'settings:main': { tomtomKey: 'k', usage: { routing: { day: '2026-11-24', d: 38, month: '2026-11', m: 120 }, places: { day: '2026-11-24', d: 3, month: '2026-11', m: 9 } } },
+      'meta:lunchBreak': { date: '2026-11-24', startedAt: null }, 'loose:l1': { id: 'l1', status: 'with-me' },
+    };
+    Object.keys(others).forEach((k) => data.set(k, JSON.stringify(others[k])));
+    const before = new Map(data);
+    const r1 = await TT.runLearnedClearOnce(store);
+    const m1 = await store.get('meta', 'travelMemory'), rec1 = await store.get('meta', 'migrations');
+    ok(r1.ran && r1.cleared === 8 && TT.pairCount(m1) === 0 && Object.keys(m1.pairs).length === 0, 'first load: every learned sample cleared (8 samples, 3 pairs in 4 buckets)', r1);
+    ok(m1.lastTypicalAt === old.lastTypicalAt && m1.last.at === old.last.at, 'the "last typical time" line data is kept');
+    ok(rec1[TT.LEARNED_CLEAR_FLAG] === true && rec1.dwell2026_11_23 === true && rec1.done.join() === 'seed-jemaramas-lunch-2026-11', 'the flag is set; the other migration flags are kept');
+    ok(Object.keys(others).every((k) => data.get(k) === before.get(k)), 'places, jobs, day history, settings (usage counters), lunch and loose items untouched');
+    ok(store.writes.slice().sort().join() === 'meta:migrations,meta:travelMemory', 'only meta/travelMemory and meta/migrations were written', store.writes);
+    // a sample saved after the clear (this build: historic figure only) is kept: the clear never runs twice
+    const mNew = TT.normaliseMemory(m1);
+    TT.remember(mNew, node('A', 'A'), node('B', 'B'), NOW, { seconds: 700, metres: 5100, typicalSeconds: 650 }, NOW);
+    await store.set('meta', 'travelMemory', mNew);
+    store.writes = [];
+    const r2 = await TT.runLearnedClearOnce(store);
+    const m2 = await store.get('meta', 'travelMemory');
+    ok(!r2.ran && store.writes.length === 0 && m2.pairs['A>B@day'] && m2.pairs['A>B@day'][0].s === 650, 'second load: nothing runs, nothing is written, the new sample stays', { r2, w: store.writes });
+    const r3 = await TT.runLearnedClearOnce(store);
+    ok(!r3.ran && TT.pairCount(await store.get('meta', 'travelMemory')) === 1, 'third load: still nothing');
+    // a device that never learned anything: the flag is set, no memory record is created
+    const data2 = new Map(), store2 = { async get(c, i) { const v = data2.get(c + ':' + i); return v == null ? null : JSON.parse(v); }, async set(c, i, v) { data2.set(c + ':' + i, JSON.stringify(v)); } };
+    const r4 = await TT.runLearnedClearOnce(store2);
+    ok(r4.ran && r4.cleared === 0 && !data2.has('meta:travelMemory') && JSON.parse(data2.get('meta:migrations'))[TT.LEARNED_CLEAR_FLAG] === true, 'a fresh device: flag set, no memory record made');
+    ok(TT.pairCount(TT.clearSamples(old)) === 0 && TT.pairCount(old) === 3, 'clearSamples (Import of an older export) returns an empty copy and leaves its input alone');
+  }
+
   console.log('\n' + passes + ' passed, ' + failures + ' failed');
   process.exit(failures ? 1 : 0);
 })().catch((e) => { console.log('ERROR ' + (e && e.stack || e)); process.exit(1); });

@@ -45,14 +45,19 @@
     return 'https://api.tomtom.com/routing/1/calculateRoute/' + ll(from) + ':' + ll(to) + '/json?key=' + encodeURIComponent(key) +
       '&travelMode=car&traffic=true&routeType=fastest&routeRepresentation=summaryOnly&computeTravelTimeFor=all&departAt=' + encodeURIComponent(departParam(departAtMs, nowMs));
   }
+  // The request as TomTom sees it (from, to, departAt as sent): two calls with the same key get the same answer.
+  const legKey = (from, to, departAtMs, nowMs) => ll(from) + ':' + ll(to) + '@' + departParam(departAtMs, nowMs);
   // -> {seconds, metres, typicalSeconds|null}. departAtMs null / not in the future = "now".
-  async function routeLeg(from, to, departAtMs, key) {
+  // onCount(n): called with every HTTP attempt that came back (the same moments the usage hook counts), so a caller can
+  // count its own requests (a 429 and its one retry are two).
+  async function routeLeg(from, to, departAtMs, key, onCount) {
     if (!key) throw new ProviderError('TomTom', 'API key missing — add it in Settings.');
     const url = routeUrl(from, to, departAtMs, key, Date.now());
     for (let attempt = 0; ; attempt++) {
       let res;
       try { res = await fetch(url); } catch (e) { hookCall('down', 0); throw downError(0); }
       hookCall('count', 'routing', 1);
+      if (onCount) { try { onCount(1); } catch (e) { /* counting never breaks a lookup */ } }
       if (res.status === 429 && attempt < RETRY_MS.length) { await wait(RETRY_MS[attempt]); continue; }
       const body = await res.json().catch(() => ({}));
       if (!res.ok && isDown(res.status)) { hookCall('down', res.status); throw downError(res.status); }
@@ -185,5 +190,5 @@
     return { seconds: r.m[0][1], metres: r.d[0][1], typicalSeconds: null };
   }
 
-  return { ProviderError, RETRY_MS, departParam, routeUrl, routeLeg, searchGoogle, tomtomMatrix, getMatrices, getMatricesOrEstimate, estimateMatrices, matrixLeg, clearCache, setTomTomHook };
+  return { ProviderError, RETRY_MS, departParam, routeUrl, legKey, routeLeg, searchGoogle, tomtomMatrix, getMatrices, getMatricesOrEstimate, estimateMatrices, matrixLeg, clearCache, setTomTomHook };
 });

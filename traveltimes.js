@@ -103,6 +103,32 @@
     return out;
   }
 
+  // ---------- one-time clear of the samples saved before the historic-only rule could be told apart ----------
+  // Build 03077b48 stored the LIVE figure when an answer had no typical time (else the typical one); fa101395 stores only
+  // the typical (historic) figure, but its samples have the same shape {s, m, at} and it purged nothing, so the two cannot
+  // be told apart. The first load of a build with this clears every learned sample once (flag meta/migrations
+  // .learnedClear2026_11_24); samples saved after it are kept. Only meta/travelMemory and meta/migrations are written.
+  const LEARNED_CLEAR_FLAG = 'learnedClear2026_11_24';
+  function clearSamples(mem) { // the pairs go; the "last typical time" line data stays (it is when, not what)
+    const out = emptyMemory();
+    if (mem && mem.lastTypicalAt != null && isFinite(mem.lastTypicalAt)) out.lastTypicalAt = Number(mem.lastTypicalAt);
+    if (mem && mem.last && isFinite(mem.last.at)) out.last = { at: Number(mem.last.at), typical: mem.last.typical !== false };
+    return out;
+  }
+  // store = {get(col, id), set(col, id, value)} (WPStore). -> {ran, cleared (samples removed)}
+  async function runLearnedClearOnce(store) {
+    const rec = (await store.get('meta', 'migrations')) || { done: [] };
+    if (rec[LEARNED_CLEAR_FLAG]) return { ran: false, cleared: 0 };
+    const mem = await store.get('meta', 'travelMemory');
+    const P = (mem && mem.pairs) || {};
+    const cleared = Object.keys(P).reduce((a, k) => a + (Array.isArray(P[k]) ? P[k].length : 0), 0);
+    if (mem) await store.set('meta', 'travelMemory', clearSamples(mem));
+    rec[LEARNED_CLEAR_FLAG] = true;
+    if (!Array.isArray(rec.done)) rec.done = [];
+    await store.set('meta', 'migrations', rec);
+    return { ran: true, cleared };
+  }
+
   // ---------- saved places: a point within 150 m of one IS that place ----------
   function snap(pt, places, radiusM) {
     if (!pt || pt.lat == null || pt.lng == null) return null;
@@ -159,13 +185,45 @@
   const sampleOf = (r, atMs) => (hasTypical(r) ? { s: r.typicalSeconds, m: r.metres, at: atMs } : null);
   // r = a successful answer {seconds, metres, typicalSeconds|null}. mem.last = {at, typical} (the most recent answer),
   // mem.lastTypicalAt = when the last typical time came back (Settings -> Travel times).
-  function remember(mem, a, b, departMs, r, nowMs) {
+  // seen (optional Set, one PLAN's): a pair already sampled by this PLAN gets no second sample.
+  function remember(mem, a, b, departMs, r, nowMs, seen) {
     if (!mem || !r) return;
     const typ = hasTypical(r);
     mem.last = { at: nowMs, typical: typ };
     if (typ) mem.lastTypicalAt = nowMs;
     if (!typ || !a || !b || a.pid == null || b.pid == null || a.pid === b.pid) return;
+    const pk = a.pid + '>' + b.pid;
+    if (seen && seen.has(pk)) return;
     addSample(mem, a.pid, b.pid, bucketOf(departMs), sampleOf(r, nowMs));
+    if (seen) seen.add(pk);
+  }
+
+  // ---------- one PLAN's TomTom requests (from the PLAN tap to the Route tab's first re-time) ----------
+  // requests = every HTTP attempt this PLAN sent (a 429 and its one retry are two: that is what the Usage counter and
+  // TomTom count) -> the banner number. memo: an identical request (same from, to and departAt as sent, Providers.legKey)
+  // already made by this PLAN is answered from memory, never fetched twice. learned: the pairs this PLAN already sampled.
+  function planSession() { return { requests: 0, reused: 0, memo: new Map(), learned: new Set() }; }
+  function tally(sess, n) {
+    if (!sess) return 0;
+    const k = n == null ? 1 : Number(n);
+    if (isFinite(k) && k > 0) sess.requests += k;
+    return sess.requests;
+  }
+  // fetchLeg(a, b, departMs, onCount) -> Promise; keyOf(a, b, departMs, nowMs) -> string. Returns fetch(a, b, departMs).
+  function sessionFetch(sess, fetchLeg, keyOf, clock) {
+    const now = clock || Date.now;
+    return (a, b, departMs) => {
+      const k = keyOf(a, b, departMs, now());
+      if (sess.memo.has(k)) { sess.reused++; return sess.memo.get(k); }
+      const p = Promise.resolve().then(() => fetchLeg(a, b, departMs, (n) => tally(sess, n)));
+      p.catch(() => {}); // a failure reaches every caller that awaits it; never an unhandled rejection
+      sess.memo.set(k, p);
+      return p;
+    };
+  }
+  // The PLAN banner: 'Travel times: TomTom Routing — 12 requests (live).' (n = session.requests)
+  function bannerText(n, live, checked) {
+    return 'Travel times: TomTom Routing — ' + n + ' request' + (n === 1 ? '' : 's') + (live ? ' (live)' : checked ? ' (route checked)' : '') + '.';
   }
   // Settings -> Travel times: "Learned: N pairs · last typical time from TomTom: today HH:MM | 23 Nov | none yet"
   // (+ " · last reply had no typical time" when the most recent answer had none). Malaysia time.
@@ -208,7 +266,7 @@
     const run = await runFetches(jobs, async (jb) => {
       const r = await o.fetchLeg(jb.a, jb.b, jb.at);
       if (!r || r.seconds == null || !isFinite(r.seconds)) return null;
-      remember(o.mem, jb.a, jb.b, jb.at, r, nowMs);
+      remember(o.mem, jb.a, jb.b, jb.at, r, nowMs, o.seen);
       return r;
     }, { onProgress: o.onProgress, concurrency: o.concurrency });
     run.results.forEach((r, k) => { if (r) val[jobs[k].i][jobs[k].j] = { s: r.seconds, m: r.metres }; });
@@ -236,7 +294,7 @@
     const run = await runFetches(legs, async (l) => {
       const r = await fetchLeg(l.a, l.b, l.at);
       if (!r || r.seconds == null || !isFinite(r.seconds)) return null;
-      remember(mem, l.a, l.b, l.at, r, nowMs);
+      remember(mem, l.a, l.b, l.at, r, nowMs, opts && opts.seen);
       return { s: r.seconds, m: r.metres };
     }, opts);
     return { values: run.results, down: run.down, requests: run.started };
@@ -402,7 +460,7 @@
     const dwellSum = bs.stopIds.reduce((a, pid) => a + (Number(input.places[pid].dwellMin) || 0) * 60, 0);
     const live = k <= LIVE_TABLE_MAX;
     const bucket = planBucket(t0, dwellSum);
-    const tab = await buildTable({ start: o.start, stops, end: o.end, links, mem: o.mem, bucket, planMs: t0, nowMs, live, liveDepartMs: t0, fetchLeg: o.fetchLeg, onProgress: o.onProgress });
+    const tab = await buildTable({ start: o.start, stops, end: o.end, links, mem: o.mem, bucket, planMs: t0, nowMs, live, liveDepartMs: t0, fetchLeg: o.fetchLeg, onProgress: o.onProgress, seen: o.seen });
     let checkRequests = 0, checks = 0, solves = 1;
     const base = { start: input.start, end: input.end, jobs: input.jobs, places: input.places, departAtISO: input.departAtISO, noDetour: !!input.noDetour, respectClosedWindows: !!input.respectClosedWindows };
     const timing = [{ departAt: input.departAtISO, m: tab.m.map((r) => r.slice()), d: tab.d.map((r) => r.slice()), est: tab.est.map((r) => r.slice()) }];
@@ -426,7 +484,7 @@
       const ts = await twoStep({
         table: tab.m,
         solve: (m) => { const r = solveOn(m); return r.error || !r.plans.length ? null : { order: r.plans[0].order, legs: legsOf(r.plans[0]), r }; },
-        check: async (legs) => { const got = await checkLegs(legs.map((l) => ({ a: tab.nodes[l.i], b: tab.nodes[l.j], at: l.at })), o.fetchLeg, o.mem, nowMs, { onProgress: o.onProgress }); checkRequests += got.requests; return got; },
+        check: async (legs) => { const got = await checkLegs(legs.map((l) => ({ a: tab.nodes[l.i], b: tab.nodes[l.j], at: l.at })), o.fetchLeg, o.mem, nowMs, { onProgress: o.onProgress, seen: o.seen }); checkRequests += got.requests; return got; },
       });
       checks = ts.checks; solves = ts.solves;
       res = ts.result ? ts.result.r : solveOn(tab.m);
@@ -443,6 +501,7 @@
     BUCKETS, LABEL, MAX_SAMPLES, SNAP_M, CONCURRENCY, CHECK_RATIO, SWITCH_MIN_SEC, FULL_REFRESH_MAX, LIVE_TABLE_MAX, ORIGIN, END,
     bucketOf, bucketDepart, planBucket, minOfDay,
     emptyMemory, memKey, medianSample, addSample, learned, pairCount, normaliseMemory, sampleOf, remember, learnedLine,
+    planSession, tally, sessionFetch, bannerText, LEARNED_CLEAR_FLAG, clearSamples, runLearnedClearOnce,
     snap, neededPairs, runFetches, buildTable, checkLegs, twoStep, planRoute, agreement, nextCandidates, lookAhead, decide, reorderText, reorderStops, solverAdapter,
   };
 });
