@@ -19,6 +19,11 @@
  *      mocked fetches == the banner number == the Usage counter's rise (12 pairs + 1 retry = 13), the same after opening the
  *      Route tab again; then PLAN from the Office place (the Route tab's first re-time from the GPS fix is part of the
  *      PLAN): 12 + 1 = 13 again, and the banner says so.
+ *  9a-b. The even pacing (one request start every 300 ms): the mock adds a seeded random ARRIVAL latency of 0-200 ms to every Routing
+ *      request and ENFORCES TomTom's 5 queries per second on the arrivals, strictly, no tolerance (a 6th arrival inside any rolling
+ *      second answers 429 and is counted), in every walk. A fresh 3-stop world (no 429 forced): 12 fetches, 0 rate-limit 429s, banner 12, counter +12, at most 4
+ *      starts in any rolling second; a fresh 6-stop world with nothing learned: 0 rate-limit 429s, banner == counter rise == fetches,
+ *      every ETA a real time, no two starts closer than 300 ms, and the PLAN's wait is printed.
  *  10. A fresh world (5 stops from a GPS origin that is no saved place): DONE, a PLAN on the running day from a point off
  *      every stop, DONE, End day with 3 stops remaining -> the km tile shows km (not "unavailable"), 0 TomTom requests for
  *      it; Close day; the history row has km and no "day(s) without km"; PLAN again the same date at 19:54 -> the km stays;
@@ -71,6 +76,11 @@ const WORLD5 = { 'waypoint:settings:main': Object.assign({}, SEED['waypoint:sett
 PLACES.forEach((p) => { WORLD5['waypoint:places:' + p.id] = p; });
 ['pA', 'pB', 'pC', 'pD', 'pF'].forEach((pid, i) => { WORLD5['waypoint:jobs:j' + (i + 1)] = job('j' + (i + 1), pid, 'Crate ' + (i + 1)); });
 
+// step 11b's world: six customer stops (A..F, H), the same GPS origin, nothing learned
+const WORLD6 = { 'waypoint:settings:main': Object.assign({}, SEED['waypoint:settings:main']) };
+PLACES.forEach((p) => { WORLD6['waypoint:places:' + p.id] = p; });
+['pA', 'pB', 'pC', 'pD', 'pF', 'pH'].forEach((pid, i) => { WORLD6['waypoint:jobs:j' + (i + 1)] = job('j' + (i + 1), pid, 'Case ' + (i + 1)); });
+
 const INIT = `(() => {
   const RealDate = Date;
   // the clock is pinned: 24 Nov 2026 02:00 UTC = 10:00 Malaysia time
@@ -106,6 +116,8 @@ const INIT = `(() => {
   const same = (p, q) => Math.abs(p.lat - q.lat) < 1e-4 && Math.abs(p.lng - q.lng) < 1e-4;
   // __rt: every Routing call {a, b, departAt}; __mx: Matrix calls; __slow: [from, to] made 3 h slower; __deny: a point -> 403
   window.__rt = []; window.__mx = 0; window.__places = 0; window.__other = 0; window.__slow = null; window.__deny = null; window.__once429 = null;
+  window.__rlT = []; window.__rlS = []; window.__rl429 = 0; // arrival times and start times (performance.now) of every Routing request; 429 for being too fast
+  { let seed = 20261124; window.__rnd = () => { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; } // seeded: runs repeat
   window.fetch = async (url, init) => {
     url = String(url);
     if (url.includes('api.tomtom.com/routing/1/calculateRoute/')) {
@@ -113,6 +125,9 @@ const INIT = `(() => {
       const a = { lat: q[0], lng: q[1] }, b = { lat: q[2], lng: q[3] };
       const dep = decodeURIComponent((url.split('departAt=')[1] || '').split('&')[0]);
       window.__rt.push({ a, b, departAt: dep, at: Date.now() });
+      window.__rlS.push(performance.now());
+      await new Promise((r) => setTimeout(r, Math.floor(window.__rnd() * 201))); // arrival latency 0-200 ms
+      { const tn = performance.now(); window.__rlT.push(tn); if (window.__rlT.filter((x) => x > tn - 1000).length > 5) { window.__rl429++; return new Response('{}', { status: 429, headers: { 'Content-Type': 'application/json' } }); } }
       if (window.__once429 && same(a, window.__once429[0]) && same(b, window.__once429[1])) { window.__once429 = null; return new Response('{}', { status: 429, headers: { 'Content-Type': 'application/json' } }); }
       if (window.__deny && (same(a, window.__deny) || same(b, window.__deny))) return new Response(JSON.stringify({ detailedError: { code: 'Forbidden', message: 'You do not have enough credits to perform this action' } }), { status: 403, headers: { 'Content-Type': 'application/json' } });
       const k = km(a, b);
@@ -198,12 +213,26 @@ async function main() {
     const click = (sel) => ev('(() => { const e = document.querySelector(' + JSON.stringify(sel) + '); if (!e) throw new Error("no " + ' + JSON.stringify(sel) + '); e.click(); return true; })()');
     const rt = () => ev('window.__rt.length');
     const tab = (name) => click('#tabs button[data-tab="' + name + '"]');
-    const settle = async () => { await sleep(300); await waitFor('!WaypointDebug.S.busy && !WaypointDebug.S.loc.busy', 'the app to settle', 10000); await sleep(200); };
+    // settled = not busy AND the TomTom limiter's queue empty AND no new Routing request for 1.3 s (the paced look-ahead after a DONE
+    // is not "busy"; it takes seconds: 30 requests = about 8 s)
+    const settle = async () => {
+      await sleep(300);
+      await waitFor('!WaypointDebug.S.busy && !WaypointDebug.S.loc.busy', 'the app to settle', 45000);
+      let last = -1, since = Date.now();
+      for (let i = 0; i < 400; i++) {
+        const n = (await rt()) + ':' + (await ev('Providers.getLimiter().queued()'));
+        if (n !== last) { last = n; since = Date.now(); }
+        if (/:0$/.test(n) && Date.now() - since >= 1300) break;
+        await sleep(100);
+      }
+      await waitFor('!WaypointDebug.S.busy && !WaypointDebug.S.loc.busy', 'the app to settle', 45000);
+      await sleep(200);
+    };
     const plan = async (nStops) => {
       await tab('plan');
       await waitFor('document.querySelector("#planBtn") && !WaypointDebug.S.busy', 'the Plan tab');
       await click('#planBtn');
-      await waitFor('!WaypointDebug.S.busy && WaypointDebug.S.tab === "route" && document.querySelectorAll(".timeline .card.stop").length === ' + nStops, 'the planned route', 15000);
+      await waitFor('!WaypointDebug.S.busy && WaypointDebug.S.tab === "route" && document.querySelectorAll(".timeline .card.stop").length === ' + nStops, 'the planned route', 45000);
       await settle();
     };
     const pending = () => ev('WaypointDebug.S.plan.result.plans[0].stops.filter((s) => !s.status).map((s) => s.placeId)');
@@ -220,6 +249,11 @@ async function main() {
     };
     const replans = () => ev('(() => { const S = WaypointDebug.S, d = Object.values(S.days)[0]; return d ? DayLog.summarise(d, S.jobs, S.places).plan.replans : 0; })()');
     const etaTexts = () => ev('[...document.querySelectorAll(".timeline .card.stop .stop-head .times")].map((e) => e.textContent).concat([document.getElementById("endArrive").textContent])');
+
+    // the smallest gap between two Routing starts (300 ms or more) and the responses it refused for being too fast
+    // (start times as the mock saw them, a hair after the limiter's own reading: 299 ms stands for 300)
+    const minGap = () => ev('(() => { const t = window.__rlS; return t.length < 2 ? 1e9 : Math.min(...t.slice(1).map((x, i) => x - t[i])); })()');
+    const rl429 = () => ev('window.__rl429');
 
     console.log('1. PLAN 6 stops A..F from O to E at a mocked 10:00');
     await send('Page.navigate', { url: appUrl });
@@ -239,6 +273,7 @@ async function main() {
     const etas = await etaTexts();
     check(etas.length === 7 && etas.every((t) => !/est\./.test(t)), 'no ETA is marked "est."', etas);
     check(!(await ev('document.getElementById("estHeader")')), 'no "Estimated" chip in the header');
+    check((await rl429()) === 0 && (await minGap()) >= 299, 'the paced PLAN: 0 responses with 429 from the strict 5-per-second mock (arrival latency 0-200 ms), no two starts closer than 300 ms', { rl429: await rl429(), gap: await minGap() });
 
     console.log('2. PLAN again');
     let n0 = await rt();
@@ -336,6 +371,45 @@ async function main() {
     const ll = await ev('document.getElementById("learnedLine").textContent');
     check(/^Learned: [1-9]\d* pairs? · last typical time from TomTom: today \d\d:\d\d$/.test(ll) && ll.indexOf('Learned: ' + await ev('TravelTimes.pairCount(WaypointDebug.S.mem)') + ' pair') === 0, 'Settings -> Travel times: "Learned: N pairs · last typical time from TomTom: today HH:MM"', ll);
     check(await ev('window.__other') === 0, 'no other network calls left the page');
+
+    console.log('9a. A fresh world: 3 stops + Home from a GPS origin (no saved place), nothing forced: the paced PLAN');
+    const loadWorld = async (world, nJobs) => {
+      await send('Page.navigate', { url: appUrl.replace('index.html', '__blank') });
+      await sleep(500);
+      await ev('(() => { localStorage.clear(); const w = ' + JSON.stringify(world) + '; Object.keys(w).forEach((k) => localStorage.setItem(k, JSON.stringify(w[k]))); localStorage.setItem("__seeded", "1"); return true; })()');
+      await send('Page.navigate', { url: appUrl });
+      await waitFor('window.WaypointDebug && WaypointDebug.S.jobs.length === ' + nJobs + ' && document.querySelector("#planBtn")', 'the ' + nJobs + '-stop world');
+      await ev('(() => { window.__gps = ' + JSON.stringify(GPS3) + '; return true; })()');
+    };
+    const usedN = () => ev('(() => { const u = WaypointDebug.S.settings.usage.routing; return u ? u.d : 0; })()');
+    const bannerNum = async () => { const m = /— (\d+) requests? /.exec(await ev('window.__banners.filter((b) => /^Travel times/.test(b)).slice(-1)[0] || ""')); return m ? Number(m[1]) : null; };
+    await loadWorld(WORLD3, 3);
+    let tp = Date.now();
+    await plan(3);
+    const wait3 = Date.now() - tp;
+    await sleep(500); await settle();
+    const f3 = await rt(), u3 = await usedN(), b3 = await bannerNum();
+    check(f3 === 12 && (await rl429()) === 0 && (await ev('window.__rt.length')) === 12, '3 stops + end from a GPS origin: 12 fetches, 0 responses with 429', { fetched: f3, rl429: await rl429(), startsMs: await ev('window.__rlT.map((x, i, a) => Math.round(x - a[0]))'), departAt: await ev('window.__rt.map((c) => c.departAt.slice(11, 16))') });
+    check(b3 === 12 && u3 === 12, 'banner 12, Usage counter +12', { banner: b3, counter: u3 });
+    check((await minGap()) >= 299, 'no two request starts closer than 300 ms (smallest gap: ' + Math.round(await minGap()) + ' ms)', await minGap());
+    check((await etaTexts()).every((t) => !/est\./.test(t)), 'every ETA is a real time (no "est.")', await etaTexts());
+    console.log('   ... the 3-stop PLAN waited ' + wait3 + ' ms in all (table + check legs, paced)');
+
+    console.log('9b. A fresh world: 6 stops, nothing learned, from a GPS origin: the paced PLAN');
+    await loadWorld(WORLD6, 6);
+    const rl0 = await rl429();
+    tp = Date.now();
+    await plan(6);
+    const wait6 = Date.now() - tp;
+    await sleep(500); await settle();
+    const f6 = await rt(), u6 = await usedN(), b6 = await bannerNum();
+    check((await rl429()) === rl0 && rl0 === 0, '6 stops with nothing learned: 0 responses with 429', { rl429: await rl429(), fetched: f6 });
+    check(b6 === f6 && u6 === f6 && f6 > 30, 'banner == Usage counter rise == the mock\'s fetch count (' + f6 + ')', { banner: b6, counter: u6, fetched: f6 });
+    check((await minGap()) >= 299, 'no two request starts closer than 300 ms (smallest gap: ' + Math.round(await minGap()) + ' ms)', await minGap());
+    const e6 = await etaTexts();
+    check(e6.length === 7 && e6.every((t) => !/est\./.test(t)) && await ev('WaypointDebug.S.plan.result.plans[0].stops.every((s) => s.arriveAt != null) && !WaypointDebug.S.plan.provider.estimated'), 'every leg has a travel time (7 ETAs, none "est.", the plan not estimated)', e6);
+    check(wait6 > wait3 && wait6 < 40000, 'the 6-stop PLAN took longer than the 3-stop one, still under 40 s', { wait3, wait6 });
+    console.log('   ... the 6-stop PLAN waited ' + wait6 + ' ms in all (' + f6 + ' requests, paced)');
 
     console.log('9. A fresh world: 3 stops + Home from a GPS origin (no saved place), one leg answered 429 once');
     await send('Page.navigate', { url: appUrl.replace('index.html', '__blank') }); // same origin, no app: nothing writes the storage meanwhile

@@ -29,8 +29,44 @@
   // 401 / 403 (bad key, not allowed, allowance used up) / 429 (after the retries) / 5xx / unreachable: one friendly error
   const isDown = (status) => status === 0 || status === 401 || status === 403 || status === 429 || status >= 500;
   const downError = (status) => new ProviderError('TomTom', Budget.DOWN_MSG, 'limit', status);
-  const RETRY_MS = [1500]; // a 429 waits and retries that leg ONCE (never more); a second 429 = TomTom out
-  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const RETRY_MS = [1200]; // a 429 waits (at least) this long, then retries that leg ONCE through the limiter (never more); a second 429 = TomTom out
+
+  // ---------- the rate limiter: ONE in front of every TomTom Routing request ----------
+  // TomTom's Routing API allows 5 queries per second, counted on ARRIVAL (network latency moves arrivals around). So the starts
+  // are spread EVENLY: at most ONE request start every `gapMs` (300 ms), first in first out (a burst of starts, even a legal-looking
+  // 4 a second, can land 8 arrivals inside one second). The clock and the timer are injectable
+  // (o.now() -> ms on any steady clock, o.setTimer(fn, ms) -> id, o.clearTimer(id)), so a test runs on a fake clock.
+  function createLimiter(o) {
+    o = o || {};
+    const now = o.now || (typeof performance !== 'undefined' && performance.now ? () => performance.now() : () => Date.now());
+    const setTimer = o.setTimer || ((fn, ms) => setTimeout(fn, ms));
+    const clearTimer = o.clearTimer || ((id) => clearTimeout(id));
+    const gapMs = o.gapMs != null ? o.gapMs : 300;
+    const queue = [];  // {fn, resolve, reject}, first in first out
+    let lastStart = -Infinity, timer = null;
+    function pump() {
+      if (timer != null) { clearTimer(timer); timer = null; }
+      const t = now();
+      if (queue.length && t >= lastStart + gapMs) {
+        const job = queue.shift();
+        lastStart = t;
+        let p;
+        try { p = Promise.resolve(job.fn()); } catch (e) { p = Promise.reject(e); }
+        p.then(job.resolve, job.reject);
+      }
+      if (queue.length) timer = setTimer(pump, Math.max(0, lastStart + gapMs - t));
+    }
+    // run(fn) -> Promise of fn's result; fn is called (the request STARTS) when the limiter lets it
+    function run(fn) {
+      return new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); pump(); });
+    }
+    // sleep(ms) on the limiter's own timer (the 429 back-off), so a fake clock drives it too
+    const sleep = (ms) => new Promise((r) => setTimer(r, ms));
+    return { run, sleep, queued: () => queue.length, now };
+  }
+  let limiter = createLimiter();
+  function setLimiter(l) { limiter = l || createLimiter(); }
+  const getLimiter = () => limiter;
 
   // ---------- TomTom Routing API: one leg ----------
   const pad2 = (n) => (n < 10 ? '0' : '') + n;
@@ -55,10 +91,11 @@
     const url = routeUrl(from, to, departAtMs, key, Date.now());
     for (let attempt = 0; ; attempt++) {
       let res;
-      try { res = await fetch(url); } catch (e) { hookCall('down', 0); throw downError(0); }
+      // every attempt (a retry too) is a request START the limiter paces; the fetch itself is called only when it lets it
+      try { res = await limiter.run(() => fetch(url)); } catch (e) { hookCall('down', 0); throw downError(0); }
       hookCall('count', 'routing', 1);
       if (onCount) { try { onCount(1); } catch (e) { /* counting never breaks a lookup */ } }
-      if (res.status === 429 && attempt < RETRY_MS.length) { await wait(RETRY_MS[attempt]); continue; }
+      if (res.status === 429 && attempt < RETRY_MS.length) { await limiter.sleep(RETRY_MS[attempt]); continue; }
       const body = await res.json().catch(() => ({}));
       if (!res.ok && isDown(res.status)) { hookCall('down', res.status); throw downError(res.status); }
       if (!res.ok) {
@@ -190,5 +227,5 @@
     return { seconds: r.m[0][1], metres: r.d[0][1], typicalSeconds: null };
   }
 
-  return { ProviderError, RETRY_MS, departParam, routeUrl, legKey, routeLeg, searchGoogle, tomtomMatrix, getMatrices, getMatricesOrEstimate, estimateMatrices, matrixLeg, clearCache, setTomTomHook };
+  return { ProviderError, RETRY_MS, createLimiter, setLimiter, getLimiter, departParam, routeUrl, legKey, routeLeg, searchGoogle, tomtomMatrix, getMatrices, getMatricesOrEstimate, estimateMatrices, matrixLeg, clearCache, setTomTomHook };
 });

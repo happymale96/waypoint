@@ -55,6 +55,7 @@ console.log('16. regression (24 Nov): TomTom unavailable -> the estimated order 
   Providers.setTomTomHook({ count: (k, n) => seen.count.push(k + ':' + n), ok: () => { seen.ok++; }, down: (st) => seen.down.push(st) });
   ok(Providers.RETRY_MS.length === 1, 'a 429 is retried at most once (one retry delay)', Providers.RETRY_MS);
   Providers.RETRY_MS.splice(0, Providers.RETRY_MS.length, 1); // no real waiting in the test (still one retry)
+  Providers.setLimiter(Providers.createLimiter({ max: 1e9 })); // the 4-per-second pacing has its own test (limiter.test.js); no real waiting here
   const urls = [];
   let script = [];
   global.fetch = async (url, init) => {

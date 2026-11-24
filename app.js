@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = 'd025e952'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '29c11ac6'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -956,7 +956,9 @@
   // Returns {res (solver result, plans timed on the timing table), matrices, estimated, requests, checks, live, firstLegLive}.
   async function routingPlan(input, departAt, noDetour) {
     const nowMs = Date.now(), t0 = departAt.getTime();
-    const progress = (d, n) => banner('Getting travel times ' + d + ' of ' + n + '…', 'busy');
+    // TomTom Routing is paced to one request start every 300 ms (Providers.createLimiter): a batch of more than 4 waits in its queue,
+    // so the PLAN notice counts it ("Getting travel times 5 of 42…"); it goes when the PLAN's banner takes its place
+    const progress = (d, n) => { if (n > 4) banner('Getting travel times ' + d + ' of ' + n + '…', 'busy'); };
     banner('Getting travel times…', 'busy');
     const sess = S.tt.planSess || (S.tt.planSess = TT.planSession());
     const r = await TT.planRoute({
