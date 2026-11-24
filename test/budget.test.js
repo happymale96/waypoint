@@ -1,5 +1,5 @@
 'use strict';
-// TomTom budget: the live re-time triggers (Budget.retimeDecision) and the daily counter / guard (UTC day).
+// TomTom budget: the live re-time triggers (Budget.retimeDecision), the usage counters (per day / UTC month) and the 90% guard.
 // Run as its own node script: node test/budget.test.js
 const Budget = require('../budget.js');
 
@@ -49,34 +49,42 @@ console.log('triggers: gaps, always, hidden, idle');
   ok(Budget.retimeDecision({ lastAt: null }, { type: 'visible', at: t, visible: true }).call, 'the first visible (launch) with no re-time yet: yes');
 }
 
-console.log('counter: UTC day rollover (08:00 Malaysia time)');
+console.log('15. counters: per day (Malaysia date) and per UTC calendar month; the month rolls over at 00:00 UTC on the 1st');
 {
-  const before = Date.UTC(2026, 10, 23, 23, 59, 0); // 24 Nov 07:59 MYT
-  const after = Date.UTC(2026, 10, 24, 0, 0, 1); //   24 Nov 08:00 MYT
-  let rec = Budget.addUsage(null, before, 3, 192);
-  rec = Budget.addUsage(rec, before, 1, 1);
-  ok(rec.day === '2026-11-23' && rec.requests === 4 && rec.cells === 193, 'counts requests and cells on the UTC day', rec);
-  const u = Budget.usage(rec, after);
-  ok(u.day === '2026-11-24' && u.requests === 0 && u.cells === 0, 'at 08:00 MYT (00:00 UTC) the day rolls over to 0 / 0', u);
-  const r2 = Budget.addUsage(rec, after, 1, 1);
-  ok(r2.day === '2026-11-24' && r2.requests === 1 && r2.cells === 1, 'the first call of the new day starts from 0', r2);
-  ok(Budget.usageLine(Budget.addUsage(null, after, 12, 1234), after) === 'TomTom today: 12 requests / 1,234 cells (free limit 2,500 per day, resets 08:00 Malaysia time)', 'Settings line wording', Budget.usageLine(Budget.addUsage(null, after, 12, 1234), after));
-  ok(Budget.usageLine(null, after) === 'TomTom today: 0 requests / 0 cells (free limit 2,500 per day, resets 08:00 Malaysia time)', 'no usage yet: 0 / 0');
+  const lastMin = Date.UTC(2026, 10, 30, 23, 59, 0); // 30 Nov 23:59 UTC = 1 Dec 07:59 MYT
+  const nextMonth = Date.UTC(2026, 11, 1, 0, 0, 1); //  1 Dec 00:00 UTC = 1 Dec 08:00 MYT
+  let u = Budget.bump(null, 'routing', Date.UTC(2026, 10, 30, 3, 0, 0), 40); // 30 Nov 11:00 MYT
+  u = Budget.bump(u, 'routing', lastMin, 2);
+  const c1 = Budget.countOf(u.routing, lastMin);
+  ok(c1.month === 42 && c1.today === 2, 'November: 42 this month; 2 today (the Malaysia date is already 1 Dec)', c1);
+  const c2 = Budget.countOf(u.routing, nextMonth);
+  ok(c2.month === 0 && c2.today === 2, '1 Dec 00:00 UTC: the month starts again at 0 (today still 2: same Malaysia date)', c2);
+  u = Budget.bump(u, 'routing', nextMonth, 1);
+  ok(Budget.countOf(u.routing, nextMonth).month === 1 && Budget.countOf(u.routing, nextMonth).today === 3, 'the first request of December: month 1, today 3');
+  u = Budget.bump(u, 'places', nextMonth, 5);
+  ok(Budget.countOf(u.places, nextMonth).month === 5 && Budget.countOf(u.matrix, nextMonth).month === 0, 'Places counted on their own; Matrix stays 0');
+  const L = Budget.usageLines(u, nextMonth, 20000, 5);
+  ok(L.routing === 'TomTom Routing   3 today · 1 this month of 20,000' && L.places === 'Google Places    5 today · 5 this month  (daily guard 140)' && L.matrix === null, 'the Usage card lines (Matrix hidden while 0)', L);
+  const L2 = Budget.usageLines(Budget.bump(u, 'matrix', nextMonth, 1), nextMonth, 20000, 5);
+  ok(L2.matrix === 'TomTom Matrix    1 today · 1 this month', 'Matrix shown once it is above 0', L2.matrix);
+  ok(!/08:00|resets/.test(JSON.stringify(L) + Budget.DOWN_MSG + Budget.GUARD_MSG), 'no daily-reset / 08:00 wording anywhere');
+  ok(Budget.DOWN_MSG === 'TomTom unavailable or monthly allowance used up - using estimated times', 'the banner text');
 }
 
-console.log('guard at 2,000 (the larger of requests and cells)');
+console.log('15. 90% of the monthly allowance pauses the automatic re-times and the look-ahead only');
 {
   const t = Date.UTC(2026, 10, 24, 5, 0, 0);
-  const low = Budget.addUsage(null, t, 1999, 1999);
-  ok(!Budget.guardHit(low, t), '1,999 / 1,999: not hit');
-  const byCells = Budget.addUsage(null, t, 30, 2000), byReq = Budget.addUsage(null, t, 2000, 10);
-  ok(Budget.guardHit(byCells, t) && Budget.guardHit(byReq, t), 'hit at 2,000 cells (30 requests) and at 2,000 requests (10 cells)');
+  const below = Budget.bump(null, 'routing', t, 17999), at90 = Budget.bump(null, 'routing', t, 18000);
+  ok(!Budget.guardHit(below, t, 20000) && Budget.guardHit(at90, t, 20000), '20,000 allowance: 17,999 not paused, 18,000 (90%) paused');
+  ok(Budget.guardHit(Budget.bump(null, 'routing', t, 900), t, 1000) && !Budget.guardHit(Budget.bump(null, 'routing', t, 899), t, 1000), 'the allowance is editable (1,000 -> 900)');
+  ok(!Budget.guardHit(at90, Date.UTC(2026, 11, 1, 0, 0, 1), 20000), 'the next UTC month: the pause is lifted');
   const st = { lastAt: t - 30 * MIN };
-  const dec = (type) => Budget.retimeDecision(st, { type, at: t, visible: true, pending: true, guard: Budget.guardHit(byCells, t) });
-  ok(!dec('tick').call && dec('tick').why === 'guard' && !dec('visible').call, 'guard: the automatic re-times (10-minute tick, visible) stop');
-  ok(dec('plan').call && dec('done').call && dec('skip').call && dec('undo').call && dec('tap').call, 'guard: PLAN, DONE-driven and tapped re-times continue');
-  const next = Date.UTC(2026, 10, 25, 0, 0, 1);
-  ok(!Budget.guardHit(byCells, next), 'the next UTC day: the guard is lifted');
+  const dec = (type) => Budget.retimeDecision(st, { type, at: t, visible: true, pending: true, guard: Budget.guardHit(at90, t, 20000) });
+  ok(!dec('tick').call && dec('tick').why === 'guard' && !dec('visible').call, 'paused: the 10-minute and the on-visible re-times');
+  ok(dec('plan').call && dec('tap').call && dec('done').call && dec('skip').call, 'not paused: PLAN, tapped re-times, DONE / SKIP re-times');
+  ok(Budget.afterStopMode({ setting: 'auto', pending: 3, guard: true }) === 'single' && Budget.afterStopMode({ setting: 'auto', pending: 3, guard: false }) === 'lookahead', 'paused: the after-stop look-ahead (DONE falls back to a single next-stop re-time)');
+  ok(Budget.afterStopMode({ setting: 'auto', pending: 1 }) === 'single' && Budget.afterStopMode({ setting: 'off', pending: 4 }) === 'single' && Budget.afterStopMode({ setting: 'ask', pending: 2 }) === 'lookahead', 'look-ahead only with 2+ pending and the setting not Off');
+  ok(Budget.afterStopMode({ setting: 'auto', pending: 3, down: true }) === 'single', 'TomTom unavailable: no look-ahead');
 }
 
 console.log('live origin: counts down until the next re-time');

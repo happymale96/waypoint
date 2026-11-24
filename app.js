@@ -1,9 +1,9 @@
-/* L-Tech Waypoint — app.js (UI). Depends on WPStore, Solver, Messages, Providers. */
+/* L-Tech Waypoint — app.js (UI). Depends on WPStore, Solver, Messages, Budget, TravelTimes, Providers. */
 (function () {
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '6ec301cb'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '03077b48'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -37,7 +37,8 @@
     fuelStations: [], // permanent station memory (see FUEL STOP below); in Export / Import, never shown in the Places tab
     lunch: null, // today's lunch-break state {date, startedAt, endedAt, skipped} (LUNCH BREAK below); stored as meta:lunchBreak
     loose: [], // items collected by a collect-only job, still with the driver (ITEMS WITH YOU below); collection "loose", in Export / Import
-    tt: { down: false, lastLiveAt: null }, // TomTom: out (limit / unavailable) since the last failed call; the last live re-time (TOMTOM BUDGET below)
+    tt: { down: false, lastLiveAt: null }, // TomTom: out (limit / unavailable) since the last failed call; the last live re-time (TOMTOM below)
+    mem: null, // the learned travel times (TravelTimes pair memory), meta:travelMemory, in Export / Import
   };
 
   function defaultSettings() {
@@ -46,7 +47,11 @@
       templates: Object.assign({}, Messages.DEFAULT_TEMPLATES),
       etaPaddingMin: 10, dwellDefaults: Object.assign({}, DEFAULT_DWELL),
       placesCallsToday: { date: todayStr(), count: 0 }, nav: 'waze', seeded: false, driverName: 'Calvin',
-      tomtomUsage: null, // {day (UTC), requests, cells}: TomTom usage on this device today (TOMTOM BUDGET)
+      usage: {}, // {routing, matrix, places}: requests per day and per UTC month on this device (Budget.bump), in Export / Import
+      ttService: 'routing', // Settings -> TomTom service: 'routing' (default, Routing API) | 'matrix' (Matrix Routing v2)
+      ttAllowance: Budget.ROUTING_ALLOWANCE, // TomTom Routing requests per month (free plan 20,000)
+      afterStop: 'auto', // After each stop, look for a faster order: 'auto' (switch automatically) | 'ask' | 'off'
+      fullRefreshMax: TravelTimes.FULL_REFRESH_MAX, // look-ahead: this many pending stops or fewer -> every needed pair is refreshed
       fuelBrand: 'Caltex', fuelDwellMin: 7, fuelMaxSearches: 50,
       autoReach: true, // mark Reached automatically within 150 m (app open); stored on the device, in Export / Import
       // the driver's lunch break (Settings -> Lunch break; device-stored, in Export / Import)
@@ -63,6 +68,8 @@
     s.dwellDefaults = Object.assign({}, DEFAULT_DWELL, stored.dwellDefaults || {});
     s.templates = Object.assign({}, Messages.DEFAULT_TEMPLATES, stored.templates || {});
     S.settings = s;
+    delete s.tomtomUsage; // the old daily counter (replaced by settings.usage)
+    try { S.mem = TravelTimes.normaliseMemory(await WPStore.get('meta', 'travelMemory')); } catch (e) { S.mem = TravelTimes.emptyMemory(); }
     const fm = await WPStore.get('meta', 'fuelStations');
     S.fuelStations = fm && Array.isArray(fm.list) ? fm.list : [];
     (await WPStore.list('places')).forEach((p) => { S.places[p.id] = p; });
@@ -77,6 +84,7 @@
     await runMigrations();
     const dwellRes = await runDwellMigration(false); // once per device (flag in meta/migrations)
     await runPinMigration(false); // once per device: every office-type place is pinned (no toast)
+    await runTomTomMigration(); // once per device: TomTom service = Routing; the Bahasa Malaysia template's old default -> the new one
     await loadDays();
     S.loose = (await WPStore.list('loose')).filter((x) => x && x.id);
     await backfillLoose(); // once: today's / the latest closed day's collect-only jobs get their loose item
@@ -122,6 +130,18 @@
     rec2[Geo.PIN_FLAG] = true;
     await WPStore.set('meta', 'migrations', rec2);
     return res;
+  }
+  // One-time (2026-11-24): every existing device moves to the Routing API (Matrix Routing's monthly allowance is used up), and
+  // the Bahasa Malaysia template becomes the owner's own wording if it is still exactly the old default (an edited one stays).
+  const TT_FLAG = 'ttRouting2026_11_24';
+  async function runTomTomMigration() {
+    const rec = (await WPStore.get('meta', 'migrations')) || { done: [] };
+    let changed = false;
+    if (!rec[TT_FLAG]) { S.settings.ttService = 'routing'; rec[TT_FLAG] = true; changed = true; }
+    if (!rec[Messages.TEMPLATE_FLAG]) { S.settings.templates = Messages.migrateTemplates(S.settings.templates).templates; rec[Messages.TEMPLATE_FLAG] = true; changed = true; }
+    if (!changed) return;
+    await saveSettings();
+    await WPStore.set('meta', 'migrations', rec);
   }
   const dwellToastText = (r) => 'Updated: ' + r.suppliers + ' supplier places to 10 min, ' + r.customers + ' customer places to 30 min, ETA padding to 10 min';
   // An active plan: the stops not done take the new place dwell; the next re-time (existing path) moves the times. The order is kept.
@@ -193,6 +213,7 @@
     const c = S.settings.placesCallsToday;
     if (c.date !== todayStr()) { c.date = todayStr(); c.count = 0; }
     c.count++;
+    S.settings.usage = Budget.bump(S.settings.usage, 'places', Date.now(), 1); // the monthly total (Usage card)
     saveSettings();
   }
   function placesCallsToday() {
@@ -200,70 +221,54 @@
     return c.date === todayStr() ? c.count : 0;
   }
 
-  // ---------- TOMTOM BUDGET (the rules live in budget.js) ----------
-  // Every TomTom response is counted per UTC day (requests + matrix cells, settings.tomtomUsage). From Budget.GUARD the
-  // automatic live re-times (visible, the 10-minute tick) stop for the rest of that UTC day. A 401 / 403 / 429 / 5xx /
-  // unreachable answer sets S.tt.down: ONE notice on the Plan and Route tabs; PLAN uses estimated times; the next
-  // successful call clears it.
-  const ttGuard = () => Budget.guardHit(S.settings.tomtomUsage, Date.now());
+  // ---------- TOMTOM (rules: budget.js; travel times: traveltimes.js) ----------
+  // Every TomTom response is counted per day and per UTC month (settings.usage: routing / matrix; Places in the same record).
+  // From 90% of the monthly Routing allowance the automatic live re-times (visible, the 10-minute tick) and the after-stop
+  // look-ahead pause for the rest of the month. A 401 / 403 / 429 (after retries) / 5xx / unreachable answer sets S.tt.down:
+  // ONE notice on the Plan and Route tabs; PLAN uses estimated times; the next successful call clears it.
+  const TT = TravelTimes;
+  const ttAllowance = () => Budget.allowanceOf(S.settings.ttAllowance);
+  const ttGuard = () => Budget.guardHit(S.settings.usage, Date.now(), ttAllowance());
+  const ttService = () => (S.settings.ttService === 'matrix' ? 'matrix' : 'routing');
   function ttRepaint() { if ((S.tab === 'route' || S.tab === 'plan') && !S.busy && !document.querySelector('.backdrop')) render(); }
   Providers.setTomTomHook({
-    count(requests, cells) {
+    count(kind, n) {
       const wasGuard = ttGuard();
-      S.settings.tomtomUsage = Budget.addUsage(S.settings.tomtomUsage, Date.now(), requests, cells);
+      S.settings.usage = Budget.bump(S.settings.usage, kind === 'matrix' ? 'matrix' : 'routing', Date.now(), n);
       saveSettings();
       if (!wasGuard && ttGuard()) ttRepaint();
     },
     ok() { if (S.tt.down) { S.tt.down = false; ttRepaint(); } },
     down() { if (!S.tt.down) { S.tt.down = true; ttRepaint(); } },
   });
+  // TomTom counts as out while the last call failed, or while the current plan was made on estimates because TomTom refused
+  const ttOut = () => S.tt.down || !!(S.plan && S.plan.provider && S.plan.provider.refused && S.plan.provider.estimatedOrder);
   function ttNotice() { // the ONE TomTom notice (down wins over the guard); the guard one only on the Route tab
-    if (S.tt.down) return h('div', { class: 'tt-notice down', id: 'ttNotice', role: 'status' }, Budget.DOWN_MSG);
+    if (ttOut()) return h('div', { class: 'tt-notice down', id: 'ttNotice', role: 'status' }, Budget.DOWN_MSG);
     if (S.tab === 'route' && ttGuard()) return h('div', { class: 'tt-notice', id: 'ttNotice', role: 'status' }, Budget.GUARD_MSG);
     return null;
   }
-  // Is a live re-time (one 1 x 1 TomTom request) allowed for this trigger now? Moves the throttle when it is.
+  // Is a live re-time (one TomTom request) allowed for this trigger now? Moves the throttle when it is.
   function liveDue(trigger) {
     const d = Budget.retimeDecision({ lastAt: S.tt.lastLiveAt }, { type: trigger, at: Date.now(), visible: document.visibilityState === 'visible', pending: hasPendingStop(curPlan()), guard: ttGuard() });
     if (d.call) S.tt.lastLiveAt = d.state.lastAt;
     return d.call;
   }
-  // the stored plan's real TomTom cells feed the per-pair cache (the estimated-times fallback reuses them after a reload)
-  function seedPairsFromPlan() {
-    try {
-      const plan = curPlan(), m = plan && plan.model;
-      if (!m || !m.matrices || !m.matrices.length) return;
-      const pl = (id) => S.places[id] || S.plan.ctx.places[id];
-      const pts = [m.start].concat(m.stopIds.map(pl), [m.end]);
-      if (pts.every((p) => p && p.lat != null)) Providers.seedPairs(pts, m.matrices[0]);
-    } catch (e) { /* only a cache */ }
+  // one leg from the chosen TomTom service -> {seconds, metres, typicalSeconds}
+  function ttLeg(a, b, departMs) {
+    return ttService() === 'matrix' ? Providers.matrixLeg(a, b, departMs, S.settings.tomtomKey) : Providers.routeLeg(a, b, departMs, S.settings.tomtomKey);
   }
-  // The re-time after TomTom came back: the estimated legs still ahead are replaced by real times (ONE request over the
-  // remaining chain: next stop ... end point), the est. marks go.
-  async function fillEstimatedLegs() {
-    const P = S.plan, plan = curPlan(), m = plan && plan.model;
-    if (!m) return false;
-    if (!Budget.hasEst(m.matrices)) { if (P.provider && P.provider.estimated) P.provider.estimated = false; return false; } // only cached real times left
-    if (!S.settings.tomtomKey) return false;
-    const k = m.stopIds.length, pidx = (pid) => { const i = m.stopIds.indexOf(pid); return i < 0 ? null : i + 1; };
-    const from = lastDoneIdx(plan);
-    const chain = [from >= 0 ? pidx(plan.stops[from].placeId) : 0];
-    plan.stops.forEach((s) => { if (!s.status && !s.fuel) { const p = pidx(s.placeId); if (p != null) chain.push(p); } });
-    chain.push(k + 1);
-    const idx = chain.filter((p) => p != null);
-    const est = m.matrices[0].est;
-    if (idx.length < 2 || !idx.some((a, i) => i > 0 && est[idx[i - 1]][a])) return false;
-    const pt = (i) => { if (i === 0) return m.start; if (i === k + 1) return m.end; const pl = S.places[m.stopIds[i - 1]] || P.ctx.places[m.stopIds[i - 1]]; return { lat: pl.lat, lng: pl.lng }; };
-    try {
-      const legs = await Providers.routeLegs(idx.map(pt), S.settings.tomtomKey);
-      if (S.plan !== P) return false;
-      legs.forEach((l, i) => {
-        const a = idx[i], b = idx[i + 1];
-        m.matrices.forEach((sl) => { if (l.s != null) sl.m[a][b] = l.s; if (sl.d && l.m != null) sl.d[a][b] = l.m; if (sl.est) sl.est[a][b] = false; });
-      });
-      if (!Budget.hasEst(m.matrices) && P.provider) P.provider.estimated = false;
-      return true;
-    } catch (e) { return false; }
+  // The learned travel times (meta:travelMemory, in Export / Import). A point within 150 m of a saved place IS that place.
+  const saveMemory = () => WPStore.set('meta', 'travelMemory', S.mem).catch(() => {});
+  function nodeOf(key, p, pid) {
+    const id = pid != null && S.places[pid] ? pid : TT.snap(p, Object.values(S.places));
+    return { key, pid: id, lat: p.lat, lng: p.lng };
+  }
+  // a delivery never goes before its own (pending) pickup: those reversed pairs are never fetched
+  function linksOf(jobs) {
+    const out = [];
+    (jobs || []).forEach((j) => { if (j.deliveryPlaceId) (j.pickups || []).filter((p) => !p.done).forEach((p) => { if (p.placeId !== j.deliveryPlaceId) out.push([p.placeId, j.deliveryPlaceId]); }); });
+    return out;
   }
   let curEst = { stops: new Set(), end: false }; // which ETAs on the Route tab carry "est." (set by renderRoute)
   const estMark = (on) => (on ? ' est.' : '');
@@ -831,7 +836,7 @@
     const replan = !!opts.replan || dayRunning();
     const s = S.settings;
     banner(null);
-    if (!s.tomtomKey) { banner('TomTom API key missing — add it in Settings. (Travel times come from TomTom Matrix Routing v2.)', 'error'); return; }
+    if (!s.tomtomKey) { banner('TomTom API key missing — add it in Settings. (Travel times come from the TomTom Routing API.)', 'error'); return; }
     const end = S.places[S.endSel];
     if (!end) { banner('Pick an end place.', 'error'); return; }
     const allJobs = JSON.parse(JSON.stringify(S.jobs));
@@ -861,26 +866,40 @@
       const places = JSON.parse(JSON.stringify(S.places));
       const input = { start, end, jobs, places, departAtISO: departAt.toISOString(), noDetour: false };
       const points = Solver.pointsFor(input);
-      banner('Asking TomTom for travel times (live traffic, 3 time slices)…', 'busy');
-      // TomTom out (limit / unavailable): cached pairs + straight-line estimates, the plan flagged estimated (never blocked)
-      const got = await Providers.getMatricesOrEstimate(points, input.departAtISO, s.tomtomKey, { force: replan });
       const prevNoDetour = S.plan ? S.plan.noDetour : false;
+      let got, routed = null;
+      if (ttService() === 'matrix') { // Settings -> TomTom service: Matrix (the old path: 3 time slices)
+        banner('Asking TomTom for travel times (Matrix, 3 time slices)…', 'busy');
+        got = await Providers.getMatricesOrEstimate(points, input.departAtISO, s.tomtomKey, { force: replan });
+        got.orderEstimated = !!got.estimated;
+      } else { // the Routing API: learned / fetched table, order, then check the chosen route (TravelTimes)
+        routed = await routingPlan(input, departAt, replan ? prevNoDetour : false);
+        got = { matrices: routed.matrices, calls: routed.requests, fromCache: false, partial: false, estimated: routed.estimated, orderEstimated: routed.estimated };
+      }
       const prevPlan = replan ? curPlan() : null; // a replan keeps the stops already done on top
       const prevCtxPlaces = replan && S.plan ? S.plan.ctx.places : null; // (the fuel station lives there)
       // the run's day = local date it departed; a replan stays in its run's day (even past midnight)
       const dayKey = replan && planDayKey() ? planDayKey() : DL.dateKey(departAt.getTime());
       const fetchedAt = new Date().toISOString();
       got.matrices.forEach((x) => { if (!x.fetchedAt) x.fetchedAt = fetchedAt; });
-      S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices, dayKey }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial, estimated: !!got.estimated } };
-      solveFresh();
+      const msgAt = S.plan && S.plan.ctx && S.plan.ctx.msgAt && replan ? S.plan.ctx.msgAt : {}; // MSG taps of the day (look-ahead rule)
+      S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices, dayKey, msgAt }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial, estimated: !!got.estimated, estimatedOrder: !!got.orderEstimated, refused: !!(routed ? routed.down : got.estimated), service: ttService() } };
+      if (routed) { S.plan.result = routed.res; S.plan.idx = 0; S.plan.alt = null; } else solveFresh();
       if (jobs !== allJobs) S.plan.ctx.jobs = allJobs; // lookups by job id still find the whole job (the solve above used the trimmed copy)
       if (prevPlan) {
         S.plan.result.plans = S.plan.result.plans.map((p) => compose(prevPlan, p));
         await keepFuelAfterReplan(prevPlan, prevCtxPlaces, points); // silent: the chosen station only, no Places calls
       }
-      if (got.estimated) banner(null); // the one TomTom notice says it (ttNotice); no second banner
-      else banner('Travel times: TomTom live traffic — ' + (got.fromCache ? 'from session cache (0 calls)' : got.calls + ' calls') + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
+      if (got.estimated) banner(null); // the one TomTom notice / the "Estimated order" header say it; no second banner
+      else if (routed) banner('Travel times: TomTom Routing — ' + routed.requests + ' request' + (routed.requests === 1 ? '' : 's') + (routed.live ? ' (live)' : routed.checks ? ' (route checked)' : '') + '.', 'info');
+      else banner('Travel times: TomTom Matrix — ' + (got.fromCache ? 'from session cache (0 calls)' : got.calls + ' calls') + (got.partial ? ' · some legs missing, treated as very long' : '') + '.', 'info');
       S.loc.origin = null; S.loc.lastAt = null; S.loc.reason = null;
+      // the first leg was just fetched live from where you are (depart now): it is the live re-time, no second request
+      const firstLive = routed && routed.firstLegLive && S.startSel === 'gps' && departAt.getTime() <= Date.now() + 60000 ? routed.firstLegLive : null;
+      if (firstLive) {
+        const p0 = curPlan(), nx = p0 && p0.stops.find((x) => !x.status), now = Date.now();
+        if (nx && nx.placeId === firstLive.placeId) { S.loc.origin = { placeId: nx.placeId, lat: start.lat, lng: start.lng, arriveMs: now + firstLive.sec * 1000, usedAt: now }; S.tt.lastLiveAt = now; }
+      }
       retimeNow(); // the shared timing path (the lunch break included)
       logPlan(replan, { start, departAt, places, points, matrices: got.matrices, jobs: Solver.buildStops(jobs, places).jobs });
       S.tab = 'route';
@@ -890,8 +909,33 @@
     } finally {
       S.busy = false;
       render();
-      if (S.tab === 'route' && S.plan) refreshFromLocation({ trigger: 'plan' });
+      if (S.tab === 'route' && S.plan && !(S.loc.origin && S.tt.lastLiveAt != null && Date.now() - S.tt.lastLiveAt < 5000)) refreshFromLocation({ trigger: 'plan' });
     }
+  }
+
+  // PLAN with the Routing API (TravelTimes): the table for the plan's bucket (learned -> other bucket -> fetched), or live for
+  // 5 stops or fewer; ORDER with the existing solver; CHECK the chosen order's legs at their planned departures; >15% off ->
+  // one re-solve (+ one check of a changed order). Never mixed: a pair with no real time = the order on estimates for all.
+  // Returns {res (solver result, plans timed on the timing table), matrices, estimated, requests, checks, live, firstLegLive}.
+  async function routingPlan(input, departAt, noDetour) {
+    const nowMs = Date.now(), t0 = departAt.getTime();
+    const progress = (d, n) => banner('Getting travel times ' + d + ' of ' + n + '…', 'busy');
+    banner('Getting travel times…', 'busy');
+    const r = await TT.planRoute({
+      Solver, input: Object.assign({}, input, { noDetour }), nowMs, mem: S.mem, fetchLeg: ttLeg, onProgress: progress,
+      start: nodeOf('__start__', input.start, S.startSel !== 'gps' ? S.startSel : null),
+      end: nodeOf('__end__', input.end, input.end.id),
+      nodeOfStop: (pid) => nodeOf(pid, input.places[pid], pid),
+      timed: (p) => LunchBreak.applyBreak(p, curLunch(), S.settings, Date.now()),
+    });
+    saveMemory();
+    let firstLegLive = null; // the plan's first leg, fetched for "now" from the start (live table, or the check of a plan departing now)
+    const p0 = !r.res.error && r.res.plans[0];
+    if (p0 && p0.order.length && !r.estimated && t0 <= nowMs + 60000) {
+      const j = r.stopIds.indexOf(p0.order[0]) + 1;
+      if (!r.matrices[0].est[0][j]) firstLegLive = { placeId: p0.order[0], sec: r.matrices[0].m[0][j] };
+    }
+    return Object.assign({}, r, { firstLegLive });
   }
 
   // ---------- plan state: persistence, live re-timing, re-solving from the cached matrices ----------
@@ -954,7 +998,14 @@
     const now = Date.now();
     const at = (from >= 0 ? now : Math.max(now, Date.parse(P.ctx.departAtISO))) + (opts.shiftMs || 0);
     const respect = opts.respect != null ? opts.respect : !!m.respectClosed;
-    const res = Solver.solve({ start: anchor, end: { lat: m.end.lat, lng: m.end.lng }, jobs, places: S.places, matrices, departAtISO: iso(at), noDetour: P.noDetour, respectClosedWindows: respect });
+    const sIn = { start: anchor, end: { lat: m.end.lat, lng: m.end.lng }, jobs, places: S.places, departAtISO: iso(at), noDetour: P.noDetour, respectClosedWindows: respect };
+    let res;
+    if (P.provider && P.provider.estimatedOrder) { // the plan was ordered on estimates: never mix when ordering again
+      const pts = Solver.pointsFor(Object.assign({}, sIn, { matrices: [] }));
+      const ordM = [{ departAt: iso(at), m: pts.map((a, i) => pts.map((b, j) => (i === j ? 0 : Budget.estSec(a, b)))) }];
+      res = Solver.solve(Object.assign({}, sIn, { matrices: ordM }));
+      if (!res.error) res = Object.assign({}, res, { plans: res.plans.map((p) => Solver.evaluate(Object.assign({}, sIn, { matrices }), p.order)) });
+    } else res = Solver.solve(Object.assign({}, sIn, { matrices }));
     return { res, jobs: JSON.parse(JSON.stringify(jobs)), anchor, matrices, departAtISO: iso(at), from };
   }
 
@@ -1054,9 +1105,13 @@
       if (verdict === 'route') {
         if (navigator.onLine === false) return await fail('offline');
         try {
-          const legs = await Providers.routeLegs([{ lat: fix.lat, lng: fix.lng }, { lat: target.lat, lng: target.lng }], S.settings.tomtomKey);
-          if (!legs[0] || legs[0].s == null) throw new Error('no duration');
-          dur = legs[0].s;
+          const now0 = Date.now();
+          const r = await ttLeg({ lat: fix.lat, lng: fix.lng }, { lat: target.lat, lng: target.lng }, null); // ONE request, depart now
+          if (!r || r.seconds == null) throw new Error('no duration');
+          dur = r.seconds;
+          // a sample only between two saved places (the fix within 150 m of one); typical time when TomTom returns it
+          const a = nodeOf('fix', fix, null), b = nodeOf('target', target, nx0 ? nx0.placeId : (P.ctx.end && P.ctx.end.id));
+          if (a.pid != null && b.pid != null) { TT.remember(S.mem, a, b, now0, r, now0); saveMemory(); }
         } catch (e) { return await fail(navigator.onLine === false || /network error/i.test(e.message || '') ? 'offline' : 'routing'); }
       }
       const cur = S.plan === P ? curPlan() : null;
@@ -1064,7 +1119,7 @@
       const hadAlt = !!P.alt, now = Date.now();
       L.origin = { placeId: tid, lat: fix.lat, lng: fix.lng, arriveMs: now + dur * 1000, usedAt: now };
       L.reason = null;
-      if (verdict === 'route') await fillEstimatedLegs(); // TomTom answered: estimated legs still ahead get real times
+      // (estimated legs further ahead keep their "est." until the next PLAN)
       if (S.plan !== P) return;
       retimeNow();
       if (hadAlt && cur.stops.some((s) => !s.status)) computeAvoidLunch(); // the Avoid-lunch delta follows the new times
@@ -1343,17 +1398,19 @@
     const ro = () => !!opts.readOnly;
     const hm = DL.fmtTime;
 
-    async function routeNow(manual) { // ONE routing request for the whole driven sequence (only when held leg data is missing)
+    async function routeNow(manual) { // NO request: legs not held from the day's own routing answers come from the learned times
       const s = sum();
       if (!s.route.needs || routing) return;
-      if (!S.settings.tomtomKey) { if (manual) toast('TomTom key missing — add it in Settings.'); return; }
-      routing = true; draw();
-      try {
-        const legs = await Providers.routeLegs(s.route.points, S.settings.tomtomKey);
-        day.routed = { key: s.route.key, legs, at: new Date().toISOString() };
-        await saveDay(day);
-      } catch (e) { if (manual) toast(e.message || 'Routing failed'); }
-      routing = false; draw();
+      const pts = s.route.points, places = Object.values(S.places), legs = [];
+      for (let i = 0; i + 1 < pts.length; i++) {
+        const a = TT.snap(pts[i], places), b = TT.snap(pts[i + 1], places);
+        const l = a != null && b != null ? (a === b ? { s: 0, m: 0 } : TT.learned(S.mem, a, b, TT.bucketOf(Date.now()))) : null;
+        if (!l || l.m == null) { if (manual) toast('km unavailable: no stored distance for every leg driven'); return; }
+        legs.push({ m: l.m, s: l.s });
+      }
+      day.routed = { key: s.route.key, legs, at: new Date().toISOString() };
+      await saveDay(day);
+      draw();
     }
 
     function editTime(field, current) {
@@ -1552,6 +1609,8 @@
         h('button', { class: 'primary', id: 'viewSummary', style: 'margin-top:10px', onclick: () => openSummary(closed.dayKey) }, 'View summary')));
       return;
     }
+    const rbox = reorderBox();
+    if (rbox) v.append(rbox);
     const note = jobsChangedNote();
     if (note) v.append(note);
     const r = P.result;
@@ -1580,7 +1639,7 @@
           h('div', null, h('b', { id: 'stopsLeft' }, view.left), h('span', { class: 'muted' }, 'stops left')),
           h('div', null, h('b', { id: 'minLeft' }, Solver.formatDuration(view.leftSec)), h('span', { class: 'muted' }, 'left')),
           h('div', null, h('b', { id: 'endArrive' }, fmt(view.endArrival) + estMark(curEst.end)), h('span', { class: 'muted' }, 'arrive ' + (ctx.end.name || 'end')))),
-        estimated ? h('div', { class: 'chip est', id: 'estHeader' }, 'Estimated times') : null,
+        P.provider && P.provider.estimatedOrder ? h('div', { class: 'chip est', id: 'estHeader' }, Budget.ESTIMATED_ORDER) : estimated ? h('div', { class: 'chip est', id: 'estHeader' }, 'Estimated times') : null,
         h('div', { class: 'muted', id: 'departedAt', style: 'margin-top:8px' }, (departMs > now ? 'Departs ' : 'Departed ') + fmt(departMs)),
         P.shiftMs > 60000 ? h('div', { class: 'chip detour' }, 'Running ' + Math.round(P.shiftMs / 60000) + ' min behind plan') : null,
         lunchSkippedLine()),
@@ -1615,7 +1674,7 @@
       if (stop && place) {
         v.append(h('div', { class: 'prompt' }, h('div', { class: 'title' }, 'Send ETA to ' + dName(place.name) + '?'),
           h('div', { class: 'row', style: 'margin-top:8px' },
-            h('button', { class: 'primary grow', onclick: () => { const m = stopMessage(stop, P.shiftMs); P.prompt = null; shareMessage(m.place, m.text); render(); } }, 'Send'),
+            h('button', { class: 'primary grow', onclick: () => { const m = stopMessage(stop, P.shiftMs); P.prompt = null; noteMsg(stop.placeId); shareMessage(m.place, m.text); render(); } }, 'Send'),
             h('button', { class: 'grow', onclick: () => { P.prompt = null; render(); } }, 'Dismiss'))));
       }
     }
@@ -1689,6 +1748,7 @@
     } catch (e) { /* never block the navigation link */ }
   }
   function navTap(stop0, i0) {
+    stopTapped();
     try {
       const ls = liveStop(stop0, i0);
       if (!ls) return;
@@ -1789,7 +1849,7 @@
     head.onclick = toggle;
     head.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } };
     const btns = navButtons(place, () => navTap(stop, i));
-    if (hasDelivery) btns.push(h('button', { class: 'small', onclick: () => { const m = stopMessage(stop, P.shiftMs); shareMessage(m.place, m.text); } }, 'MSG'));
+    if (hasDelivery) btns.push(h('button', { class: 'small', onclick: () => { stopTapped(); noteMsg(stop.placeId); const m = stopMessage(stop, P.shiftMs); shareMessage(m.place, m.text); } }, 'MSG'));
     btns.push(primaryBtn(stop, i)); // REACHED, then DONE: one button, the place and size DONE always had
     btns.push(h('button', { class: 'small', onclick: () => skipStop(stop, i) }, 'SKIP'));
     const rin = reachedInline(stop, i); // "Reached 14:10 · auto  Undo" at the end of the card's action lines (no extra row)
@@ -1833,6 +1893,7 @@
   }
   // The one primary button: REACHED first, then DONE. For 500 ms after the stop became reached it ignores taps.
   function primaryTap(stop0, i0) {
+    stopTapped();
     const ls = liveStop(stop0, i0);
     if (!ls) return;
     if (!Reached.isReached(ls.stop)) return markReached(stop0, i0);
@@ -1851,9 +1912,12 @@
     try {
       const P = S.plan, plan = curPlan();
       if (!P || !plan || !fix || !fix.ok) return false;
-      const stops = plan.stops.map((s) => { const pl = placeOfStop(s); return pl ? { id: s.placeId, lat: pl.lat, lng: pl.lng, status: s.status, reachedAt: s.reachedAt, noAutoReach: s.noAutoReach } : null; }).filter(Boolean);
+      const stops = plan.stops.map((s) => { const pl = placeOfStop(s); return pl ? { id: s.placeId, lat: pl.lat, lng: pl.lng, status: s.status, reachedAt: s.reachedAt, noAutoReach: s.noAutoReach, fuel: !!s.fuel, actions: s.actions || [] } : null; }).filter(Boolean);
       if (P.ctx.end) stops.push({ id: END_ID, lat: P.ctx.end.lat, lng: P.ctx.end.lng, isEnd: true });
-      const id = Reached.autoReachTarget(fix, stops, { enabled: S.settings.autoReach !== false, visible: document.visibilityState === 'visible', now: Date.now() });
+      const jobs = {}; // the jobs as they are NOW (a pickup's done flag is set by DONE at that pickup): Reached.canAutoReach
+      ((P.ctx && P.ctx.jobs) || []).forEach((j) => { jobs[j.id] = j; });
+      S.jobs.forEach((j) => { jobs[j.id] = j; });
+      const id = Reached.autoReachTarget(fix, stops, { enabled: S.settings.autoReach !== false, visible: document.visibilityState === 'visible', now: Date.now(), jobs });
       if (!id) return false;
       const idx = plan.stops.findIndex((s) => s.placeId === id && !s.status), live = plan.stops[idx];
       if (!reachStop(live, 'auto')) return false;
@@ -2052,11 +2116,12 @@
     await savePlan();
     render();
     dayCompleteBanner();
-    refreshFromLocation({ trigger: 'done' }); // after DONE: ETAs from where we are now (always; one 1 x 1 request; never blocks)
+    afterStop('done'); // after DONE: the live look-ahead (Part F) or one next-stop re-time; never blocks
   }
 
   // A stop becomes skipped ONLY by this explicit tap (nothing else - DONE order, timing, replan - ever sets it).
   async function skipStop(stop0, i0) { // actions stay pending; skipped stops leave the re-time chain and the header counts
+    stopTapped();
     const P = S.plan;
     const ls = liveStop(stop0, i0);
     if (!ls) return;
@@ -2074,9 +2139,10 @@
     toast(ls.stop.fuel ? 'Fuel stop skipped. Undo skip to bring it back.' : 'Skipped — actions stay pending. Undo skip to bring it back.');
     await savePlan();
     render();
-    refreshFromLocation({ trigger: 'skip' });
+    afterStop('skip');
   }
   async function undoSkip(stop0, i0) { // puts the stop back in the chain and re-times
+    stopTapped();
     const P = S.plan, cur = curPlan();
     const stop = cur && cur.stops[i0] && cur.stops[i0].placeId === stop0.placeId ? cur.stops[i0] : null;
     if (!stop || stop.status !== 'skipped') return;
@@ -2091,6 +2157,153 @@
     refreshFromLocation({ trigger: 'undo' });
   }
 
+  // ---------- AFTER EACH STOP: LIVE LOOK-AHEAD (TravelTimes.lookAhead) ----------
+  // DONE / SKIP with at least 2 stops pending (end point not counted) and the setting not Off: live times for NOW from where
+  // you are (a first-leg probe over the stops that may come next, or every needed pair when 5 or fewer are pending), a re-solve
+  // of the pending stops with every rule, and a switch only when the best order is different AND at least 10 minutes earlier
+  // at the end point. It only RE-ORDERS pending stops (never adds, removes, skips or un-skips one). TomTom out / the allowance
+  // guard / Matrix service / setting Off: the single next-stop re-time instead.
+  const todayMsg = (pid) => { const t = S.plan && S.plan.ctx.msgAt && S.plan.ctx.msgAt[pid]; return t != null && DL.dateKey(t) === DL.dateKey(Date.now()); };
+  function noteMsg(pid) { try { const c = S.plan.ctx; c.msgAt = Object.assign({}, c.msgAt || {}, { [pid]: Date.now() }); savePlan(); } catch (e) { /* never block MSG */ } }
+  function stopTapped() { // the "Order updated" notice stays until the next tap on a stop button
+    const P = S.plan;
+    if (P && P.reorder && P.reorder.kind === 'notice') P.reorder = null;
+  }
+  const pendingStops = (plan) => plan.stops.filter((s) => !s.status && !s.fuel);
+  async function afterStop(trigger) {
+    const P = S.plan, plan = curPlan();
+    if (!P || !plan) return;
+    if (P.reorder && P.reorder.kind === 'card') P.reorder = null; // an unanswered suggestion belongs to the previous stop
+    P.noSwitch = false; // an Undo holds switches only until the next DONE / SKIP
+    const pend = pendingStops(plan);
+    const mode = Budget.afterStopMode({ setting: S.settings.afterStop || 'auto', pending: pend.length, guard: ttGuard(), down: ttOut(), service: ttService() });
+    if (mode !== 'lookahead' || !S.settings.tomtomKey || navigator.onLine === false || pend.some((s) => s.reachedAt != null)) return refreshFromLocation({ trigger });
+    S.tt.lastLiveAt = Date.now();
+    try { await lookAheadNow(P); } catch (e) { /* never break DONE: the plan keeps its times */ }
+  }
+  async function lookAheadNow(P) {
+    const plan0 = curPlan(), m = plan0.model, now = Date.now(), nowIso = iso(now);
+    const placeOf = (id) => S.places[id] || P.ctx.places[id];
+    // where you are: the fix (as the saved place when within 150 m), else the last DONE stop, else the plan's start
+    const fix = await quickFix(false);
+    if (S.plan !== P) return;
+    if (fix.ok && autoReachCheck(Object.assign({ at: Date.now() }, fix))) return; // on site at the next stop already: no look-ahead
+    const di = lastDoneIdx(plan0, true), ds = di >= 0 ? placeOf(plan0.stops[di].placeId) : null;
+    const here = fix.ok && fix.accuracy <= Solver.LOC.MAX_ACCURACY_M ? { lat: fix.lat, lng: fix.lng } : ds ? { lat: ds.lat, lng: ds.lng } : { lat: m.start.lat, lng: m.start.lng };
+    const plan = curPlan(), pend = pendingStops(plan);
+    const pendIds = new Set(pend.map((s) => s.placeId));
+    // the jobs still to do at the pending stops (skipped stops stay skipped: OnBoard.jobsForPlan)
+    const placesOfJob = (j) => (j.errandPlaceId ? [j.errandPlaceId] : (j.pickups || []).filter((p) => !p.done).map((p) => p.placeId).concat(j.deliveryPlaceId ? [j.deliveryPlaceId] : []));
+    const jobs = OnBoard.jobsForPlan(JSON.parse(JSON.stringify(S.jobs.filter((j) => !j.status || j.status === 'pending'))), plan)
+      .filter((j) => { const ps = placesOfJob(j); return ps.length && ps.every((p) => pendIds.has(p)); });
+    const places = Object.assign({}, P.ctx.places, S.places);
+    const base = { start: here, end: { lat: m.end.lat, lng: m.end.lng }, jobs, places, departAtISO: nowIso, noDetour: P.noDetour, respectClosedWindows: !!m.respectClosed };
+    const prec = Solver.precedence(base);
+    if (prec.stopIds.length !== pend.length || !prec.stopIds.every((id) => pendIds.has(id))) return refreshFromLocation({ trigger: 'done' }); // never add / drop a stop
+    const origin = nodeOf(TT.ORIGIN, here, null);
+    const endPid = P.ctx.end && P.ctx.end.id && S.places[P.ctx.end.id] ? P.ctx.end.id : null;
+    const end = nodeOf(TT.END, m.end, endPid);
+    const nodes = new Map([[TT.ORIGIN, origin], [TT.END, end]]);
+    const pendNodes = pend.map((s) => { const pl = placeOf(s.placeId); const n = nodeOf(s.placeId, pl, s.placeId); nodes.set(s.placeId, n); return n; });
+    const bucket = TT.bucketOf(now);
+    // the plan's own table (indices: 0 start, 1..k stops, k+1 end) for any leg neither fetched nor learned
+    const k = m.stopIds.length, sl = m.matrices[0];
+    const midx = (key) => (key === TT.ORIGIN ? (di >= 0 && m.stopIds.indexOf(plan0.stops[di].placeId) >= 0 ? m.stopIds.indexOf(plan0.stops[di].placeId) + 1 : 0) : key === TT.END ? k + 1 : m.stopIds.indexOf(key) + 1);
+    const fallback = (a, b) => {
+      const i = midx(a), j = midx(b);
+      if (i > 0 || a === TT.ORIGIN) { const v = sl.m[i] && sl.m[i][j]; if (j > 0 && v != null && isFinite(v)) return v; }
+      return Budget.estSec(nodes.get(a), nodes.get(b));
+    };
+    const learnedSec = (a, b) => { const x = nodes.get(a), y = nodes.get(b); if (!x || !y || x.pid == null || y.pid == null) return null; const l = TT.learned(S.mem, x.pid, y.pid, bucket); return l ? l.s : null; };
+    const post = (p) => LunchBreak.applyBreak(Solver.retime(p, -1, nowIso), curLunch(), S.settings, Date.now());
+    const ad = TT.solverAdapter(Solver, base, post);
+    const fullMax = Number.isFinite(Number(S.settings.fullRefreshMax)) ? Number(S.settings.fullRefreshMax) : TT.FULL_REFRESH_MAX;
+    const res = await TT.lookAhead({
+      origin, pending: pendNodes, end, links: linksOf(jobs), before: prec.before, current: pend.map((s) => s.placeId), fullRefreshMax: fullMax,
+      learned: learnedSec, fallback,
+      fetchLive: async (a, b) => { const r = await ttLeg(a, b, null); if (r) TT.remember(S.mem, a, b, now, r, now); return r; },
+      solve: (leg) => ad.solve((x, y) => leg(x === TT.ORIGIN ? TT.ORIGIN : x, y)),
+      arrival: (order, leg) => ad.arrival(order, leg),
+    });
+    saveMemory();
+    if (S.plan !== P || curPlan() !== plan) return; // the plan moved on while we waited
+    if (res.aborted) { retimeNow(); await savePlan(); if (S.tab === 'route') render(); return; } // TomTom out: estimates (one notice)
+    // the times returned for now refresh the ETAs: stop -> stop / end legs into the plan's table, the first leg as the live origin
+    res.live.forEach((sec, key) => {
+      const [a, b] = key.split('>');
+      if (a === TT.ORIGIN) return;
+      const i = midx(a), j = midx(b);
+      if (i > 0 && j > 0) m.matrices.forEach((x) => { x.m[i][j] = sec; if (x.est) x.est[i][j] = false; });
+    });
+    const firstOf = (order) => order[0];
+    const setOrigin = (order) => {
+      const nx = firstOf(order), sec = res.live.get(TT.ORIGIN + '>' + nx);
+      if (sec != null) { const t = Date.now(); S.loc.origin = { placeId: nx, lat: here.lat, lng: here.lng, arriveMs: t + sec * 1000, usedAt: t }; S.timesFrom = t; S.loc.reason = null; }
+    };
+    const cur = pend.map((s) => s.placeId);
+    const setting = S.settings.afterStop || 'auto';
+    const d = TT.decide({ res, setting, current: cur, messagedNext: todayMsg(cur[0]), held: P.noSwitch });
+    if (d.action === 'none') { setOrigin(cur); retimeNow(); await savePlan(); if (S.tab === 'route') render(); return; }
+    const text = TT.reorderText(cur, res.best, res.saveSec, (id) => dName(pName(id)));
+    if (d.action === 'switch' && applyOrder(res.best, 'auto', text)) {
+      setOrigin(res.best);
+      retimeNow();
+    } else {
+      P.reorder = { kind: 'card', order: res.best, text, extra: d.messaged ? dName((placeOf(cur[0]) || {}).name || '') + ' was already messaged' : null };
+      setOrigin(cur);
+      retimeNow();
+    }
+    await savePlan();
+    if (S.tab === 'route') render();
+  }
+  // Put the pending stops in `order` (done / skipped stops keep their places); a pending fuel stop is put back by its own rule.
+  function applyOrder(order, via, text) {
+    const P = S.plan, cur = curPlan();
+    const prev = { stops: JSON.parse(JSON.stringify(cur.stops)), order: cur.order.slice(), origin: S.loc.origin ? Object.assign({}, S.loc.origin) : null };
+    const base = stripFuel(cur);
+    const stops = TT.reorderStops(base.stops, order);
+    if (!stops) return false; // never adds, removes, skips or un-skips a stop
+    let next = Object.assign({}, base, { stops, order: stops.map((s) => s.placeId) });
+    const fuelPending = cur.stops.find((s) => s.fuel && !s.status), fz = cur.model.fuelT, place = P.ctx.places[FUEL_ID];
+    if (fuelPending && fz && place) next = reinsertFuel(cur, next, fz, place);
+    P.result.plans = [next]; P.idx = 0; P.alt = null;
+    P.reorder = { kind: 'notice', text, prev };
+    logReplanVia(via);
+    return true;
+  }
+  async function reorderUndo() {
+    const P = S.plan, R = P && P.reorder;
+    if (!R || !R.prev) return;
+    const cur = curPlan();
+    P.result.plans = [Object.assign({}, cur, { stops: R.prev.stops, order: R.prev.order })]; P.idx = 0;
+    S.loc.origin = R.prev.origin;
+    P.reorder = null; P.noSwitch = true; // no further switch until the next DONE / SKIP
+    retimeNow();
+    await savePlan();
+    render();
+  }
+  async function reorderAccept() {
+    const P = S.plan, R = P && P.reorder;
+    if (!R || R.kind !== 'card') return;
+    applyOrder(R.order, 'suggested', R.text);
+    S.loc.origin = null;
+    retimeNow();
+    await savePlan();
+    render();
+  }
+  function reorderBox() { // the notice at the top of the Route tab, or the "Ask me" card
+    const R = S.plan && S.plan.reorder;
+    if (!R) return null;
+    if (R.kind === 'notice') {
+      return h('div', { class: 'prompt reorder-notice', id: 'reorderNotice', role: 'status' }, h('span', null, R.text + ' · '),
+        h('button', { class: 'link-undo', type: 'button', id: 'reorderUndo', onclick: () => reorderUndo() }, 'Undo'));
+    }
+    return h('div', { class: 'prompt', id: 'reorderCard' }, h('div', { class: 'title' }, R.text.replace(/^Order updated: /, 'Faster order: ')),
+      R.extra ? h('div', { class: 'muted', id: 'reorderExtra' }, R.extra) : null,
+      h('div', { class: 'row', style: 'margin-top:8px' },
+        h('button', { class: 'primary grow', id: 'reorderSwitch', onclick: () => reorderAccept() }, 'Switch'),
+        h('button', { class: 'grow', id: 'reorderKeep', onclick: () => { S.plan.reorder = null; render(); } }, 'Keep mine')));
+  }
   // ---------- FUEL STOP ----------
   // "Add fuel stop": the station of the chosen brand, and the place in today's remaining route, that adds the fewest minutes.
   // The maths lives in fuel.js. The stop is a normal plan stop with stop.fuel = true and placeId FUEL_ID; its place sits in the
@@ -2165,39 +2378,19 @@
       return (sec == null ? estimateSec(a, b) : sec) / 60;
     };
   }
-  // ONE existing TomTom lookup (+ its cache) over the plan's points, the route's points and the stations
-  async function fuelTable(extra, plan) {
-    const m = plan.model, P = S.plan;
-    const all = [m.start].concat(m.stopIds.map((id) => S.places[id] || P.ctx.places[id]).filter(Boolean), [m.end], extra);
-    const idx = new Map(), points = [];
-    all.forEach((p) => { const k = llKey(p); if (!idx.has(k)) { idx.set(k, points.length); points.push({ lat: p.lat, lng: p.lng }); } });
-    const got = await Providers.getMatrices(points, new Date().toISOString(), S.settings.tomtomKey);
-    return { points, idx, matrices: got.matrices };
-  }
-  const tableGetOf = (t) => (ka, kb, ms) => {
-    const ia = t.idx.get(ka), ib = t.idx.get(kb);
-    if (ia == null || ib == null) return null;
-    const sl = nearestSlice(t.matrices, ms, (s) => Date.parse(s.departAt));
-    const v = sl ? sl.m[ia][ib] : null;
-    return v == null || !isFinite(v) ? null : v;
-  };
-  // the station's times to / from every point of the table, keyed by coordinates (what Solver.retime reads)
-  function makeFuelT(st, table, plan) {
-    const P = S.plan, sIdx = table.idx.get(llKey(st));
-    const ll = {}, pid2key = {};
-    table.points.forEach((p) => { ll[llKey(p)] = { lat: p.lat, lng: p.lng }; });
+  // the station's fetched times (Fuel.realTimeShortlist: minutes by "a.key>b.key") to / from the route points, keyed by
+  // coordinates (what Solver.retime reads; any other leg is estimated there)
+  function makeFuelT(st, times, pts, plan) {
+    const P = S.plan, sk = llKey(st), now = Date.now();
+    const ll = {}, pid2key = {}, to = {}, from = {};
+    pts.forEach((p) => { ll[p.key || llKey(p)] = { lat: p.lat, lng: p.lng }; });
     plan.model.stopIds.forEach((id) => { const pl = S.places[id] || P.ctx.places[id]; if (pl) pid2key[id] = llKey(pl); });
-    const slices = table.matrices.map((sl) => {
-      const to = {}, from = {};
-      table.points.forEach((p, i) => {
-        if (i === sIdx) return;
-        const k = llKey(p);
-        if (sl.m[i][sIdx] != null) to[k] = sl.m[i][sIdx];
-        if (sl.m[sIdx][i] != null) from[k] = sl.m[sIdx][i];
-      });
-      return { at: Date.parse(sl.departAt), to, from };
+    (times || new Map()).forEach((min, k) => {
+      const [a, b] = k.split('>');
+      if (b === sk && a !== sk) to[a] = Math.round(min * 60);
+      if (a === sk && b !== sk) from[b] = Math.round(min * 60);
     });
-    return { lat: st.lat, lng: st.lng, pid2key, ll, slices };
+    return { lat: st.lat, lng: st.lng, pid2key, ll, slices: [{ at: now, to, from }] };
   }
   // the plan with the fuel stop put in front of point b (b = the leg's destination; the end point = after the last stop)
   function withFuel(plan, b, fz, place) {
@@ -2239,19 +2432,12 @@
     } else r = insertBestFuel(q, fz, place);
     return Object.assign({}, r, { stops: Reached.keepStateOf(prevPlan.stops, r.stops) });
   }
-  // Replan from here: keep the fuel stop, silently re-placed (fresh times for the chosen station only; no Places calls)
-  async function keepFuelAfterReplan(prevPlan, prevPlaces, points) {
-    const P = S.plan, place = prevPlaces && prevPlaces[FUEL_ID], fz0 = prevPlan.model && prevPlan.model.fuelT;
-    if (!place || !fz0) return;
+  // Replan from here: keep the fuel stop, silently re-placed from its stored times (estimated where none): no request, no Places call
+  async function keepFuelAfterReplan(prevPlan, prevPlaces) {
+    const P = S.plan, place = prevPlaces && prevPlaces[FUEL_ID], fz = prevPlan.model && prevPlan.model.fuelT;
+    if (!place || !fz) return;
     P.ctx.places = Object.assign({}, P.ctx.places, { [FUEL_ID]: place });
     const pending = prevPlan.stops.some((s) => s.fuel && !s.status);
-    let fz = fz0;
-    if (pending && S.settings.tomtomKey) {
-      try {
-        const base = P.result.plans[0], st = { lat: place.lat, lng: place.lng };
-        fz = makeFuelT(st, await fuelTable([st], base), base);
-      } catch (e) { fz = fz0; } // keep the stored times (anything not in them is estimated)
-    }
     P.result.plans = P.result.plans.map((p) => {
       const q = Object.assign({}, p, { model: Object.assign({}, p.model, { fuelT: fz }) });
       return pending ? retimeLocal(reinsertFuel(prevPlan, q, fz, place)) : q;
@@ -2302,24 +2488,19 @@
           await saveStations();
         }
       }
-      // --- 4c: shortlist from the whole memory, then real travel times ---
+      // --- 4c: every (station, position) ranked by the estimator, then real times for the best 8 only (2 requests each) ---
       status.textContent = 'Getting travel times…';
       const known = Fuel.stationsOfBrand(S.fuelStations, brand);
       if (!known.length) { fail('No ' + brand + ' found near this route.'); return; }
-      const short = Fuel.shortlist(pts, known, legs, 5);
-      const stationPts = short.map((r) => Object.assign({}, r.station, { fuel: true, key: llKey(r.station) }));
-      let table;
-      try { table = await fuelTable(pts.concat(stationPts), base); } catch (e) {
-        if (cancelled) return;
-        if (e && e.kind === 'limit') { sh.close(); render(); return; } // the one TomTom notice says why (no second banner)
-        fail('Could not get travel times: ' + (e.message || e)); return;
-      }
+      const stationPts = known.map((st) => Object.assign({}, st, { fuel: true, key: llKey(st) }));
+      const cands = Fuel.allCandidates(pts, stationPts, legs);
+      const estMin = (a, b) => (a.key === b.key ? 0 : Budget.estSec(a, b) / 60);
+      const baseTT = makeTT(base, Date.now(), () => null, null); // A -> B: the plan's own table (no request)
+      const pick = await Fuel.realTimeShortlist(cands, estMin, async (a, b) => { const r = await ttLeg(a, b, null); return r && r.seconds != null ? r.seconds / 60 : null; }, baseTT, 8);
       if (cancelled) return;
       const fzs = {};
-      const fzOf = (st) => fzs[st.placeId] || (fzs[st.placeId] = makeFuelT(st, table, base));
-      const cands = [];
-      short.forEach((r, i) => r.legs.forEach((l) => cands.push({ station: stationPts[i], a: pts[l.from], b: pts[l.to], legIndex: l.index })));
-      const sorted = Fuel.pickInsertion(cands, makeTT(base, Date.now(), fzOf, tableGetOf(table)));
+      const fzOf = (st) => fzs[st.placeId] || (fzs[st.placeId] = makeFuelT(st, pick.times, pts, base));
+      const sorted = pick.sorted;
       if (!sorted.length) { fail('Could not work out travel times to the ' + brand + ' stations.'); return; }
       // --- 4d: preview ---
       let cur = 0;
@@ -2428,7 +2609,7 @@
         h('div', { class: 'title place-name' }, p.name),
         h('div', { class: 'place-tag' }, h('span', { class: 'chip' }, Messages.typeLabel(p.type))),
         h('div', { class: 'muted' }, p.address || (p.lat.toFixed(4) + ', ' + p.lng.toFixed(4))),
-        p.whatsapp ? h('div', { class: 'muted place-wa' }, 'WA ' + Messages.compactNumber(p.whatsapp)) : null,
+        Geo.waCardText(p.contactName, p.whatsapp ? Messages.compactNumber(p.whatsapp) : '') ? h('div', { class: 'muted place-wa' }, Geo.waCardText(p.contactName, p.whatsapp ? Messages.compactNumber(p.whatsapp) : '')) : null,
         Geo.lunchCardText(p.closedWindows) ? h('div', { class: 'place-closed' }, 'Lunch ' + Geo.lunchCardText(p.closedWindows)) : null)) : [h('div', { class: 'empty card' }, none)]));
     }
     v.append(h('div', { class: 'row' }, h('div', { class: 'grow' }, input), h('button', { class: 'primary', onclick: () => openPlacePicker((p) => openPlaceEditor(p), 'Add place') }, '+ Add')), list);
@@ -2443,6 +2624,7 @@
     const addr = h('input', { value: p.address });
     const dwell = h('input', { type: 'number', inputmode: 'numeric', min: '0', value: String(p.dwellMin) });
     const type = h('select', { onchange: (e) => { dwell.value = String(S.settings.dwellDefaults[e.target.value] != null ? S.settings.dwellDefaults[e.target.value] : 10); syncType(); } }, TYPES.map((t) => h('option', { value: t, selected: p.type === t }, Messages.typeLabel(t))));
+    const contact = h('input', { id: 'placeContact', value: p.contactName || '', maxlength: String(Geo.CONTACT_MAX), autocomplete: 'off', placeholder: 'Optional' });
     const wa = h('input', { type: 'tel', inputmode: 'tel', value: Messages.compactNumber(p.whatsapp), placeholder: '+60123456789' });
     const pin = h('input', { type: 'checkbox', id: 'placePin', checked: !!p.pinned, style: 'width:auto;min-height:0' });
     const sal = h('select', null, ['Encik', 'Puan', 'Cik'].map((t) => h('option', { value: t, selected: (p.salutation || 'Encik') === t }, t)));
@@ -2507,6 +2689,7 @@
       h('label', { class: 'field' }, 'Type'), type, h('label', { class: 'field' }, 'Dwell (minutes)'), dwell,
       h('label', { class: 'check-row' }, pin, ' Pin to top of search'),
       lunchBox,
+      h('label', { class: 'field' }, 'Contact name'), contact,
       h('label', { class: 'field' }, 'WhatsApp number'), wa,
       salBox,
       h('label', { class: 'field' }, 'Location'), pinInfo, h('div', { class: 'row', style: 'margin-top:6px' }, h('div', { class: 'grow' }, updLoc), undoLoc), pinMsg,
@@ -2522,6 +2705,8 @@
           if (!name.value.trim()) { toast('Name is required'); return; }
           if (!keepCustom) { const cw = lunchValue(); if (!cw) return; p.closedWindows = cw; }
           Object.assign(p, { name: name.value.trim(), address: addr.value.trim(), type: type.value, dwellMin: Number(dwell.value) || 0, whatsapp: Messages.compactNumber(wa.value), salutation: sal.value, lang: lang.value, pinned: pin.checked });
+          const cn = Geo.cleanContact(contact.value);
+          if (cn) p.contactName = cn; else delete p.contactName; // places without it stay exactly as before
           await savePlace(p); sh.close(); render();
         } }, 'Save')));
   }
@@ -2553,12 +2738,10 @@
     v.append(
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'API keys'),
         field('Google Places key (place search only)', bind(h('input', { type: 'password', autocomplete: 'off', value: s.googleKey }), 'googleKey')),
-        field('TomTom key (all travel times)', bind(h('input', { type: 'password', autocomplete: 'off', value: s.tomtomKey }), 'tomtomKey')),
+        field('TomTom key (all travel times: Routing API)', bind(h('input', { type: 'password', autocomplete: 'off', value: s.tomtomKey }), 'tomtomKey')),
         h('div', { class: 'muted' }, 'Keys stay on this device (never in the code, never exported).')),
-      h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Google Places calls today'),
-        h('div', { class: 'title' }, String(placesCallsToday())),
-        h('div', { class: 'muted' }, 'Counted on this device only. No Google-side cap is set yet.'),
-        h('div', { class: 'tt-usage', id: 'ttUsage' }, Budget.usageLine(S.settings.tomtomUsage, Date.now()))),
+      usageCard(s),
+      travelCard(s, field),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Driver'),
         field('Driver name (day log + summary)', bind(h('input', { value: s.driverName || 'Calvin', autocomplete: 'off' }), 'driverName', (x) => x.trim() || 'Calvin'))),
       historyCard(),
@@ -2576,12 +2759,45 @@
       lunchSettingsCard(s, field),
       fuelSettingsCard(s, field),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Data'),
-        h('div', { class: 'row' }, h('button', { class: 'grow', onclick: exportJson }, 'Export JSON'), h('button', { class: 'grow', onclick: () => fileIn.click() }, 'Import JSON'), fileIn),
-        h('button', { style: 'margin-top:8px', onclick: () => { Providers.clearCache(); toast('Travel-time cache cleared'); } }, 'Clear travel-time cache')),
+        h('div', { class: 'row' }, h('button', { class: 'grow', onclick: exportJson }, 'Export JSON'), h('button', { class: 'grow', onclick: () => fileIn.click() }, 'Import JSON'), fileIn)),
       h('div', { class: 'muted', id: 'lastPlan', style: 'text-align:center;font-size:12px' }, lastPlanText()),
       h('div', { class: 'muted', style: 'text-align:center' }, 'L-Tech Waypoint v' + APP_VERSION + ' · build ' + BUILD_STAMP),
       h('div', { class: 'muted', id: 'swBuild', style: 'text-align:center;font-size:12px' }, 'Service worker: checking…'));
     describeServiceWorker().then((t) => { const el = document.getElementById('swBuild'); if (el) el.textContent = t; });
+  }
+
+  // Settings -> Usage: TomTom Routing (and Matrix, only when used) and Google Places, today and this month, each with a thin bar.
+  function usageCard(s) {
+    const L = Budget.usageLines(s.usage, Date.now(), ttAllowance(), placesCallsToday());
+    const bar = (id, pct) => h('div', { class: 'usage-bar', id }, h('div', { class: 'usage-fill' + (pct >= 90 ? ' high' : ''), style: 'width:' + pct.toFixed(1) + '%' }));
+    const allow = h('input', { type: 'number', id: 'ttAllowance', inputmode: 'numeric', min: '1', value: String(ttAllowance()) });
+    allow.addEventListener('change', () => { s.ttAllowance = Budget.allowanceOf(allow.value); allow.value = String(s.ttAllowance); saveSettings(); render(); });
+    return h('div', { class: 'card', id: 'usageCard' }, h('h2', { style: 'margin-top:0' }, 'Usage'),
+      h('div', { class: 'usage-line', id: 'usageRouting' }, L.routing), bar('usageRoutingBar', L.routingPct),
+      h('div', { class: 'usage-line', id: 'usagePlaces' }, L.places), bar('usagePlacesBar', L.placesPct),
+      L.matrix ? h('div', { class: 'usage-line', id: 'usageMatrix' }, L.matrix) : null,
+      h('label', { class: 'field' }, 'TomTom Routing allowance per month'), allow,
+      h('div', { class: 'muted' }, 'Counted on this device only. TomTom\'s free allowance is per month and per API.'));
+  }
+  // Settings -> Travel times: the TomTom service, the after-stop look-ahead, the learned travel times (+ Forget, in-page confirm)
+  let forgetTimesAsk = false;
+  function travelCard(s, field) {
+    const sel = (id, key, opts, def) => {
+      const el = h('select', { id }, opts.map(([val, lab]) => h('option', { value: val, selected: (s[key] || def) === val }, lab)));
+      el.addEventListener('change', () => { s[key] = el.value; saveSettings(); });
+      return el;
+    };
+    const n = TT.pairCount(S.mem);
+    const forget = forgetTimesAsk
+      ? h('div', { class: 'row', id: 'forgetTimesConfirm', style: 'margin-top:8px' }, h('span', { class: 'grow' }, 'Forget ' + n + ' learned pairs?'),
+        h('button', { class: 'small', id: 'forgetTimesNo', onclick: () => { forgetTimesAsk = false; render(); } }, 'Cancel'),
+        h('button', { class: 'small danger', id: 'forgetTimesYes', onclick: async () => { S.mem = TT.emptyMemory(); await saveMemory(); forgetTimesAsk = false; toast('Learned travel times forgotten'); render(); } }, 'Forget'))
+      : h('button', { class: 'small', id: 'forgetTimes', disabled: !n, onclick: () => { forgetTimesAsk = true; render(); } }, 'Forget');
+    return h('div', { class: 'card', id: 'travelCard' }, h('h2', { style: 'margin-top:0' }, 'Travel times'),
+      field('TomTom service', sel('ttServiceSel', 'ttService', [['routing', 'Routing (default)'], ['matrix', 'Matrix']], 'routing')),
+      field('After each stop, look for a faster order', sel('afterStopSel', 'afterStop', [['auto', 'Switch automatically'], ['ask', 'Ask me'], ['off', 'Off']], 'auto')),
+      h('div', { class: 'row', style: 'margin-top:10px;align-items:center' }, h('span', { class: 'grow', id: 'learnedCount' }, 'Learned travel times: ' + n + ' pair' + (n === 1 ? '' : 's')), forgetTimesAsk ? null : forget),
+      forgetTimesAsk ? forget : null);
   }
 
   // Settings -> Lunch break (the driver's own break; a customer's lunch is the place's closed window). Device-stored, in Export / Import.
@@ -2615,7 +2831,7 @@
 
   function exportJson() {
     const settings = Object.assign({}, S.settings); delete settings.googleKey; delete settings.tomtomKey;
-    const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), dwellMigrated: true, pinMigrated: true, places: Object.values(S.places), jobs: S.jobs, settings, fuelStations: S.fuelStations },
+    const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), dwellMigrated: true, pinMigrated: true, places: Object.values(S.places), jobs: S.jobs, settings, fuelStations: S.fuelStations, travelTimes: S.mem },
       OnBoard.exportLoose(S.loose), // looseItems: the items still with you
       DL.exportPayload(S.days, S.jobs, S.places)); // + dayLog (records) and dayHistory (per-day totals); keys never included
     const a = h('a', { href: URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })), download: 'waypoint-' + new Date().toISOString().slice(0, 10) + '.json' });
@@ -2638,9 +2854,16 @@
         for (const d of dl.records) { S.days[d.date] = d; await WPStore.set('daylogs', d.date, d); }
       }
       if (data.settings) {
-        const keep = { googleKey: S.settings.googleKey, tomtomKey: S.settings.tomtomKey, placesCallsToday: S.settings.placesCallsToday, tomtomUsage: S.settings.tomtomUsage };
+        const keep = { googleKey: S.settings.googleKey, tomtomKey: S.settings.tomtomKey, placesCallsToday: S.settings.placesCallsToday };
+        if (!data.settings.usage) keep.usage = S.settings.usage; // older exports have no counters: the device's are kept
         S.settings = Object.assign(defaultSettings(), data.settings, keep);
+        delete S.settings.tomtomUsage;
+        S.settings.templates = Messages.migrateTemplates(Object.assign({}, Messages.DEFAULT_TEMPLATES, S.settings.templates || {})).templates;
         await saveSettings();
+      }
+      if (data.travelTimes && typeof data.travelTimes === 'object') { // older exports have none: the learned times are kept
+        S.mem = TT.normaliseMemory(data.travelTimes);
+        await saveMemory();
       }
       if (Array.isArray(data.fuelStations)) { // older exports have none: the current memory is kept
         S.fuelStations = data.fuelStations.filter((x) => x && x.placeId != null && x.lat != null && x.lng != null);
@@ -2726,7 +2949,6 @@
   setInterval(minuteTick, 60000);
 
   load().then(() => {
-    seedPairsFromPlan();
     if (S.plan) lunchTick();
     if (S.plan && retimeNow()) savePlan(); // restored plan: re-time from the last done stop (or start) at the current time
     if (S.tab === 'plan') openPlanTab(); // a running day restored on the Plan tab: the chips read "My location" / "Now"

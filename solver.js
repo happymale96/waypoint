@@ -604,5 +604,17 @@
     return buildPlan(c, orderPlaceIds.map((p) => c.idx[p]));
   }
 
-  return { solve, evaluate, retime, markLate, normWindows, pushPastClosed, reindexMatrices, distanceM, refreshDue, judgeFix, originFresh, liveView, timesLine, LOC, isClosedAt, buildStops, pointsFor, formatETA, formatDuration, hmToSec, MAX_STOPS, DEFAULT_DWELL };
+  // The ordering rules as "must come before" lists (read only; the same prerequisites the search uses):
+  // {stopIds, before: {placeId: [placeIds that must be visited earlier]}}. Used to say which stops may be visited NEXT.
+  function precedence(input) {
+    const bs = buildStops(input.jobs, input.places);
+    const N = bs.stopIds.length + 2;
+    const zero = Array.from({ length: N }, () => new Array(N).fill(0));
+    const c = prepare(Object.assign({}, input, { matrices: [{ departAt: input.departAtISO || new Date().toISOString(), m: zero }] }));
+    const before = {};
+    bs.stopIds.forEach((pid, i) => { before[pid] = bs.stopIds.filter((q, o) => c.pre[i] & (1 << o)); });
+    return { stopIds: bs.stopIds, before };
+  }
+
+  return { solve, evaluate, precedence, retime, markLate, normWindows, pushPastClosed, reindexMatrices, distanceM, refreshDue, judgeFix, originFresh, liveView, timesLine, LOC, isClosedAt, buildStops, pointsFor, formatETA, formatDuration, hmToSec, MAX_STOPS, DEFAULT_DWELL };
 });

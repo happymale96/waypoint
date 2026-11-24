@@ -1,11 +1,15 @@
 /* L-Tech Waypoint — providers.js
  * Google Places (New) Text Search — place search ONLY.
- * TomTom Matrix Routing v2 (synchronous) — ALL travel times.
- * Matches https://docs.tomtom.com/matrix-routing-v2-api/documentation/synchronous-matrix :
- *   POST https://api.tomtom.com/routing/matrix/2?key=KEY
- *   body {origins:[{point:{latitude,longitude}}], destinations:[...], options:{departAt, traffic, travelMode}}
- *   200 -> {data:[{originIndex, destinationIndex, routeSummary:{travelTimeInSeconds, trafficDelayInSeconds,...}, detailedError?}], statistics}
- *   departAt must be "now" or a future dateTime; traffic "live" cannot be combined with "any".
+ * TomTom Routing API "Calculate Route" (service version 1) — ALL travel times by default, one origin -> one destination per
+ * request (routeLeg). Matches https://docs.tomtom.com/routing-api/documentation/tomtom-maps/calculate-route :
+ *   GET https://api.tomtom.com/routing/1/calculateRoute/{lat,lon}:{lat,lon}/json?key=KEY&travelMode=car&traffic=true
+ *       &routeType=fastest&routeRepresentation=summaryOnly&computeTravelTimeFor=all&departAt=now|<RFC 3339 dateTime>
+ *   200 -> {routes:[{summary:{lengthInMeters, travelTimeInSeconds, trafficDelayInSeconds, departureTime, arrivalTime,
+ *          noTrafficTravelTimeInSeconds, historicTrafficTravelTimeInSeconds, liveTrafficIncidentsTravelTimeInSeconds}}]}
+ *   historicTrafficTravelTimeInSeconds = the time "using time-dependent historic traffic data" (stored as the learned sample).
+ *   Errors: 400 bad input / no route, 403 not authorised / account, 429 too many requests, 5xx: detailedError {code, message}.
+ * TomTom Matrix Routing v2 (synchronous) — kept, used only when Settings -> "TomTom service" is Matrix:
+ *   POST https://api.tomtom.com/routing/matrix/2?key=KEY  body {origins, destinations, options:{departAt, traffic, travelMode}}
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory(root, require('./budget.js'));
@@ -17,44 +21,51 @@
     constructor(provider, message, kind, status) { super(kind === 'limit' ? message : provider + ': ' + message); this.provider = provider; this.kind = kind || null; this.status = status || null; }
   }
 
-  // ---------- TomTom usage hook (the app counts every request / cell per UTC day and tracks the "down" state) ----------
-  // hook = {count(requests, cells), ok(), down(status)}. Every response that came back is counted (whatever its status).
+  // ---------- TomTom usage hook (the app counts every request per day / month and tracks the "down" state) ----------
+  // hook = {count(kind 'routing'|'matrix', n), ok(), down(status)}. Every response that came back is counted (whatever its status).
   let hook = null;
   function setTomTomHook(h) { hook = h || null; }
   const hookCall = (name, ...a) => { try { if (hook && hook[name]) hook[name](...a); } catch (e) { /* never break a lookup */ } };
-  // 401 / 403 (out of credits, bad key) / 429 (rate) / 5xx / unreachable: one friendly error, no raw HTTP text
+  // 401 / 403 (bad key, not allowed, allowance used up) / 429 (after the retries) / 5xx / unreachable: one friendly error
   const isDown = (status) => status === 0 || status === 401 || status === 403 || status === 429 || status >= 500;
   const downError = (status) => new ProviderError('TomTom', Budget.DOWN_MSG, 'limit', status);
-  async function tomtomFetch(body, cells, key) {
-    let res;
-    try {
-      res = await fetch('https://api.tomtom.com/routing/matrix/2?key=' + encodeURIComponent(key), {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-      });
-    } catch (e) {
-      hookCall('down', 0);
-      throw downError(0);
-    }
-    hookCall('count', 1, cells);
-    const out = await res.json().catch(() => ({}));
-    if (!res.ok && isDown(res.status)) { hookCall('down', res.status); throw downError(res.status); }
-    if (res.ok) hookCall('ok');
-    return { res, body: out };
-  }
+  const RETRY_MS = [1500, 3000]; // a 429 waits and retries that leg up to 2 times
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // ---------- per-pair cache of real TomTom times (the estimated-times fallback reads it) ----------
-  const pairs = new Map(); // "lat,lng>lat,lng" -> {s, m}
-  const pairKey = (a, b) => roundPt(a) + '>' + roundPt(b);
-  function rememberPair(a, b, s, m) { if (s != null && isFinite(s)) pairs.set(pairKey(a, b), { s, m: m != null ? m : null }); }
-  function lookupPair(a, b) { return pairs.get(pairKey(a, b)) || null; }
-  // seed from a stored plan's matrices (real cells only): times survive a reload
-  function seedPairs(points, slice) {
-    if (!slice || !slice.m) return;
-    points.forEach((a, i) => points.forEach((b, j) => {
-      if (i === j || (slice.est && slice.est[i] && slice.est[i][j])) return;
-      const v = slice.m[i] && slice.m[i][j];
-      if (v != null && v < 1e8) rememberPair(a, b, v, slice.d && slice.d[i] ? slice.d[i][j] : null);
-    }));
+  // ---------- TomTom Routing API: one leg ----------
+  const pad2 = (n) => (n < 10 ? '0' : '') + n;
+  // RFC 3339 with the Malaysia offset (TomTom: "dateTime" with an optional offset), e.g. 2026-11-24T18:15:00+08:00
+  function departParam(ms, nowMs) {
+    if (ms == null || ms <= (nowMs != null ? nowMs : Date.now()) + 60000) return 'now';
+    const d = new Date(ms + 8 * 3600e3);
+    return d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' + pad2(d.getUTCDate()) + 'T' + pad2(d.getUTCHours()) + ':' + pad2(d.getUTCMinutes()) + ':00+08:00';
+  }
+  const ll = (p) => Number(p.lat).toFixed(6) + ',' + Number(p.lng).toFixed(6);
+  function routeUrl(from, to, departAtMs, key, nowMs) {
+    return 'https://api.tomtom.com/routing/1/calculateRoute/' + ll(from) + ':' + ll(to) + '/json?key=' + encodeURIComponent(key) +
+      '&travelMode=car&traffic=true&routeType=fastest&routeRepresentation=summaryOnly&computeTravelTimeFor=all&departAt=' + encodeURIComponent(departParam(departAtMs, nowMs));
+  }
+  // -> {seconds, metres, typicalSeconds|null}. departAtMs null / not in the future = "now".
+  async function routeLeg(from, to, departAtMs, key) {
+    if (!key) throw new ProviderError('TomTom', 'API key missing — add it in Settings.');
+    const url = routeUrl(from, to, departAtMs, key, Date.now());
+    for (let attempt = 0; ; attempt++) {
+      let res;
+      try { res = await fetch(url); } catch (e) { hookCall('down', 0); throw downError(0); }
+      hookCall('count', 'routing', 1);
+      if (res.status === 429 && attempt < RETRY_MS.length) { await wait(RETRY_MS[attempt]); continue; }
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok && isDown(res.status)) { hookCall('down', res.status); throw downError(res.status); }
+      if (!res.ok) {
+        const de = body.detailedError || (body.error && typeof body.error === 'object' ? body.error : null);
+        throw new ProviderError('TomTom', 'HTTP ' + res.status + (de ? ' — ' + (de.message || de.code) : ''));
+      }
+      hookCall('ok');
+      const sm = body.routes && body.routes[0] && body.routes[0].summary;
+      if (!sm || sm.travelTimeInSeconds == null) throw new ProviderError('TomTom', 'no route in the answer.');
+      const typ = sm.historicTrafficTravelTimeInSeconds;
+      return { seconds: sm.travelTimeInSeconds, metres: sm.lengthInMeters != null ? sm.lengthInMeters : null, typicalSeconds: typ != null && isFinite(typ) ? typ : null };
+    }
   }
 
   // ---------- Google Places (New) ----------
@@ -97,25 +108,35 @@
     })).filter((p) => p.lat != null && p.lng != null);
   }
 
-  // ---------- TomTom Matrix Routing v2 ----------
+  // ---------- TomTom Matrix Routing v2 (Settings -> TomTom service: Matrix only) ----------
   const cache = new Map();   // session-only matrix cache
   const SLICE_OFFSETS_H = [0, 2, 4];
-
   function pt(p) { return { point: { latitude: p.lat, longitude: p.lng } }; }
-
+  async function matrixFetch(body, key) {
+    let res;
+    try {
+      res = await fetch('https://api.tomtom.com/routing/matrix/2?key=' + encodeURIComponent(key), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+    } catch (e) { hookCall('down', 0); throw downError(0); }
+    hookCall('count', 'matrix', 1);
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok && isDown(res.status)) { hookCall('down', res.status); throw downError(res.status); }
+    if (res.ok) hookCall('ok');
+    return { res, body: out };
+  }
   async function tomtomMatrix(points, key, departAtMs) {
     if (!key) throw new ProviderError('TomTom', 'API key missing — add it in Settings.');
     const n = points.length;
     const now = Date.now();
     const options = { traffic: 'live', travelMode: 'car', departAt: (departAtMs <= now + 60000) ? 'now' : new Date(departAtMs).toISOString() };
-    const { res, body } = await tomtomFetch({ origins: points.map(pt), destinations: points.map(pt), options }, n * n, key);
+    const { res, body } = await matrixFetch({ origins: points.map(pt), destinations: points.map(pt), options }, key);
     if (!res.ok) {
       const detail = body.detailedError ? (body.detailedError.message || body.detailedError.code) : (body.error || body.message || '');
-      const hint = res.status === 401 || res.status === 403 ? ' (check the key and that Matrix Routing is enabled)' : res.status === 429 ? ' (rate limit — try again shortly)' : '';
-      throw new ProviderError('TomTom', 'HTTP ' + res.status + (detail ? ' — ' + detail : '') + hint);
+      throw new ProviderError('TomTom', 'HTTP ' + res.status + (detail ? ' — ' + detail : ''));
     }
     const m = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => (i === j ? 0 : null)));
-    const d = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => (i === j ? 0 : null))); // metres, from the same response
+    const d = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => (i === j ? 0 : null)));
     (body.data || []).forEach((c) => {
       if (c.originIndex === c.destinationIndex) return;
       const rs = c.routeSummary;
@@ -127,14 +148,8 @@
     const failed = m.some((row, i) => row.some((v, j) => v == null && i !== j));
     return { m, d, failed };
   }
-
   const roundPt = (p) => p.lat.toFixed(5) + ',' + p.lng.toFixed(5);
-  function cacheKey(points, departAtISO) {
-    return points.map(roundPt).join('|') + '@' + departAtISO.slice(0, 16);
-  }
-
-  // Three slices: departAt, +2 h, +4 h. Cached in memory so re-solving makes zero API calls.
-  // Returns {matrices:[{departAt, m}], fromCache, calls}
+  const cacheKey = (points, departAtISO) => points.map(roundPt).join('|') + '@' + departAtISO.slice(0, 16);
   async function getMatrices(points, departAtISO, key, opts) {
     opts = opts || {};
     const ck = cacheKey(points, departAtISO);
@@ -143,41 +158,31 @@
     const slices = SLICE_OFFSETS_H.map((h) => t0 + h * 3600e3);
     const results = await Promise.all(slices.map((ms) => tomtomMatrix(points, key, ms)));
     const matrices = results.map((r, i) => ({ departAt: new Date(slices[i]).toISOString(), m: r.m, d: r.d }));
-    seedPairs(points, results[0]); // the first slice (depart now / the plan's departure) feeds the per-pair cache
     cache.set(ck, matrices);
     return { matrices, fromCache: false, calls: slices.length, partial: results.some((r) => r.failed) };
   }
-  // PLAN never blocked: TomTom out (limit / unavailable) -> cached pairs + straight-line estimates, every estimated cell
-  // flagged (slice.est). Other errors (key missing, a 400) are thrown as before.
+  // estimates for every pair (Budget.estSec), flagged; the provider's matrix shape
+  function estimateMatrices(points, departAtISO) {
+    const m = points.map((a) => points.map((b) => (a === b ? 0 : Budget.estSec(a, b))));
+    const d = points.map((a) => points.map((b) => (a === b ? 0 : Budget.estMetres(a, b))));
+    const est = points.map((a, i) => points.map((b, j) => i !== j));
+    return [{ departAt: departAtISO, m, d, est }];
+  }
   async function getMatricesOrEstimate(points, departAtISO, key, opts) {
     try {
       return await getMatrices(points, departAtISO, key, opts);
     } catch (e) {
       if (!e || e.kind !== 'limit') throw e;
-      const f = Budget.fillMatrices(points, departAtISO, SLICE_OFFSETS_H, lookupPair);
-      return { matrices: f.matrices, fromCache: false, calls: 0, partial: false, estimated: true, estCells: f.estimated, error: e };
+      return { matrices: estimateMatrices(points, departAtISO), fromCache: false, calls: 0, partial: false, estimated: true, error: e };
     }
   }
-  function clearCache() { cache.clear(); pairs.clear(); }
-
-  // ONE Matrix Routing v2 request for a whole driven sequence (End Day): origins = points[0..n-2], destinations =
-  // points[1..n-1]; the leg i is cell (i,i). Same provider/product as planning; no new API. Returns [{m metres, s seconds}].
-  async function routeLegs(points, key) {
-    if (!key) throw new ProviderError('TomTom', 'API key missing — add it in Settings.');
-    if (!points || points.length < 2) return [];
-    const origins = points.slice(0, -1), dests = points.slice(1);
-    const { res, body } = await tomtomFetch({ origins: origins.map(pt), destinations: dests.map(pt), options: { traffic: 'live', travelMode: 'car', departAt: 'now' } }, origins.length * dests.length, key);
-    if (!res.ok) throw new ProviderError('TomTom', 'HTTP ' + res.status + (body.detailedError ? ' — ' + (body.detailedError.message || body.detailedError.code) : ''));
-    const legs = origins.map(() => ({ m: null, s: null }));
-    (body.data || []).forEach((c) => {
-      if (c.originIndex !== c.destinationIndex || c.detailedError || !c.routeSummary || !legs[c.originIndex]) return;
-      const rs = c.routeSummary;
-      legs[c.originIndex] = { m: rs.lengthInMeters != null ? rs.lengthInMeters : null, s: rs.travelTimeInSeconds != null ? rs.travelTimeInSeconds : null };
-    });
-    if (legs.some((l) => l.m == null)) throw new ProviderError('TomTom', 'route response was missing some legs.');
-    legs.forEach((l, i) => rememberPair(origins[i], dests[i], l.s, l.m));
-    return legs;
+  function clearCache() { cache.clear(); }
+  // one leg through Matrix v2 (1 x 1), the same answer shape as routeLeg
+  async function matrixLeg(from, to, departAtMs, key) {
+    const r = await tomtomMatrix([from, to], key, departAtMs != null ? departAtMs : Date.now());
+    if (r.m[0][1] == null) throw new ProviderError('TomTom', 'route response was missing the leg.');
+    return { seconds: r.m[0][1], metres: r.d[0][1], typicalSeconds: null };
   }
 
-  return { ProviderError, searchGoogle, tomtomMatrix, getMatrices, getMatricesOrEstimate, routeLegs, clearCache, setTomTomHook, lookupPair, seedPairs };
+  return { ProviderError, RETRY_MS, departParam, routeUrl, routeLeg, searchGoogle, tomtomMatrix, getMatrices, getMatricesOrEstimate, estimateMatrices, matrixLeg, clearCache, setTomTomHook };
 });

@@ -78,6 +78,11 @@ const INIT = `(() => {
   window.fetch = async (url, init) => {
     url = String(url);
     if (url.includes('api.tomtom.com')) {
+      if (url.includes('/calculateRoute/')) { // the Routing API: one leg per request, coordinates in the path
+        const q = [0].concat(url.split('/calculateRoute/')[1].split('/')[0].split(/[,:]/).map(Number));
+        const k = km({ lat: +q[1], lng: +q[2] }, { lat: +q[3], lng: +q[4] });
+        return json({ routes: [{ summary: { travelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), lengthInMeters: Math.round(k * 1300) } }] });
+      }
       const b = JSON.parse(init.body), data = [];
       b.origins.forEach((o, i) => b.destinations.forEach((d, j) => {
         const k = km({ lat: o.point.latitude, lng: o.point.longitude }, { lat: d.point.latitude, lng: d.point.longitude });
@@ -158,7 +163,7 @@ async function main() {
     await send('Page.enable'); await send('Runtime.enable');
     await send('Page.addScriptToEvaluateOnNewDocument', { source: INIT });
     const ev = async (expr) => { const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }); if (r.exceptionDetails) throw new Error('page error: ' + (r.exceptionDetails.exception && r.exceptionDetails.exception.description || r.exceptionDetails.text)); return r.result.value; };
-    const waitFor = async (expr, what, ms) => { const end = Date.now() + (ms || 8000); while (Date.now() < end) { if (await ev('!!(' + expr + ')')) return true; await sleep(100); } throw new Error('timeout waiting for ' + what); };
+    const waitFor = async (expr, what, ms) => { const end = Date.now() + (ms || 8000); while (Date.now() < end) { if (await ev('!!(' + expr + ')')) return true; await sleep(100); } const bn = await ev('(document.getElementById("banner") || {}).textContent || ""').catch(() => ''); throw new Error('timeout waiting for ' + what + (bn ? ' [banner: ' + bn + ']' : '') + (page.logs.length ? ' [page: ' + page.logs.join(' | ') + ']' : '')); };
     const click = (sel) => ev('(() => { const e = document.querySelector(' + JSON.stringify(sel) + '); if (!e) throw new Error("no " + ' + JSON.stringify(sel) + '); e.click(); return true; })()');
     const text = (sel) => ev('(() => { const e = document.querySelector(' + JSON.stringify(sel) + '); return e ? e.textContent : null; })()');
     const clickText = (sel, label) => ev('(() => { const e = [...document.querySelectorAll(' + JSON.stringify(sel) + ')].find((x) => x.textContent.trim() === ' + JSON.stringify(label) + '); if (!e) throw new Error("no " + ' + JSON.stringify(label) + '); e.click(); return true; })()');
@@ -376,7 +381,7 @@ async function main() {
     await ev('(() => { const c = [...document.querySelectorAll(".timeline .card.stop")].find((x) => x.querySelector(".nm") && x.querySelector(".nm").textContent.indexOf("Delta") === 0); [...c.querySelectorAll("button")].find((b) => b.textContent === "MSG").click(); return true; })()');
     await waitFor('window.__copied', 'the copied message');
     const copied = await ev('window.__copied');
-    check(/pukul 5:10 petang\./.test(copied), 'the copied message says 5:10 petang (17:10) for an ETA of 17:00', copied);
+    check(/^Salam .*sebelum pukul 5\.10pm hantar ke kilang .*Tq👍$/.test(copied), 'the copied message (Part G wording) says 5.10pm (17:10) for an ETA of 17:00', copied);
 
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {

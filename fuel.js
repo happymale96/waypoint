@@ -131,6 +131,43 @@
     return out;
   }
 
+  // Every (station, allowed leg) pair as a pickInsertion candidate: [{station, a, b, legIndex}].
+  function allCandidates(routePoints, stations, legs) {
+    const out = [], seen = new Set();
+    (stations || []).forEach((st) => {
+      if (!st || seen.has(st.placeId)) return;
+      seen.add(st.placeId);
+      (legs || []).forEach((l) => out.push({ station: st, a: routePoints[l.from], b: routePoints[l.to], legIndex: l.index }));
+    });
+    return out;
+  }
+  // Rank every candidate with the estimator (estMin(p, q) -> minutes), keep the best n (default 8), fetch the real times of
+  // their two station legs (fetchMin(p, q) -> Promise<minutes>; each distinct leg once: at most 2n requests), then choose
+  // among those n with the existing rule (pickInsertion; baseMin(p, q) = the route's own leg A -> B, no request).
+  // Points carry .key. Returns {sorted, requests, times: Map "a>b" -> minutes, estimated (TomTom out: the estimate ranking)}.
+  async function realTimeShortlist(candidates, estMin, fetchMin, baseMin, n) {
+    n = n == null ? 8 : n;
+    const ranked = pickInsertion(candidates, estMin).slice(0, n);
+    const need = [], seen = new Set();
+    const want = (p, q) => { const k = p.key + '>' + q.key; if (!seen.has(k)) { seen.add(k); need.push([p, q, k]); } };
+    ranked.forEach((c) => { want(c.a, c.station); want(c.station, c.b); });
+    const times = new Map();
+    let down = false, requests = 0;
+    await mapLimit(need, 4, async ([p, q, k]) => {
+      if (down) return;
+      requests++;
+      try { const v = await fetchMin(p, q); if (v != null && isFinite(v)) times.set(k, v); } catch (e) { if (e && e.kind === 'limit') down = true; }
+    });
+    if (down) return { sorted: ranked, requests, times, estimated: true };
+    const tt = (p, q) => {
+      const k = p.key + '>' + q.key;
+      if (times.has(k)) return times.get(k);
+      if (p.fuel || q.fuel) return null;
+      return baseMin(p, q);
+    };
+    return { sorted: pickInsertion(ranked.map((c) => ({ station: c.station, a: c.a, b: c.b, legIndex: c.legIndex })), tt), requests, times, estimated: false };
+  }
+
   // How many Places searches this tap may make.
   function searchBudget(needed, maxPerTap, callsToday, dailyGuard) {
     dailyGuard = dailyGuard == null ? DAILY_GUARD : dailyGuard;
@@ -189,7 +226,7 @@
 
   return {
     DAILY_GUARD, REUSE_MS, FUEL_ID,
-    haversineKm, corridorDetourKm, evenIndices, thinEvenly, samplePoints, remainingPoints, allowedLegs, shortlist, pickInsertion,
+    haversineKm, corridorDetourKm, evenIndices, thinEvenly, samplePoints, remainingPoints, allowedLegs, shortlist, pickInsertion, allCandidates, realTimeShortlist,
     searchBudget, mergeStations, sameRouteKey, nameHasBrand, stationsOfBrand, mapLimit,
   };
 });

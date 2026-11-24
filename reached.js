@@ -95,6 +95,23 @@
   // Returns a stop id only when ALL hold: setting on; page visible; the fix is fresh by the app's own rule
   // (Solver.originFresh, 5 min) and accurate to 100 m or better; exactly ONE pending stop (not done, not skipped, not
   // already reached, not flagged no-auto-reach) lies within 150 m; and that stop is not the end point. Otherwise null.
+  // Can something be done at this stop NOW (auto-reach candidate)? stop = {id, actions:[{jobId, kind}], fuel?, isEnd?};
+  // jobs = {jobId: job} (pickups[].done = DONE at the pickup; Reached there is not enough). True when at least one holds:
+  // a pickup here not done; a delivery here whose job's pickups are ALL done (a job with no pickup = an item already with
+  // you); an errand here; the fuel stop or the end point. A stop whose only actions are deliveries waiting for a pickup that
+  // is not done (or was skipped) is not a candidate. A stop listed without actions keeps the old behaviour.
+  function canAutoReach(stop, jobs) {
+    if (!stop) return false;
+    if (stop.isEnd || stop.fuel || !Array.isArray(stop.actions)) return true;
+    const J = jobs || {};
+    return stop.actions.some((a) => {
+      const j = J[a.jobId];
+      if (!j) return false;
+      if (a.kind === 'pickup') return (j.pickups || []).some((p) => p.placeId === stop.id && !p.done);
+      if (a.kind === 'deliver') return (j.pickups || []).every((p) => p.done);
+      return a.kind === 'errand';
+    });
+  }
   function autoReachTarget(fix, stops, opts) {
     opts = opts || {};
     if (!opts.enabled || !opts.visible) return null;
@@ -102,7 +119,7 @@
     if (!(fix.accuracy <= MAX_ACCURACY_M)) return null;
     if (!Solver.originFresh({ usedAt: fix.at }, opts.now)) return null;
     const inRange = (stops || []).filter((s) => isPending(s) && !isReached(s) && !s.noAutoReach && s.lat != null && s.lng != null
-      && Solver.distanceM(fix, s) <= RADIUS_M);
+      && canAutoReach(s, opts.jobs) && Solver.distanceM(fix, s) <= RADIUS_M);
     if (inRange.length !== 1 || inRange[0].isEnd) return null;
     return inRange[0].id;
   }
@@ -398,5 +415,5 @@
 
   return { RADIUS_M, MAX_ACCURACY_M, TAP_GUARD_MS, MIN_ON_SITE_MS, isReached, buttonLabel, tapIgnored, stampReached, undoReached, undoDone, carryForward,
     keptState, keepStateOf, stampNav, WATCH_OPTS, WATCH_RETIME_MS, shouldWatch, retimeDue,
-    reachedText, onSiteStop, autoReachTarget, daySplit, dayTimeline, timelineEventsOfSummary, splitOfSummary, splitLine, stopLine };
+    reachedText, onSiteStop, canAutoReach, autoReachTarget, daySplit, dayTimeline, timelineEventsOfSummary, splitOfSummary, splitLine, stopLine };
 });

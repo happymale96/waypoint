@@ -81,6 +81,11 @@ const INIT = `(() => {
   window.fetch = async (url, init) => {
     url = String(url);
     if (url.includes('api.tomtom.com')) {
+      if (url.includes('/calculateRoute/')) { // the Routing API: one leg per request, coordinates in the path
+        const q = [0].concat(url.split('/calculateRoute/')[1].split('/')[0].split(/[,:]/).map(Number));
+        const k = km({ lat: +q[1], lng: +q[2] }, { lat: +q[3], lng: +q[4] });
+        return json({ routes: [{ summary: { travelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), lengthInMeters: Math.round(k * 1300) } }] });
+      }
       const b = JSON.parse(init.body), data = [];
       b.origins.forEach((o, i) => b.destinations.forEach((d, j) => {
         const k = km({ lat: o.point.latitude, lng: o.point.longitude }, { lat: d.point.latitude, lng: d.point.longitude });
@@ -161,7 +166,7 @@ async function main() {
     await send('Page.enable'); await send('Runtime.enable');
     await send('Page.addScriptToEvaluateOnNewDocument', { source: INIT });
     const ev = async (expr) => { const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }); if (r.exceptionDetails) throw new Error('page error: ' + (r.exceptionDetails.exception && r.exceptionDetails.exception.description || r.exceptionDetails.text)); return r.result.value; };
-    const waitFor = async (expr, what, ms) => { const end = Date.now() + (ms || 8000); while (Date.now() < end) { if (await ev('!!(' + expr + ')')) return true; await sleep(100); } throw new Error('timeout waiting for ' + what); };
+    const waitFor = async (expr, what, ms) => { const end = Date.now() + (ms || 8000); while (Date.now() < end) { if (await ev('!!(' + expr + ')')) return true; await sleep(100); } const bn = await ev('(document.getElementById("banner") || {}).textContent || ""').catch(() => ''); throw new Error('timeout waiting for ' + what + (bn ? ' [banner: ' + bn + ']' : '') + (page.logs.length ? ' [page: ' + page.logs.join(' | ') + ']' : '')); };
     const click = (sel) => ev('(() => { const e = document.querySelector(' + JSON.stringify(sel) + '); if (!e) throw new Error("no " + ' + JSON.stringify(sel) + '); e.click(); return true; })()');
     const text = (sel) => ev('(() => { const e = document.querySelector(' + JSON.stringify(sel) + '); return e ? e.textContent : null; })()');
     const advanceMin = (min) => ev('window.__off += ' + (min * 60000));
@@ -434,6 +439,52 @@ async function main() {
     const copied = await ev('window.__copiedText || ""');
     check(/Time split: Driving/.test(copied) && !/null|undefined|Plan vs actual|Drive \(est/.test(copied), 'Copy summary: the time split instead of the old estimate, no "Plan vs actual", no "null"', copied.slice(0, 200));
 
+    console.log('9. auto-reach only where something can be done (J1 pickup A -> delivery B, J2 pickup C -> delivery D)');
+    await send('Emulation.clearDeviceMetricsOverride');
+    await send('Page.navigate', { url: 'about:blank' });
+    await sleep(500);
+    await send('Storage.clearDataForOrigin', { origin: new URL(appUrl).origin, storageTypes: 'local_storage' });
+    await send('Page.navigate', { url: appUrl });
+    await waitFor('document.querySelector("#planBtn")', 'the Plan tab (third world)');
+    const W3 = {
+      'waypoint:places:qA': { id: 'qA', name: 'Pickup A', address: 'A', lat: 3.10, lng: 101.60, type: 'supplier', dwellMin: 10, closedWindows: [] },
+      'waypoint:places:qB': { id: 'qB', name: 'Deliver B', address: 'B', lat: 3.13, lng: 101.64, type: 'factory', dwellMin: 15, closedWindows: [] },
+      'waypoint:places:qC': { id: 'qC', name: 'Pickup C', address: 'C', lat: 3.16, lng: 101.60, type: 'supplier', dwellMin: 10, closedWindows: [] },
+      'waypoint:places:qD': { id: 'qD', name: 'Deliver D', address: 'D', lat: 3.19, lng: 101.64, type: 'factory', dwellMin: 15, closedWindows: [] },
+      'waypoint:jobs:J1': { id: 'J1', pickups: [{ placeId: 'qA', item: 'Gear' }], deliveryPlaceId: 'qB', notes: '', urgent: false, urgentRank: 0, arriveBefore: null, arriveAfter: null, status: 'pending', doneAt: null, createdAt: '2026-11-23T02:00:00.000Z' },
+      'waypoint:jobs:J2': { id: 'J2', pickups: [{ placeId: 'qC', item: 'Shaft' }], deliveryPlaceId: 'qD', notes: '', urgent: false, urgentRank: 0, arriveBefore: null, arriveAfter: null, status: 'pending', doneAt: null, createdAt: '2026-11-23T02:01:00.000Z' },
+    };
+    await ev('(() => { Object.keys(localStorage).filter((k) => /^waypoint:(jobs|places|plan|daylogs):/.test(k) && k !== "waypoint:places:home").forEach((k) => localStorage.removeItem(k)); const w = ' + JSON.stringify(W3) + '; Object.keys(w).forEach((k) => localStorage.setItem(k, JSON.stringify(w[k]))); return true; })()');
+    await send('Page.navigate', { url: appUrl });
+    await waitFor('document.querySelector("#planBtn")', 'the Plan tab (third world, reloaded)');
+    await ev('(() => { window.__gps = { lat: 3.05, lng: 101.55, accuracy: 20 }; return true; })()'); // far from every stop
+    await click('#planBtn');
+    await waitFor('window.WaypointDebug && WaypointDebug.S.plan && WaypointDebug.S.tab === "route" && document.querySelectorAll(".timeline .card.stop").length === 4', 'the J1 / J2 route', 12000);
+    await waitFor('!WaypointDebug.S.loc.busy && Object.keys(window.__watches).length === 1', 'the watch after PLAN');
+    const idxOf = (id) => ev('WaypointDebug.S.plan.result.plans[0].stops.findIndex((s) => s.placeId === ' + JSON.stringify(id) + ')');
+    const toastText = () => ev('(() => { const t = document.getElementById("toast"); return t && !t.hidden ? t.textContent : ""; })()');
+    await ev('(() => { document.getElementById("toast").hidden = true; return true; })()');
+    // the position moves to D before C is Done: a GPS-watch update 60 m from D
+    await ev('(() => { const p = WaypointDebug.S.places.qD; window.__gps = { lat: p.lat + 60 / 111190, lng: p.lng, accuracy: 20 }; return window.__watchFire(window.__gps); })()');
+    await sleep(400);
+    check(await ev(planStop('qD') + '.reachedAt == null'), 'at D before C is Done: D is NOT marked Reached');
+    check(!/Reached/.test(await toastText()), 'no "Reached … (auto)" toast', await toastText());
+    // C: the manual REACHED tap (works on any stop), then DONE, the position still at D
+    const iC = await idxOf('qC');
+    await clickPrimary(iC);
+    await waitFor(planStop('qC') + '.reachedAt != null', 'the manual Reached at C');
+    await advanceMs(2000);
+    await clickPrimary(await idxOf('qC'));
+    await waitFor(planStop('qC') + '.status === "done"', 'DONE at C');
+    await waitFor(planStop('qD') + '.reachedAt != null', 'D Reached by itself after DONE at C', 8000);
+    check(await ev(planStop('qD') + '.reachedSource') === 'auto', 'D becomes Reached by itself (auto) once its pickup C is Done');
+    check(/Reached Deliver D .*\(auto\)/.test(await toastText()), 'the auto-reach toast names D', await toastText());
+    // B: a delivery whose pickup A is not done - the manual Reached tap still works
+    const iB = await idxOf('qB');
+    check(await ev(planStop('qB') + '.reachedAt == null'), 'B (pickup A not done) is not reached');
+    await clickPrimary(iB);
+    await waitFor(planStop('qB') + '.reachedAt != null', 'the manual Reached at B');
+    check(await ev(planStop('qB') + '.reachedSource') === 'tap', 'a manual Reached tap on a not-yet-collectable delivery still works');
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {
     await cleanup();

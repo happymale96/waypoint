@@ -288,5 +288,10 @@ button.end-day { width: 100%; margin: 8px 0 0; min-height: 44px; }
 /* TomTom budget: the one notice (limit reached / unavailable, or the daily guard), "Estimated times", the Settings counter */
 .tt-notice { margin: 0 0 10px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--chip); font-size: 14px; font-weight: 600; }
 .tt-notice.down { background: var(--warn); color: #fff; border-color: transparent; }
+.usage-line { font-size: 14px; white-space: pre-wrap; font-variant-numeric: tabular-nums; margin-top: 8px; }
+.usage-bar { height: 4px; border-radius: 2px; background: var(--chip); margin: 4px 0 2px; overflow: hidden; }
+.usage-fill { height: 100%; background: var(--accent, #2f6fde); }
+.usage-fill.high { background: var(--warn); }
+.reorder-notice { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px; }
 .chip.est { margin-top: 8px; }
 .tt-usage { margin-top: 8px; font-size: 14px; }

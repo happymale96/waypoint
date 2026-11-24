@@ -1,14 +1,20 @@
 #!/usr/bin/env node
-/* Mocked browser smoke for the TomTom budget (no screenshots, no network, no real keys).
+/* Mocked browser smoke for TomTom on the Routing API (no screenshots, no network, no real keys).
  *   node tools/smoke-tomtom.js
  * Serves the app from this repo on a free local port, drives a headless Chrome / Edge over the DevTools protocol, and mocks
- * TomTom (every call it receives is logged with its origins x destinations; it can answer 403 "not enough credits"),
- * geolocation incl. watchPosition, and the clock inside the page. Walks: PLAN with 4 stops, then 60 GPS-watch updates over a
- * mocked 10 minutes (the minute timer run once per mocked minute): 0 TomTom calls from the updates, at most one periodic
- * re-time, each 1 x 1. Then TomTom answers 403: PLAN still gives a route, ONE friendly notice, no raw "HTTP 403", "Estimated
- * times" in the Route header, ETAs marked "est.". TomTom recovers: the next PLAN clears the notice and the marks. Settings
- * shows the counter with exactly the requests / cells the mock received. Exit 1 on failure.
- * Needs Node 22+ (global WebSocket / fetch) and Chrome or Edge (set CHROME=<path> to choose one).
+ * TomTom (calculateRoute and Matrix are counted per endpoint, every departAt recorded; one leg can be made very slow; any
+ * request touching a chosen point can answer 403), geolocation incl. watchPosition, the clipboard and the clock (pinned to
+ * 24 Nov 2026 10:00 Malaysia time). Walks:
+ *   1. PLAN 6 stops A..F from O (my location) to E: exactly 49 Routing calls (42 table + 7 check), 0 Matrix, the progress
+ *      text "Getting travel times n of N…", no "est." on any ETA.     2. PLAN again: 7 calls (the learned table + the check).
+ *   3. 60 GPS-watch updates over a mocked 10 minutes: at most 1 Routing call (the 10-minute re-time).
+ *   4. DONE on the first stop (5 pending -> full refresh): exactly 5 + 20 + 5 = 30 calls; a later leg made very slow -> the
+ *      order changes by itself, the "Order updated … · Undo" notice, Replans +1; Undo -> the previous order back.
+ *   5. Setting "Ask me", DONE on the next stop: the Switch / Keep mine card, nothing changes until Switch.
+ *   6. MSG on a customer stop: the copied text is the owner's wording (Salam …, sebelum pukul …, Tq👍).
+ *   7. 403 for a new pair: the ONE notice with the new text (no "08:00"), a route, "Estimated order" in the header, no look-ahead.
+ *   8. Settings "Usage": TomTom Routing and Google Places, today and this month, equal to the mock's counts.
+ * Exit 1 on failure. Needs Node 22+ (global WebSocket / fetch) and Chrome or Edge (set CHROME=<path> to choose one).
  */
 'use strict';
 const fs = require('fs');
@@ -31,26 +37,26 @@ function check(cond, name, extra) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const freePort = () => new Promise((res, rej) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); }); s.on('error', rej); });
 
-// ---------- the world: four deliveries / errands at four places, home as the end ----------
-const job = (id, o) => Object.assign({ id, pickups: [], deliveryPlaceId: null, notes: '', urgent: false, urgentRank: 0, arriveBefore: null, arriveAfter: null, status: 'pending', doneAt: null, createdAt: '2026-11-24T01:0' + id.slice(1) + ':00.000Z' }, o);
-const SEED = {
-  'waypoint:settings:main': { googleKey: 'test-google', tomtomKey: 'test-tomtom', seeded: true, defaultLang: 'ms', nav: 'waze', driverName: 'Calvin', lunchBreakOn: false },
-  'waypoint:places:home': { id: 'home', name: 'Home (Bloomsvale)', address: 'Bloomsvale', lat: 3.0757673, lng: 101.6609445, type: 'home', dwellMin: 0, closedWindows: [] },
-  'waypoint:places:pA': { id: 'pA', name: 'Alpha Bank', address: 'A St', lat: 3.10, lng: 101.66, type: 'other', dwellMin: 10, closedWindows: [] },
-  'waypoint:places:pB': { id: 'pB', name: 'Beta Customer', address: 'B St', lat: 3.125, lng: 101.705, type: 'factory', dwellMin: 15, closedWindows: [] },
-  'waypoint:places:pC': { id: 'pC', name: 'Gamma Works', address: 'C St', lat: 3.17, lng: 101.62, type: 'factory', dwellMin: 15, closedWindows: [] },
-  'waypoint:places:pD': { id: 'pD', name: 'Delta Supply', address: 'D St', lat: 3.14, lng: 101.58, type: 'supplier', dwellMin: 10, closedWindows: [] },
-  'waypoint:jobs:j1': job('j1', { inHandItem: 'Urgent part', deliveryPlaceId: 'pB', urgent: true, urgentRank: 1 }),
-  'waypoint:jobs:j2': job('j2', { inHandItem: 'Spare', deliveryPlaceId: 'pC' }),
-  'waypoint:jobs:j3': job('j3', { errandPlaceId: 'pA', dwellMin: 10, notes: 'Pay bill' }),
-  'waypoint:jobs:j4': job('j4', { inHandItem: 'Bolts', deliveryPlaceId: 'pD' }),
-};
-const GPS0 = { lat: 3.0, lng: 101.65, accuracy: 15 }; // far from every stop (no auto-reach while driving west)
+// ---------- the world: O (office, where the run starts), six customer deliveries A..F (east / north), E = home ----------
+const pl = (id, name, lat, lng, type, dwell) => ({ id, name, address: name + ' St', lat, lng, type, dwellMin: dwell, closedWindows: [], salutation: 'Encik', lang: 'default' });
+const PLACES = [
+  pl('pO', 'Office O', 3.0994, 101.7390, 'office', 10), pl('home', 'Home E', 3.0758, 101.6609, 'home', 0),
+  pl('pA', 'Alpha Works', 3.120, 101.760, 'factory', 10), pl('pB', 'Beta Works', 3.140, 101.780, 'factory', 10),
+  pl('pC', 'Gamma Works', 3.160, 101.750, 'factory', 10), pl('pD', 'Delta Works', 3.180, 101.790, 'factory', 10),
+  pl('pF', 'Foxtrot Works', 3.110, 101.800, 'factory', 10), pl('pH', 'Hotel Works', 3.150, 101.820, 'factory', 10),
+  pl('pG', 'Golf Works', 3.200, 101.740, 'factory', 10),
+];
+const job = (id, pid, item) => ({ id, pickups: [], inHandItem: item, deliveryPlaceId: pid, notes: '', urgent: false, urgentRank: 0, arriveBefore: null, arriveAfter: null, status: 'pending', doneAt: null, createdAt: '2026-11-24T01:0' + id.slice(1) + ':00.000Z' });
+const SEED = { 'waypoint:settings:main': { googleKey: 'test-google', tomtomKey: 'test-tomtom', seeded: true, defaultLang: 'ms', nav: 'waze', driverName: 'Calvin', lunchBreakOn: false } };
+PLACES.forEach((p) => { SEED['waypoint:places:' + p.id] = p; });
+['pA', 'pB', 'pC', 'pD', 'pF', 'pH', 'pG'].forEach((pid, i) => { SEED['waypoint:jobs:j' + (i + 1)] = job('j' + (i + 1), pid, 'Part ' + (i + 1)); });
+const O = PLACES[0];
+const GPS0 = { lat: O.lat, lng: O.lng, accuracy: 15 }; // "My location" = the office
 
 const INIT = `(() => {
   const RealDate = Date;
-  // the mocked clock starts at 04:00 UTC today (12:00 MYT), far from the counter's 00:00 UTC rollover
-  window.__off = (() => { const n = RealDate.now(), d = new RealDate(n); return RealDate.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 4, 0, 0) - n; })();
+  // the clock is pinned: 24 Nov 2026 02:00 UTC = 10:00 Malaysia time
+  window.__off = RealDate.UTC(2026, 10, 24, 2, 0, 0) - RealDate.now();
   window.Date = class extends RealDate {
     constructor(...a) { if (a.length === 0) super(RealDate.now() + window.__off); else super(...a); }
     static now() { return RealDate.now() + window.__off; }
@@ -66,25 +72,37 @@ const INIT = `(() => {
   } });
   window.__watchFire = (p) => { const ws = Object.values(window.__watches); ws.forEach((w) => w.ok({ coords: { latitude: p.lat, longitude: p.lng, accuracy: p.accuracy }, timestamp: Date.now() })); return ws.length; };
   try { navigator.permissions.query = async () => ({ state: 'granted', addEventListener() {} }); } catch (e) { /* ignore */ }
+  window.__copiedText = '';
+  try { Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (t) => { window.__copiedText = t; } } }); } catch (e) { /* ignore */ }
   window.open = () => null;
   document.addEventListener('click', (e) => { const a = e.target && e.target.closest && e.target.closest('a[target="_blank"]'); if (a) e.preventDefault(); }, true);
+  // every banner text the page shows (the PLAN progress line is short-lived)
+  window.__banners = [];
+  document.addEventListener('DOMContentLoaded', () => {
+    new MutationObserver(() => { const b = document.getElementById('banner'); if (b && !b.hidden && b.textContent) window.__banners.push(b.textContent); })
+      .observe(document.documentElement, { subtree: true, childList: true, characterData: true, attributes: true });
+  });
   const km = (a, b) => { const r = Math.PI / 180, dl = (b.lat - a.lat) * r, dg = (b.lng - a.lng) * r;
     const x = Math.sin(dl / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dg / 2) ** 2; return 12742 * Math.asin(Math.sqrt(x)); };
   const realFetch = window.fetch.bind(window);
-  window.__tt = []; window.__ttMode = 200; window.__other = 0;
+  const same = (p, q) => Math.abs(p.lat - q.lat) < 1e-4 && Math.abs(p.lng - q.lng) < 1e-4;
+  // __rt: every Routing call {a, b, departAt}; __mx: Matrix calls; __slow: [from, to] made 3 h slower; __deny: a point -> 403
+  window.__rt = []; window.__mx = 0; window.__places = 0; window.__other = 0; window.__slow = null; window.__deny = null;
   window.fetch = async (url, init) => {
     url = String(url);
-    if (url.includes('api.tomtom.com')) {
-      const b = JSON.parse(init.body);
-      window.__tt.push({ o: b.origins.length, d: b.destinations.length, at: Date.now(), mode: window.__ttMode });
-      if (window.__ttMode !== 200) return new Response(JSON.stringify({ detailedError: { code: 'Forbidden', message: 'You do not have enough credits to perform this action' } }), { status: window.__ttMode, headers: { 'Content-Type': 'application/json' } });
-      const data = [];
-      b.origins.forEach((o, i) => b.destinations.forEach((d, j) => {
-        const k = km({ lat: o.point.latitude, lng: o.point.longitude }, { lat: d.point.latitude, lng: d.point.longitude });
-        data.push({ originIndex: i, destinationIndex: j, routeSummary: { travelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), lengthInMeters: Math.round(k * 1300) } });
-      }));
-      return new Response(JSON.stringify({ data }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    if (url.includes('api.tomtom.com/routing/1/calculateRoute/')) {
+      const q = url.split('/calculateRoute/')[1].split('/')[0].split(/[,:]/).map(Number);
+      const a = { lat: q[0], lng: q[1] }, b = { lat: q[2], lng: q[3] };
+      const dep = decodeURIComponent((url.split('departAt=')[1] || '').split('&')[0]);
+      window.__rt.push({ a, b, departAt: dep, at: Date.now() });
+      if (window.__deny && (same(a, window.__deny) || same(b, window.__deny))) return new Response(JSON.stringify({ detailedError: { code: 'Forbidden', message: 'You do not have enough credits to perform this action' } }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+      const k = km(a, b);
+      let s = Math.round(k * 1.3 / 40 * 3600);
+      if (window.__slow && same(a, window.__slow[0]) && same(b, window.__slow[1])) s += 3 * 3600;
+      return new Response(JSON.stringify({ formatVersion: '0.0.12', routes: [{ summary: { lengthInMeters: Math.round(k * 1300), travelTimeInSeconds: s, trafficDelayInSeconds: 0, departureTime: '', arrivalTime: '' } }] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
+    if (url.includes('api.tomtom.com')) { window.__mx++; return new Response('{}', { status: 500 }); }
+    if (url.includes('places.googleapis.com')) { window.__places++; return new Response(JSON.stringify({ places: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } }); }
     if (!url.startsWith(location.origin)) { window.__other++; return new Response('{}', { status: 404 }); }
     return realFetch(url, init);
   };
@@ -157,96 +175,144 @@ async function main() {
     await send('Page.enable'); await send('Runtime.enable');
     await send('Page.addScriptToEvaluateOnNewDocument', { source: INIT });
     const ev = async (expr) => { const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }); if (r.exceptionDetails) throw new Error('page error: ' + (r.exceptionDetails.exception && r.exceptionDetails.exception.description || r.exceptionDetails.text)); return r.result.value; };
-    const waitFor = async (expr, what, ms) => { const end = Date.now() + (ms || 8000); while (Date.now() < end) { if (await ev('!!(' + expr + ')')) return true; await sleep(100); } throw new Error('timeout waiting for ' + what); };
+    const waitFor = async (expr, what, ms) => { const end = Date.now() + (ms || 8000); while (Date.now() < end) { if (await ev('!!(' + expr + ')')) return true; await sleep(100); } const bn = await ev('(document.getElementById("banner") || {}).textContent || ""').catch(() => ''); throw new Error('timeout waiting for ' + what + (bn ? ' [banner: ' + bn + ']' : '') + (page.logs.length ? ' [page: ' + page.logs.join(' | ') + ']' : '')); };
     const click = (sel) => ev('(() => { const e = document.querySelector(' + JSON.stringify(sel) + '); if (!e) throw new Error("no " + ' + JSON.stringify(sel) + '); e.click(); return true; })()');
-    const ttCount = () => ev('window.__tt.length');
+    const rt = () => ev('window.__rt.length');
     const tab = (name) => click('#tabs button[data-tab="' + name + '"]');
-    const plan = async () => {
+    const settle = async () => { await sleep(300); await waitFor('!WaypointDebug.S.busy && !WaypointDebug.S.loc.busy', 'the app to settle', 10000); await sleep(200); };
+    const plan = async (nStops) => {
       await tab('plan');
       await waitFor('document.querySelector("#planBtn") && !WaypointDebug.S.busy', 'the Plan tab');
-      await ev('WaypointDebug.S.planDone = false');
       await click('#planBtn');
-      await waitFor('!WaypointDebug.S.busy && WaypointDebug.S.tab === "route" && document.querySelectorAll(".timeline .card.stop").length === 4', 'the planned route', 10000);
-      await sleep(400); // the PLAN-triggered live re-time (one 1 x 1 request) settles
-      await waitFor('!WaypointDebug.S.loc.busy', 'the live re-time after PLAN');
+      await waitFor('!WaypointDebug.S.busy && WaypointDebug.S.tab === "route" && document.querySelectorAll(".timeline .card.stop").length === ' + nStops, 'the planned route', 15000);
+      await settle();
     };
-    const bodyText = () => ev('document.body.innerText');
-    const counted = async (what) => { const c = await ev('(() => { const t = window.__tt, u = WaypointDebug.S.settings.tomtomUsage || {}; return { mock: t.length, cells: t.reduce((a, x) => a + x.o * x.d, 0), r: u.requests || 0, c: u.cells || 0 }; })()');
-      check(c.mock === c.r && c.cells === c.c, what + ': the device counter matches what the mock received', c); };
+    const pending = () => ev('WaypointDebug.S.plan.result.plans[0].stops.filter((s) => !s.status).map((s) => s.placeId)');
+    const idxOf = (id) => ev('WaypointDebug.S.plan.result.plans[0].stops.findIndex((s) => s.placeId === ' + JSON.stringify(id) + ')');
+    const card = (n) => 'document.querySelectorAll(".timeline .card.stop")[' + n + ']';
+    const clickPrimary = async (id) => { const n = await idxOf(id); return ev('(() => { const x = ' + card(n) + '.querySelector(".stop-btns button.ok"); x.click(); return x.textContent; })()'); };
+    const gpsAt = (pid) => ev('(() => { const p = WaypointDebug.S.places[' + JSON.stringify(pid) + ']; window.__gps = { lat: p.lat, lng: p.lng, accuracy: 15 }; return true; })()');
+    const reachDone = async (id) => { // REACHED, then DONE 2 s later (past the double-tap guard)
+      await clickPrimary(id);
+      await waitFor('WaypointDebug.S.plan.result.plans[0].stops.find((s) => s.placeId === ' + JSON.stringify(id) + ').reachedAt != null', 'Reached at ' + id);
+      await ev('window.__off += 2000');
+      await clickPrimary(id);
+      await waitFor('WaypointDebug.S.plan.result.plans[0].stops.find((s) => s.placeId === ' + JSON.stringify(id) + ').status === "done"', 'DONE at ' + id);
+    };
+    const replans = () => ev('(() => { const S = WaypointDebug.S, d = Object.values(S.days)[0]; return d ? DayLog.summarise(d, S.jobs, S.places).plan.replans : 0; })()');
+    const etaTexts = () => ev('[...document.querySelectorAll(".timeline .card.stop .stop-head .times")].map((e) => e.textContent).concat([document.getElementById("endArrive").textContent])');
 
-    console.log('1. PLAN with 4 stops');
+    console.log('1. PLAN 6 stops A..F from O to E at a mocked 10:00');
     await send('Page.navigate', { url: appUrl });
     await waitFor('document.querySelector("#planBtn")', 'the Plan tab');
-    await plan();
-    const afterPlan = await ev('window.__tt.map((c) => c.o + "x" + c.d)');
-    check(afterPlan.filter((c) => c === '6x6').length === 3, 'PLAN: 3 matrix requests of 6 x 6 (start + 4 stops + end)', afterPlan);
-    check(afterPlan.filter((c) => c === '1x1').length <= 1 && afterPlan.length <= 4, 'PLAN: plus at most one 1 x 1 live re-time', afterPlan);
-    await waitFor('Object.keys(window.__watches).length === 1', 'the GPS watch to start');
-    await counted('after PLAN');
+    // stop G (job j7) waits, parked, for step 7: six stops now
+    await waitFor('window.WaypointDebug && WaypointDebug.S.jobs.length === 7', 'the seven seeded jobs');
+    await ev('(() => { const j = WaypointDebug.S.jobs.find((x) => x.id === "j7"); j.status = "parked"; return true; })()');
+    check(await ev('new Date().toISOString()').then((t) => t.startsWith('2026-11-24T02:0')), 'the clock is pinned to 24 Nov 2026 10:00 MYT');
+    await plan(6);
+    const c1 = await ev('window.__rt.map((c) => c.departAt)');
+    check(c1.length === 49 && await ev('window.__mx') === 0, 'exactly 49 Routing calls (42 table + 7 check) and 0 Matrix calls', { routing: c1.length, matrix: await ev('window.__mx') });
+    check(c1.slice(0, 43).every((d) => d === 'now') && c1.slice(43).every((d) => /^2026-11-24T1[0-3]:[0-5][0-9]:00\+08:00$/.test(d)), 'the table departs now (10:00 is inside its Day bucket); the first check leg departs now, the later ones at their planned departures (+08:00)', [c1[0], c1[42], c1[43], c1[48]]);
+    const banners = await ev('window.__banners');
+    check(banners.some((b) => /^Getting travel times \d+ of \d+…/.test(b)), 'the progress text "Getting travel times n of N…" appears', banners.filter((b) => /Getting/.test(b)).slice(-2));
+    check(banners.some((b) => /Getting travel times 42 of 42…/.test(b)), '... counting up to 42 of 42 for the table');
+    const etas = await etaTexts();
+    check(etas.length === 7 && etas.every((t) => !/est\./.test(t)), 'no ETA is marked "est."', etas);
+    check(!(await ev('document.getElementById("estHeader")')), 'no "Estimated" chip in the header');
 
-    console.log('2. 60 watch updates over a mocked 10 minutes (page visible), the minute timer once per mocked minute');
-    let fromUpdates = 0, fromTicks = 0;
-    const tickCalls = [];
+    console.log('2. PLAN again');
+    let n0 = await rt();
+    await plan(6);
+    check((await rt()) - n0 === 7, 'PLAN again: 7 Routing calls (the learned table + one check per leg)', (await rt()) - n0);
+
+    console.log('3. 60 watch updates over a mocked 10 minutes');
+    await waitFor('Object.keys(window.__watches).length === 1', 'the GPS watch');
+    n0 = await rt();
     const pos = Object.assign({}, GPS0);
     for (let u = 1; u <= 60; u++) {
       await ev('window.__off += 10000');
-      pos.lng -= 0.004; // ~445 m per update: always "moved"
-      const n0 = await ttCount();
+      pos.lng -= 0.004; // west, away from every stop
       await ev('(() => { window.__gps = ' + JSON.stringify(pos) + '; return window.__watchFire(' + JSON.stringify(pos) + '); })()');
-      await sleep(30);
-      fromUpdates += (await ttCount()) - n0;
-      if (u % 6 === 0) { // one mocked minute
-        const n1 = await ttCount();
-        await ev('WaypointDebug.minuteTick()');
-        await sleep(150);
-        await waitFor('!WaypointDebug.S.loc.busy', 'the tick to settle');
-        const got = await ev('window.__tt.slice(' + n1 + ').map((c) => c.o + "x" + c.d)');
-        fromTicks += got.length; tickCalls.push(...got);
-      }
+      await sleep(20);
+      if (u % 6 === 0) { await ev('WaypointDebug.minuteTick()'); await sleep(120); await waitFor('!WaypointDebug.S.loc.busy', 'the tick'); }
     }
-    check(fromUpdates === 0, 'TomTom received 0 calls from the 60 watch updates', fromUpdates);
-    check(fromTicks <= 1 && tickCalls.every((c) => c === '1x1'), 'at most 1 periodic re-time in 10 minutes, each 1 x 1', tickCalls);
-    check(fromTicks === 1, 'the 10-minute periodic re-time ran once', tickCalls);
-    await counted('after the watch updates');
-    check(/^Times from your location, /.test(await ev('document.getElementById("timesFrom").textContent')), 'the status line still reads "Times from your location" (counting down from the last TomTom time)', await ev('document.getElementById("timesFrom").textContent'));
+    check((await rt()) - n0 <= 1, 'at most 1 Routing call in those 10 minutes', (await rt()) - n0);
 
-    console.log('3. TomTom answers 403 (not enough credits): PLAN still gives a route, estimated');
-    await ev('(() => { window.__ttMode = 403; window.__gps = { lat: 3.01, lng: 101.40, accuracy: 15 }; return true; })()'); // a new start: its pairs are not cached
-    await plan();
-    const t403 = await bodyText();
-    const notices = await ev('[...document.querySelectorAll("#ttNotice")].map((e) => e.textContent)');
-    check(notices.length === 1 && notices[0] === 'TomTom limit reached or unavailable - using estimated times until it resets (08:00)', 'ONE friendly notice', notices);
-    check(!/HTTP\s*\d|403|credits/i.test(t403) && !/HTTP/.test(await ev('document.getElementById("banner").textContent')), 'no raw "HTTP 403" text anywhere on the page', t403.match(/.{0,40}(HTTP|403|credits).{0,40}/i));
-    check(await ev('document.querySelectorAll(".timeline .card.stop").length') === 4, 'a 4-stop route is produced');
-    check(await ev('(document.getElementById("estHeader") || {}).textContent') === 'Estimated times', 'the Route header shows "Estimated times"');
-    const marks = await ev('[...document.querySelectorAll(".timeline .card.stop .stop-head .times")].map((e) => e.textContent)');
-    check(marks.length === 4 && marks.every((t) => / est\.$/.test(t)), 'every stop ETA is marked "est."', marks);
-    check(/ est\.$/.test(await ev('document.getElementById("endArrive").textContent')), 'the end arrival is marked "est."');
-    check(await ev('WaypointDebug.S.plan.provider.estimated === true'), 'the plan is flagged estimated');
-    await counted('after the 403 PLAN');
-    const ord = await ev('WaypointDebug.S.plan.result.plans[0].stops.map((s) => s.placeId)');
-    check(ord.indexOf('pB') < ord.indexOf('pC') && ord.indexOf('pB') < ord.indexOf('pD'), 'ordering rules unchanged: the urgent delivery before every non-urgent delivery', ord);
-    await tab('plan');
-    check(await ev('document.querySelectorAll("#ttNotice").length') === 1, 'the Plan tab shows the same single notice');
-    await tab('route');
+    console.log('4. DONE on the first stop: 5 pending -> full refresh; a later leg made very slow');
+    const ord0 = await pending();
+    const first = ord0[0], nextTwo = [ord0[1], ord0[2]];
+    await ev('(() => { const P = WaypointDebug.S.places; window.__slow = [P[' + JSON.stringify(nextTwo[0]) + '], P[' + JSON.stringify(nextTwo[1]) + ']]; return true; })()');
+    await gpsAt(first);
+    const rp0 = await replans();
+    n0 = await rt();
+    await reachDone(first);
+    await settle();
+    const nDone = (await rt()) - n0;
+    check(nDone === 30, 'exactly 5 + 20 + 5 = 30 Routing calls', nDone);
+    const ord1 = await pending();
+    check(ord1.join() !== ord0.slice(1).join(), 'the order changed by itself', { before: ord0.slice(1), after: ord1 });
+    check(ord1.indexOf(nextTwo[1]) !== ord1.indexOf(nextTwo[0]) + 1, 'the very slow leg is no longer driven', ord1);
+    const notice = await ev('(document.getElementById("reorderNotice") || {}).textContent || ""');
+    check(/^Order updated: (next is .+ \(was .+\)|after .+ then .+) - saves about \d+ min · Undo$/.test(notice), 'the "Order updated … · Undo" notice at the top of the Route tab', notice);
+    check((await replans()) === rp0 + 1, '"Replans" +1', { before: rp0, after: await replans() });
+    await click('#reorderUndo');
+    await sleep(200);
+    check((await pending()).join() === ord0.slice(1).join(), 'Undo: the previous order is back', await pending());
+    check(!(await ev('document.getElementById("reorderNotice")')), 'the notice is gone');
 
-    console.log('4. TomTom recovers: the next PLAN clears the notice and the est. marks');
-    await ev('window.__ttMode = 200');
-    await plan();
-    check(await ev('document.querySelectorAll("#ttNotice").length') === 0, 'the notice is gone');
-    check(await ev('!document.getElementById("estHeader")'), 'no "Estimated times" in the header');
-    const marks2 = await ev('[...document.querySelectorAll(".timeline .card.stop .times")].map((e) => e.textContent)');
-    check(marks2.every((t) => !/est\./.test(t)) && !/est\./.test(await ev('document.getElementById("endArrive").textContent')), 'no ETA is marked "est."', marks2);
-    check(await ev('WaypointDebug.S.plan.provider.estimated === false'), 'the plan is no longer flagged estimated');
-
-    console.log('5. Settings shows the counter with what the mock received');
-    const got = await ev('(() => { const t = window.__tt; return { r: t.length, c: t.reduce((a, x) => a + x.o * x.d, 0) }; })()');
+    console.log('5. Setting "Ask me", DONE on the next stop');
     await tab('settings');
-    await waitFor('document.getElementById("ttUsage")', 'the Settings counter');
-    const line = await ev('document.getElementById("ttUsage").textContent');
+    await waitFor('document.getElementById("afterStopSel")', 'the setting');
+    await ev('(() => { const s = document.getElementById("afterStopSel"); s.value = "ask"; s.dispatchEvent(new Event("change")); return true; })()');
+    check(await ev('WaypointDebug.S.settings.afterStop') === 'ask', 'the setting is "Ask me"');
+    await tab('route');
+    const ordA = await pending(); // the slow leg is now the first one: from here (ordA[0]) to ordA[1]
+    await gpsAt(ordA[0]);
+    n0 = await rt();
+    const rp1 = await replans();
+    await reachDone(ordA[0]);
+    await settle();
+    check((await rt()) - n0 === 20, '4 pending: 4 + 12 + 4 = 20 Routing calls', (await rt()) - n0);
+    check(await ev('!!document.getElementById("reorderCard") && !!document.getElementById("reorderSwitch") && !!document.getElementById("reorderKeep")'), 'the card with Switch / Keep mine appears');
+    check((await pending()).join() === ordA.slice(1).join(), 'nothing changes before Switch', await pending());
+    await click('#reorderSwitch');
+    await sleep(200);
+    check((await pending()).join() !== ordA.slice(1).join() && (await replans()) === rp1 + 1, 'Switch: the faster order is applied, "Replans" +1', await pending());
+
+    console.log('6. MSG on a customer stop');
+    const msgStop = (await pending())[0];
+    await ev('(() => { const c = document.querySelectorAll(".timeline .card.stop")[WaypointDebug.S.plan.result.plans[0].stops.findIndex((s) => s.placeId === ' + JSON.stringify(msgStop) + ')]; const b = [...c.querySelectorAll("button")].find((x) => x.textContent === "MSG"); b.click(); return true; })()');
+    await waitFor('window.__copiedText', 'the copied message');
+    const copied = await ev('window.__copiedText');
+    check(/^Salam (pagi|tengah hari|petang|malam) encik, barang encik nanti saya sebelum pukul \d{1,2}\.\d\d(am|pm) hantar ke kilang encik ye\. Tq👍$/.test(copied) && copied.startsWith('Salam ') && copied.includes('sebelum pukul') && copied.endsWith('Tq👍'), 'the copied text is the owner\'s wording (Salam …, sebelum pukul …, Tq👍)', copied);
+
+    console.log('7. TomTom answers 403 for a new pair');
+    await ev('(() => { const j = WaypointDebug.S.jobs.find((x) => x.id === "j7"); j.status = "pending"; WaypointDebug.render(); window.__deny = WaypointDebug.S.places.pG; return true; })()');
+    const left = (await pending()).length;
+    await plan(await ev('WaypointDebug.S.plan.result.plans[0].stops.length') + 1); // the done stops stay on top, + the new stop G
+    const notices = await ev('[...document.querySelectorAll("#ttNotice")].map((e) => e.textContent)');
+    check(notices.length === 1 && notices[0] === 'TomTom unavailable or monthly allowance used up - using estimated times', 'ONE notice with the new text', notices);
+    check(!/08:00|resets/.test(await ev('document.body.innerText')), 'no "08:00" / reset wording anywhere on the page');
+    check(await ev('WaypointDebug.S.plan.result.plans[0].stops.filter((s) => !s.status).length') === left + 1, 'a route is still produced (with the new stop)');
+    check(await ev('(document.getElementById("estHeader") || {}).textContent') === 'Estimated order - TomTom unavailable', 'the header shows "Estimated order - TomTom unavailable"');
+    const nxt = (await pending()).find((id) => id !== 'pG');
+    await gpsAt(nxt);
+    n0 = await rt();
+    await reachDone(nxt);
+    await settle();
+    check((await rt()) - n0 <= 1, 'DONE while TomTom is out: no look-ahead (at most the single next-stop re-time)', (await rt()) - n0);
+
+    console.log('8. Settings "Usage"');
+    await tab('settings');
+    await waitFor('document.getElementById("usageCard")', 'the Usage card');
+    const total = await rt(), places = await ev('window.__places');
     const fmtN = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-    check(line === 'TomTom today: ' + fmtN(got.r) + ' requests / ' + fmtN(got.c) + ' cells (free limit 2,500 per day, resets 08:00 Malaysia time)', 'Settings: "TomTom today: ' + got.r + ' requests / ' + got.c + ' cells ..."', line);
-    check(await ev('document.getElementById("ttUsage").closest(".card").textContent.includes("Google Places calls today")'), 'next to the Places counter');
+    const uR = await ev('document.getElementById("usageRouting").textContent'), uP = await ev('document.getElementById("usagePlaces").textContent');
+    check(uR === 'TomTom Routing   ' + fmtN(total) + ' today · ' + fmtN(total) + ' this month of 20,000', 'TomTom Routing: today and this month = the mock\'s ' + total + ' calls', uR);
+    check(uP === 'Google Places    ' + places + ' today · ' + places + ' this month  (daily guard 140)', 'Google Places: today and this month = the mock\'s ' + places + ' calls', uP);
+    check(await ev('!document.getElementById("usageMatrix")') && await ev('window.__mx') === 0, 'Matrix: 0 calls, not shown');
+    check(await ev('document.querySelectorAll("#usageCard .usage-bar").length') === 2, 'a thin bar for each');
+    check(/^Learned travel times: \d+ pairs?$/.test(await ev('document.getElementById("learnedCount").textContent')), 'Settings: "Learned travel times: N pairs"', await ev('document.getElementById("learnedCount").textContent'));
     check(await ev('window.__other') === 0, 'no other network calls left the page');
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {

@@ -43,7 +43,7 @@ eq(M.fill('{salam} {salutation} {items} {time} {name}', { salam: 'A', salutation
 eq(M.fill('{time} and {time}', { time: 'T' }), 'T and T', 'repeated placeholder');
 const settings = { defaultLang: 'ms', etaPaddingMin: 15, templates: M.DEFAULT_TEMPLATES };
 const msg = M.buildMessage({ place: { name: 'Acme', salutation: 'Puan', lang: 'default' }, settings, arriveAt: '14:21', now: new Date(2030, 0, 1, 9, 0) });
-eq(msg, 'Selamat pagi Puan. Barang Puan ada dengan saya, saya akan hantar ke Puan sekitar pukul 2:40 petang. Terima kasih.\n— Calvin, L-Tech Automation', 'default ms message');
+eq(msg, 'Salam pagi puan, barang puan nanti saya sebelum pukul 2.40pm hantar ke kilang puan ye. Tq👍', 'default ms message (the owner\'s wording)');
 const en = M.buildMessage({ place: { name: 'Acme', lang: 'en' }, settings, arriveAt: '14:21', now: new Date(2030, 0, 1, 15, 0) });
 eq(en, "Good afternoon. Your items are with me, I'll deliver them to you around 2:40 pm. Thank you.\n— Calvin, L-Tech Automation", 'place.lang overrides default');
 eq(M.langFor({ lang: 'default' }, { defaultLang: 'en' }), 'en', 'default lang from settings');
@@ -64,6 +64,31 @@ console.log('message time = ETA + padding, rounded UP to a 5-minute mark only if
   eq(M.etaText('17:00', 10, 'en'), '5:10 pm', 'etaText (en) uses the same minutes');
   eq(M.etaText('17:02', 10, 'ms'), '5:15 petang', 'etaText (ms) uses the same minutes');
   eq(M.buildMessage({ place: { lang: 'en' }, settings: { defaultLang: 'ms' }, arriveAt: '17:00', now: new Date(2030, 0, 1, 15, 0) }).includes('around 5:10 pm'), true, 'with no padding setting the default is 10');
+}
+
+console.log('20. Bahasa Malaysia in the owner\'s own words (new default template)');
+{
+  const s = { defaultLang: 'ms', etaPaddingMin: 10, templates: M.DEFAULT_TEMPLATES };
+  const at = (h, m) => new Date(2026, 10, 24, h, m); // the clock is pinned (TZ=Asia/Kuala_Lumpur)
+  eq(M.buildMessage({ place: { salutation: 'Encik', lang: 'default' }, settings: s, arriveAt: at(12, 0), now: at(10, 42) }),
+    'Salam pagi encik, barang encik nanti saya sebelum pukul 12.10pm hantar ke kilang encik ye. Tq👍', 'a. 10:42, ETA 12:00, padding 10, Encik (one line)');
+  eq(M.buildMessage({ place: { salutation: 'Puan', lang: 'ms' }, settings: s, arriveAt: at(15, 2), now: at(14, 30) }),
+    'Salam petang puan, barang puan nanti saya sebelum pukul 3.15pm hantar ke kilang puan ye. Tq👍', 'b. 14:30, ETA 15:02, padding 10, Puan');
+  eq(M.buildMessage({ place: { salutation: 'Cik' }, settings: s, arriveAt: at(13, 0), now: at(12, 5) }).startsWith('Salam tengah hari cik, '), true, '12:05 -> "Salam tengah hari", cik in lowercase');
+  eq(M.buildMessage({ place: { salutation: 'Encik' }, settings: s, arriveAt: at(20, 0), now: at(19, 30) }).startsWith('Salam malam encik, '), true, '19:30 -> "Salam malam"');
+  eq(M.DEFAULT_TEMPLATES.ms.includes('\n'), false, 'one line, no signature line');
+  const t = (hhmm, pad) => M.timeDot(M.messageMinutes(hhmm, pad));
+  eq(t('09:05', 0), '9.05am', 'c. 09:05 -> 9.05am');
+  eq(t('00:05', 0), '12.05am', 'c. 00:05 -> 12.05am');
+  eq(t('12:00', 0), '12.00pm', 'c. 12:00 -> 12.00pm');
+  eq(t('23:55', 10), '12.05am', 'c. 23:55 + 10 -> 12.05am');
+  const old = { ms: M.OLD_MS_DEFAULT, en: M.DEFAULT_TEMPLATES.en };
+  const r1 = M.migrateTemplates(old);
+  eq(r1.changed && r1.templates.ms === M.DEFAULT_TEMPLATES.ms, true, 'd. the stored template equal to the old default -> replaced');
+  const edited = { ms: '{salam} {salutation}, saya on the way. {time}', en: M.DEFAULT_TEMPLATES.en };
+  const r2 = M.migrateTemplates(edited);
+  eq(!r2.changed && r2.templates.ms === edited.ms, true, 'd. an edited template -> unchanged');
+  eq(M.buildMessage({ place: { lang: 'en' }, settings: s, arriveAt: at(12, 0), now: at(10, 42) }), "Good morning. Your items are with me, I'll deliver them to you around 12:10 pm. Thank you.\n— Calvin, L-Tech Automation", 'English unchanged');
 }
 
 console.log('\n' + passes + ' passed, ' + failures + ' failed');

@@ -224,6 +224,18 @@
     return s.from + '–' + s.to + (s.friFrom ? ' · Fri ' + s.friFrom + '–' + s.friTo : '');
   }
 
+  // Contact name on a place: trimmed, at most 40 characters ('' when empty).
+  const CONTACT_MAX = 40;
+  const cleanContact = (v) => String(v == null ? '' : v).trim().slice(0, CONTACT_MAX).trim();
+  // The Places card's WhatsApp line: "<contact name> · <number>", the name alone without a number, "WA <number>" (as before)
+  // without a name, '' with neither. numberText = the number as the card shows it.
+  function waCardText(contactName, numberText) {
+    const n = cleanContact(contactName), w = String(numberText || '');
+    if (n && w) return n + ' · ' + w;
+    if (n) return n;
+    return w ? 'WA ' + w : '';
+  }
+
   return { SHORT_LINK_MSG, MY_BOX, GOOD_ACCURACY_M, parseCoords, outsideMalaysia, inRange, mapsCheckUrl, getFix, makePlace, manualPlace, moveLocation, undoMove, migrateDwell, DWELL_FLAG, pickerOrder, pinnedFirst, migratePins, PIN_FLAG,
-    daysLabel, simpleToStored, storedToSimple, validateSimple, formatWindows, lunchCardText };
+    daysLabel, simpleToStored, storedToSimple, validateSimple, formatWindows, lunchCardText, CONTACT_MAX, cleanContact, waCardText };
 });

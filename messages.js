@@ -5,10 +5,28 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
+  // The owner's own wording (one line, no signature). OLD_MS_DEFAULT is the previous default: a stored template equal to
+  // it is replaced once by the new default (migrateTemplates); an edited one is left alone.
   const DEFAULT_TEMPLATES = {
-    ms: '{salam} {salutation}. Barang {salutation} ada dengan saya, saya akan hantar ke {salutation} sekitar pukul {time}. Terima kasih.\n— Calvin, L-Tech Automation',
+    ms: '{salam} {salutation}, barang {salutation} nanti saya sebelum pukul {time} hantar ke kilang {salutation} ye. Tq👍',
     en: "{salam}. Your items are with me, I'll deliver them to you around {time}. Thank you.\n— Calvin, L-Tech Automation",
   };
+  const OLD_MS_DEFAULT = '{salam} {salutation}. Barang {salutation} ada dengan saya, saya akan hantar ke {salutation} sekitar pukul {time}. Terima kasih.\n— Calvin, L-Tech Automation';
+  const TEMPLATE_FLAG = 'msTemplate2026_11_24';
+  // templates -> {templates, changed}: the Bahasa Malaysia template moves to the new default only if it is exactly the old one
+  function migrateTemplates(templates) {
+    const t = Object.assign({}, templates || {});
+    if (t.ms === OLD_MS_DEFAULT) { t.ms = DEFAULT_TEMPLATES.ms; return { templates: t, changed: true }; }
+    return { templates: t, changed: false };
+  }
+  // the time of day in Bahasa Malaysia (the app's boundaries: pagi < 12:00, tengah hari < 14:00, petang < 19:00, malam)
+  const partOfDay = (hour) => (hour < 12 ? 'pagi' : hour < 14 ? 'tengah hari' : hour < 19 ? 'petang' : 'malam');
+  const salamMs = (hour) => 'Salam ' + partOfDay(hour);
+  // 12-hour, a dot, no leading zero on the hour, am/pm with no space: 12.10pm, 9.05am, 12.05am
+  function timeDot(mins) {
+    const h = Math.floor(mins / 60) % 24, m = mins % 60;
+    return (h % 12 === 0 ? 12 : h % 12) + '.' + (m < 10 ? '0' : '') + m + (h < 12 ? 'am' : 'pm');
+  }
 
   function greeting(hour, lang) {
     if (lang === 'en') return hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
@@ -42,8 +60,7 @@
       return h12 + ':' + mm + ' ' + (h < 12 ? 'am' : 'pm');
     }
     const h12 = h % 12 === 0 ? 12 : h % 12;
-    const part = h < 12 ? 'pagi' : h < 14 ? 'tengah hari' : h < 19 ? 'petang' : 'malam';
-    return h12 + ':' + mm + ' ' + part;
+    return h12 + ':' + mm + ' ' + partOfDay(h);
   }
 
   function fill(template, vars) {
@@ -62,11 +79,21 @@
     const lang = langFor(place, s);
     const tpls = Object.assign({}, DEFAULT_TEMPLATES, s.templates || {});
     const now = opts.now ? new Date(opts.now) : new Date();
+    const pad = s.etaPaddingMin != null ? s.etaPaddingMin : 10;
+    if (lang === 'ms') { // Bahasa Malaysia: "Salam pagi", lowercase encik / puan / cik, 12.10pm
+      return fill(tpls.ms, {
+        salam: salamMs(now.getHours()),
+        salutation: String(place.salutation || 'Encik').toLowerCase(),
+        items: opts.items || '',
+        time: timeDot(messageMinutes(opts.arriveAt, pad)),
+        name: place.name || '',
+      });
+    }
     return fill(tpls[lang], {
       salam: greeting(now.getHours(), lang),
       salutation: place.salutation || 'Encik',
       items: opts.items || '',
-      time: etaText(opts.arriveAt, s.etaPaddingMin != null ? s.etaPaddingMin : 10, lang),
+      time: etaText(opts.arriveAt, pad, lang),
       name: place.name || '',
     });
   }
@@ -102,5 +129,5 @@
     return 'https://wa.me/' + n + '?text=' + encodeURIComponent(text);
   }
 
-  return { DEFAULT_TEMPLATES, greeting, messageMinutes, etaText, fill, langFor, buildMessage, normaliseNumber, compactNumber, typeLabel, waLink };
+  return { DEFAULT_TEMPLATES, OLD_MS_DEFAULT, TEMPLATE_FLAG, migrateTemplates, partOfDay, salamMs, timeDot, greeting, messageMinutes, etaText, fill, langFor, buildMessage, normaliseNumber, compactNumber, typeLabel, waLink };
 });
