@@ -8,6 +8,12 @@
  * Office not repeated); choose it and save -> the card reads AO Advance -> Office (L-Tech), still one job, same id; the pencil opens the
  * form again and Cancel changes nothing; after PLAN, editing the job shows "Jobs changed - tap PLAN to update the route" on the Plan and
  * Route tabs and the route is NOT changed until PLAN is tapped (then the note is gone); Urgent, hold (park) and delete still work.
+ * Then the 25 Nov 2026 day (world s1, travel times from a fixed minute table; Home, Office, Pacific Klang, Asian Automotive,
+ * Carrier, Eastern Press): through the form, an errand at the Office with First stop on (FIRST on its Plan card) and a just-collect
+ * job at Klang with an empty "send to" (the hint); PLAN -> Office, Asian, Carrier, Eastern, Klang with FIRST on the first card only;
+ * DONE at every stop -> the Klang item is in the With you bar; no "job j_" text anywhere. World s2 (the two-visit day): two
+ * Office cards, FIRST on the first only, the second holds only the Carrier delivery and comes after Carrier; DONE on the first
+ * leaves that delivery open; First stop turned on for another job -> the "First stop moved from Office to Carrier" toast.
  * The server and the browser are always shut down. Exit 1 on failure.
  * Needs Node 22+ (global WebSocket / fetch) and Chrome or Edge (set CHROME=<path> to choose one).
  */
@@ -45,6 +51,31 @@ const SEED = {
   'waypoint:jobs:jao': job('jao', { pickups: [{ placeId: 'ao', item: 'Float switch', done: false }], deliveryPlaceId: 'carrier', notes: 'ask for Ali', createdAt: '2026-11-23T01:01:00.000Z' }),
 };
 
+// ---------- the First stop worlds (25 Nov 2026): a fixed minute table, symmetric; H = Home (start and end) ----------
+const MINS = { 'H-O': 32, 'H-K': 46, 'H-A': 40, 'H-C': 42, 'H-E': 50, 'O-K': 68, 'O-A': 22, 'O-C': 25, 'O-E': 50, 'A-C': 11, 'A-E': 60, 'A-K': 65, 'C-E': 61, 'C-K': 66, 'E-K': 11 };
+const LL = { H: HOME, O: { lat: 3.15, lng: 101.72 }, K: { lat: 3.0, lng: 101.45 }, A: { lat: 3.14, lng: 101.76 }, C: { lat: 3.17, lng: 101.74 }, E: { lat: 3.02, lng: 101.5 } };
+const wplace = (id, name, L, type) => Object.assign({ id, name, address: name + ' Rd', type: type || 'other', dwellMin: 0, closedWindows: [] }, LL[L]);
+const WORLD = {
+  'waypoint:settings:main': SEED['waypoint:settings:main'],
+  'waypoint:places:home': Object.assign({}, SEED['waypoint:places:home']),
+  'waypoint:places:office': wplace('office', 'Office', 'O', 'office'), 'waypoint:places:klang': wplace('klang', 'Pacific Klang Oil Seals', 'K'),
+  'waypoint:places:asian': wplace('asian', 'Asian Automotive', 'A'), 'waypoint:places:carrier': wplace('carrier', 'Carrier', 'C'),
+  'waypoint:places:eastern': wplace('eastern', 'Eastern Press', 'E'),
+};
+const SEEDS = {
+  base: SEED,
+  s1: Object.assign({}, WORLD, { // + through the UI: the errand at the Office (First stop on) and the just-collect job at Klang
+    'waypoint:jobs:j2': job('j2', { pickups: [{ placeId: 'office', item: 'Brackets', done: false }], deliveryPlaceId: 'asian', createdAt: '2026-11-25T00:01:00.000Z' }),
+    'waypoint:jobs:j3': job('j3', { inHandItem: 'Sensor', deliveryPlaceId: 'carrier', createdAt: '2026-11-25T00:02:00.000Z' }),
+    'waypoint:jobs:j4': job('j4', { inHandItem: 'Gasket', deliveryPlaceId: 'eastern', createdAt: '2026-11-25T00:03:00.000Z' }),
+  }),
+  s2: Object.assign({}, WORLD, {
+    'waypoint:jobs:e1': job('e1', { errandPlaceId: 'office', dwellMin: 0, notes: 'Sign cheques', firstStop: true, createdAt: '2026-11-25T00:01:00.000Z' }),
+    'waypoint:jobs:j2': job('j2', { pickups: [{ placeId: 'office', item: 'Brackets', done: false }], deliveryPlaceId: 'asian', createdAt: '2026-11-25T00:02:00.000Z' }),
+    'waypoint:jobs:j6': job('j6', { pickups: [{ placeId: 'carrier', item: 'Compressor', done: false }], deliveryPlaceId: 'office', createdAt: '2026-11-25T00:03:00.000Z' }),
+  }),
+};
+
 // runs in the page before anything else: mocks + seed. The clock starts at 11:00 local and its offset survives a reload.
 const INIT = `(() => {
   const RealDate = Date;
@@ -69,14 +100,29 @@ const INIT = `(() => {
   document.addEventListener('click', (e) => { const a = e.target && e.target.closest && e.target.closest('a[target="_blank"]'); if (a) e.preventDefault(); }, true);
   const km = (a, b) => { const r = Math.PI / 180, dl = (b.lat - a.lat) * r, dg = (b.lng - a.lng) * r;
     const x = Math.sin(dl / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dg / 2) ** 2; return 12742 * Math.asin(Math.sqrt(x)); };
+  const WORLD_ID = new URLSearchParams(location.search).get('world') || 'base';
+  const LL = ${JSON.stringify(LL)}, MINS = ${JSON.stringify(MINS)};
+  const letterOf = (p) => { let b = null, bd = Infinity; Object.keys(LL).forEach((x) => { const d = km(p, LL[x]); if (d < bd) { bd = d; b = x; } }); return bd < 0.3 ? b : null; };
+  const tableSec = (a, b) => { // the First stop worlds only: travel times from the fixed minute table
+    if (WORLD_ID === 'base') return null;
+    const x = letterOf(a), y = letterOf(b);
+    if (!x || !y) return null;
+    if (x === y) return 0;
+    const v = MINS[x + '-' + y] != null ? MINS[x + '-' + y] : MINS[y + '-' + x];
+    return v == null ? null : v * 60;
+  };
+  window.__legs = [];
   const realFetch = window.fetch.bind(window);
   const json = (o) => new Response(JSON.stringify(o), { status: 200, headers: { 'Content-Type': 'application/json' } });
   window.fetch = async (url, init) => {
     url = String(url);
     if (url.includes('api.tomtom.com')) {
       if (url.includes('/calculateRoute/')) { // the Routing API: one leg per request, coordinates in the path
+        window.__legs.push(url.split('/calculateRoute/')[1].split('/')[0]);
         const q = [0].concat(url.split('/calculateRoute/')[1].split('/')[0].split(/[,:]/).map(Number));
         const k = km({ lat: +q[1], lng: +q[2] }, { lat: +q[3], lng: +q[4] });
+        const tsec = tableSec({ lat: +q[1], lng: +q[2] }, { lat: +q[3], lng: +q[4] });
+        if (tsec != null) return json({ routes: [{ summary: { travelTimeInSeconds: tsec, historicTrafficTravelTimeInSeconds: tsec, lengthInMeters: Math.round(k * 1300) } }] });
         return json({ routes: [{ summary: { travelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), historicTrafficTravelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), lengthInMeters: Math.round(k * 1300) } }] });
       }
       const b = JSON.parse(init.body), data = [];
@@ -91,7 +137,7 @@ const INIT = `(() => {
   try {
     if (!localStorage.getItem('__seeded')) {
       const d = new Date(), today = d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
-      const seed = ${JSON.stringify(SEED)};
+      const seed = ${JSON.stringify(SEEDS)}[WORLD_ID];
       seed['waypoint:settings:main'].placesCallsToday = { date: today, count: 0 };
       Object.keys(seed).forEach((k) => localStorage.setItem(k, JSON.stringify(seed[k])));
       localStorage.setItem('__seeded', '1');
@@ -175,16 +221,16 @@ async function main() {
       await ev(stopBtn(nm) + '.click()');
       await waitFor(planStop(id) + '.status === "done"', 'Done on ' + id);
     };
-    const fresh = async () => {
+    const fresh = async (world) => {
       await send('Page.navigate', { url: 'about:blank' }); // leave the app first (nothing can save behind our back), then wipe its storage
       await sleep(300);
       await send('Storage.clearDataForOrigin', { origin: new URL(appUrl).origin, storageTypes: 'local_storage,session_storage' });
-      await send('Page.navigate', { url: appUrl });
+      await send('Page.navigate', { url: appUrl + (world ? '?world=' + world : '') });
       await waitFor('document.querySelector("#planBtn")', 'the Plan tab');
     };
-    const planNow = async (n) => {
+    const planNow = async (n, ms) => { // ms: a bigger PLAN waits longer (TomTom requests start 300 ms apart)
       await click('#planBtn');
-      await waitFor('window.WaypointDebug && WaypointDebug.S.plan && WaypointDebug.S.tab === "route" && !WaypointDebug.S.busy && document.querySelectorAll(".timeline .card.stop").length === ' + n, 'a planned route of ' + n + ' stops');
+      await waitFor('window.WaypointDebug && WaypointDebug.S.plan && WaypointDebug.S.tab === "route" && !WaypointDebug.S.busy && document.querySelectorAll(".timeline .card.stop").length === ' + n, 'a planned route of ' + n + ' stops', ms);
     };
     const barText = () => text('#onBoardToggle');
     const openBar = async () => { if (await ev('!document.querySelector("#onBoardList")')) await click('#onBoardToggle'); await waitFor('document.querySelector("#onBoardList")', 'the expanded list'); };
@@ -293,6 +339,102 @@ async function main() {
     await clickText('.card.job .job-actions button', 'Delete');
     await waitFor('WaypointDebug.S.jobs.length === 0', 'deleted');
     check(await ev('!document.querySelector(".card.job")'), 'delete removes the job');
+
+    // ---------- First stop and "just collect" (the 25 Nov 2026 day) ----------
+    const pickPlace = async (re) => {
+      await waitFor('document.querySelector(".picker-list .pick-row")', 'the picker rows');
+      await ev('[...document.querySelectorAll(".picker-list .pick-row")].find((r) => ' + re + '.test(r.textContent)).click()');
+      await sleep(100);
+    };
+    const routeCards = () => ev('[...document.querySelectorAll(".timeline .card.stop")].filter((c) => !c.classList.contains("fuel")).map((c) => ({ nm: (c.querySelector(".nm") || c.querySelector(".title") || {}).textContent, first: !!c.querySelector(".pill.first"), acts: [...c.querySelectorAll(".act")].map((a) => a.className.replace("act ", "") + ":" + a.textContent), done: c.classList.contains("done") }))');
+    const noJobIds = () => ev('!/job j_|\\bj_[a-z0-9]{6,}/.test(document.body.innerText)');
+    const doneAt = async (key, nm, L) => { await ev('window.__pos = ' + JSON.stringify(LL[L])); await reachDone(key, nm); await sleep(200); };
+
+    console.log('7. the 25 Nov day: First stop on an errand, a just-collect job, PLAN');
+    await fresh('s1');
+    check((await jobIds()).length === 3, 'three seeded jobs (collect Office -> Asian, deliver Carrier, deliver Eastern)', await jobIds());
+    await clickText('button', '+ Add job');
+    await waitFor('document.querySelector(".sheet")', 'the add-job form');
+    await clickText('.sheet .seg button', 'Errand');
+    await clickText('.sheet button', 'Pick errand place');
+    await pickPlace('/Office/');
+    check(await ev('!!document.querySelector("#firstStopToggle") && document.querySelector("#firstStopToggle").checked === false'), 'the errand form has a First stop toggle, off by default');
+    await ev('(() => { const n = [...document.querySelectorAll(".sheet input")].find((i) => i.placeholder === "Optional"); n.value = "Sign cheques"; n.dispatchEvent(new Event("input", { bubbles: true })); return true; })()');
+    await click('#firstStopToggle');
+    await sheetBtn('Save job');
+    await waitFor('!document.querySelector(".sheet")', 'the form closes');
+    const errandId = await S('jobs.find((j) => j.errandPlaceId === "office").id');
+    check(await S('jobs.filter((j) => j.firstStop).length') === 1 && await S('jobs.find((j) => j.firstStop).errandPlaceId') === 'office', 'the Office errand has First stop on (the only one)');
+    check(await ev('[...document.querySelectorAll(".card.job")].filter((c) => c.querySelector(".pill.first")).map((c) => c.querySelector(".box.errand") ? "errand" : "other").join()') === 'errand', 'FIRST tag on the errand\'s Plan card only');
+
+    await clickText('button', '+ Add job');
+    await waitFor('document.querySelector(".sheet #jobDest")', 'the add-job form');
+    check(await ev('!!document.querySelector("#firstStopToggle")'), 'the delivery form has the First stop toggle too');
+    await clickText('.sheet button', 'Pick pickup place');
+    await pickPlace('/Klang/');
+    await ev('(() => { const n = [...document.querySelectorAll(".sheet input")].find((i) => i.placeholder === "Item (e.g. 2 pcs sensor)"); n.value = "Oil seals"; n.dispatchEvent(new Event("input", { bubbles: true })); return true; })()');
+    check(await text('#justCollectHint') === 'Just collect — stays with you' && /Pick delivery place/.test(await text('#jobDest')), 'empty "send to": the hint "Just collect — stays with you"', await text('#justCollectHint'));
+    await sheetBtn('Save job');
+    await waitFor('!document.querySelector(".sheet")', 'the form closes');
+    const j1 = await S('jobs.find((j) => (j.pickups || []).some((p) => p.placeId === "klang"))');
+    check(j1 && !j1.deliveryPlaceId && j1.pickups[0].item === 'Oil seals', 'the just-collect job is saved with no delivery place', j1);
+    check((await jobIds()).length === 5, 'five jobs');
+
+    await planNow(5, 30000);
+    check(JSON.stringify(await stopNames()) === JSON.stringify(['office', 'asian', 'carrier', 'eastern', 'klang']), 'PLAN: Office, Asian Automotive, Carrier, Eastern Press, Klang', await stopNames());
+    const rc = await routeCards();
+    check(JSON.stringify(rc.map((c) => c.first)) === JSON.stringify([true, false, false, false, false]), 'the FIRST tag on the first Route card only', rc);
+    check(rc.filter((c) => /^Office/.test(c.nm)).length === 1, 'exactly one Office card', rc.map((c) => c.nm));
+    const klangBtns = await ev('[...document.querySelectorAll(".timeline .card.stop")].find((c) => /Klang/.test(c.textContent)).querySelector(".stop-btns").textContent');
+    check(!/MSG/.test(klangBtns), 'the just-collect stop (a supplier pickup) has no MSG button', klangBtns);
+    check(await noJobIds(), 'no "job j_" text on screen after PLAN');
+    check(await S('plan.ctx && WaypointDebug.S.plan.result.plans[0].violations.length') === 0, 'no missed windows');
+
+    console.log('8. DONE at every stop -> the Klang item is with you');
+    await doneAt('office', 'Office', 'O');
+    check(await S('jobs.find((j) => j.id === ' + JSON.stringify(errandId) + ').status') === 'done', 'DONE at the Office completes the errand');
+    const left1 = await ev('WaypointDebug.S.plan.result.plans[0].stops.filter((s) => !s.status).map((s) => s.placeId)');
+    check(JSON.stringify(left1) === JSON.stringify(['asian', 'carrier', 'eastern', 'klang']), 'after DONE at the Office the remaining order is Asian, Carrier, Eastern, Klang', left1);
+    await doneAt('asian', 'Asian', 'A');
+    await doneAt('carrier', 'Carrier', 'C');
+    await doneAt('eastern', 'Eastern', 'E');
+    await doneAt('klang', 'Pacific Klang', 'K');
+    await waitFor('document.querySelector("#onBoardToggle")', 'the With you bar');
+    check(/With you: 1 item/.test(await barText()), 'Route tab: "With you: 1 item"', await barText());
+    await openBar();
+    check(await ev('/Oil seals/.test(document.querySelector("#onBoardList").textContent) && /Pacific Klang/.test(document.querySelector("#onBoardList").textContent)'), 'the row: Oil seals from Pacific Klang');
+    check(await S('jobs.find((j) => (j.pickups || []).some((p) => p.placeId === "klang")).status') === 'done', 'the just-collect job is finished for the day');
+    check(await noJobIds(), 'no "job j_" text on screen after the day');
+
+    console.log('9. the two-visit day: two Office cards');
+    await fresh('s2');
+    await planNow(4, 30000);
+    const order2 = await stopNames();
+    const rc2 = await routeCards();
+    const offices = rc2.map((c, i) => (/^Office/.test(c.nm) ? i : -1)).filter((i) => i >= 0);
+    check(offices.length === 2 && offices[0] === 0, 'two Office cards, the first one is stop 1', rc2.map((c) => c.nm));
+    check(rc2[0].first && !rc2[offices[1]].first, 'FIRST on stop 1 only', rc2.map((c) => c.first));
+    check(rc2[offices[1]].acts.length === 1 && /^deliver:Compressor/.test(rc2[offices[1]].acts[0]), 'the second Office card holds only the Carrier delivery', rc2[offices[1]].acts);
+    check(rc2[0].acts.length === 2 && rc2[0].acts.some((a) => /^errand:/.test(a)) && rc2[0].acts.some((a) => /^collect:Brackets/.test(a)), 'stop 1 holds the errand and the Brackets collection', rc2[0].acts);
+    check(order2.indexOf('carrier') < offices[1] && order2.indexOf('asian') > 0, 'Carrier comes before the second Office card; Asian after stop 1', order2);
+    check(order2[offices[1]] === 'office#2', 'the second visit is its own stop', order2);
+    check(!(await ev('window.__legs')).some((l) => { const [a, b] = l.split(':'); return a === b; }), 'no request for the Office -> Office pair');
+    // A2: First stop on for another job -> it moves, with the toast naming both places (the route waits for PLAN)
+    await tab('plan');
+    await ev('[...document.querySelectorAll(".card.job")].find((c) => /Compressor/.test(c.textContent)).querySelector(".edit-btn").click()');
+    await waitFor('document.querySelector(".sheet #firstStopToggle")', 'the edit form');
+    check(await ev('document.querySelector("#firstStopToggle").checked === false'), 'the edit form shows First stop off for this job');
+    await click('#firstStopToggle');
+    await sheetBtn('Save changes');
+    await waitFor('/First stop moved/.test(document.getElementById("toast").textContent)', 'the First stop toast');
+    check(await text('#toast') === 'First stop moved from Office to Carrier', 'the toast: First stop moved from Office to Carrier', await text('#toast'));
+    check(JSON.stringify(await S('jobs.filter((j) => j.firstStop).map((j) => j.id)')) === '["j6"]', 'only that job has First stop now');
+    check(JSON.stringify(await stopNames()) === JSON.stringify(order2), 'the stored route is unchanged until PLAN');
+    await tab('route');
+    await doneAt('office', 'Office', 'O');
+    check(await S('jobs.find((j) => j.id === "j6").status') === 'pending', 'DONE on stop 1 leaves the Carrier -> Office delivery open');
+    check(await ev('WaypointDebug.S.plan.result.plans[0].stops.find((s) => s.placeId === "office#2").status') == null, 'the second Office card is still pending');
+    check(await noJobIds(), 'no "job j_" text on screen');
 
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {

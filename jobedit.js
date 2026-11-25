@@ -46,8 +46,37 @@
       deliveryPlaceId: job.deliveryPlaceId || null, inHandItem: job.inHandItem || '',
       errandPlaceId: job.errandPlaceId || null, dwellMin: job.dwellMin != null ? String(job.dwellMin) : '',
       notes: job.notes || '', urgent: !!job.urgent, after: job.arriveAfter || '', before: job.arriveBefore || '',
+      firstStop: !!job.firstStop,
     };
   }
+
+  // ---------- First stop (one entry at a time, for one day) ----------
+  // The place a job's First stop pins: the errand place, its first pickup, or its delivery when it is deliver-only (solver.js
+  // firstStopPlace is the planning rule; this one also names a stop already made, for the toast).
+  function firstStopPlaceOf(j) {
+    if (!j) return null;
+    if (j.errandPlaceId) return j.errandPlaceId;
+    const pk = j.pickups || [];
+    return pk.length ? pk[0].placeId : (j.deliveryPlaceId || null);
+  }
+  // Turn First stop on (or off) for job `id`. On = every other job loses it. Returns {jobs (new list, same order), changedIds,
+  // movedFrom (the job that had it, or null)}.
+  function setFirstStop(jobs, id, on) {
+    let movedFrom = null;
+    const list = jobs.map((x) => {
+      if (x.id === id) {
+        if (!!x.firstStop === !!on) return x;
+        const y = Object.assign({}, x);
+        if (on) y.firstStop = true; else delete y.firstStop;
+        return y;
+      }
+      if (on && x.firstStop) { if (x.status !== 'done') movedFrom = x; const y = Object.assign({}, x); delete y.firstStop; return y; }
+      return x;
+    });
+    return { jobs: list, changedIds: list.filter((x, k) => x !== jobs[k]).map((x) => x.id), movedFrom };
+  }
+  // the toast when it moves: "First stop moved from Office to Carrier"
+  const firstStopToast = (fromJob, toJob, nameOf) => 'First stop moved from ' + nameOf(firstStopPlaceOf(fromJob)) + ' to ' + nameOf(firstStopPlaceOf(toJob));
 
   // Edit job `id` of `jobs` from `form`. Nothing is changed unless it all validates.
   function updateJob(jobs, id, form, opts) {
@@ -101,8 +130,17 @@
     } else if (wantUrgent) { j.urgent = true; j.urgentRank = old.urgentRank || 0; }
     else { j.urgent = false; j.urgentRank = 0; }
     list[i] = j;
-    return { ok: true, jobs: list, job: j, ignored, changedIds: list.filter((x, k) => x !== jobs[k]).map((x) => x.id) };
+    // First stop: as the form says (a form without the field keeps it); on = it leaves every other job
+    let movedFrom = null;
+    if (form.firstStop != null) {
+      if (form.firstStop) j.firstStop = true; else delete j.firstStop;
+      if (form.firstStop) {
+        const r = setFirstStop(list, id, true);
+        movedFrom = r.movedFrom; list = r.jobs; list[i] = j;
+      }
+    }
+    return { ok: true, jobs: list, job: j, ignored, movedFrom, changedIds: list.filter((x, k) => x !== jobs[k]).map((x) => x.id) };
   }
 
-  return { validate, isEditable, donePickups, formOf, updateJob };
+  return { validate, isEditable, donePickups, formOf, updateJob, firstStopPlaceOf, setFirstStop, firstStopToast };
 });

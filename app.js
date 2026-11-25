@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '29c11ac6'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '8b2f797f'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -291,11 +291,35 @@
     const id = pid != null && S.places[pid] ? pid : TT.snap(p, Object.values(S.places));
     return { key, pid: id, lat: p.lat, lng: p.lng };
   }
-  // a delivery never goes before its own (pending) pickup: those reversed pairs are never fetched
-  function linksOf(jobs) {
-    const out = [];
-    (jobs || []).forEach((j) => { if (j.deliveryPlaceId) (j.pickups || []).filter((p) => !p.done).forEach((p) => { if (p.placeId !== j.deliveryPlaceId) out.push([p.placeId, j.deliveryPlaceId]); }); });
-    return out;
+  // a delivery never goes before its own (pending) pickup: those reversed pairs are never fetched (stop keys: a second visit
+  // to the First stop's place is its own key)
+  const linksOf = (jobs, places) => Solver.linksOf(Solver.buildStops(jobs, places || S.places));
+
+  // ---------- First stop / second visit (solver.js) ----------
+  // A stop key '<placeId>#2' is a second visit to that saved place: same coordinates, its own card. Its place sits in
+  // ctx.places under that key (a copy of the saved place), so every "S.places[id] || ctx.places[id]" lookup finds it.
+  const baseId = (id) => Solver.baseId(id);
+  function addVisitPlaces(places, stopIds) {
+    (stopIds || []).forEach((k) => { const b = baseId(k); if (b !== k && places[b] && !places[k]) places[k] = Object.assign({}, places[b], { id: k }); });
+    return places;
+  }
+  // The jobs the solver gets on a running day (copies; S.jobs untouched): a First stop already made or skipped has no further
+  // effect (its job's flag is dropped), and a delivery that sits in a pending second visit keeps that visit (visit2).
+  function planJobs(jobs, plan) {
+    if (!plan) return jobs;
+    const spent = new Set(), v2 = {};
+    plan.stops.forEach((s) => {
+      if (s.first && s.status) (s.actions || []).forEach((a) => spent.add(a.jobId));
+      if (!s.status && s.visitOf) (s.actions || []).forEach((a) => { if (a.kind === 'deliver') v2[a.jobId] = s.visitOf; });
+    });
+    return jobs.map((j) => {
+      const drop = j.firstStop && spent.has(j.id);
+      if (!drop && !v2[j.id]) return j;
+      const c = Object.assign({}, j);
+      if (drop) delete c.firstStop;
+      if (v2[j.id]) c.visit2 = v2[j.id];
+      return c;
+    });
   }
   let curEst = { stops: new Set(), end: false }; // which ETAs on the Route tab carry "est." (set by renderRoute)
   const estMark = (on) => (on ? ' est.' : '');
@@ -686,11 +710,13 @@
     const win = (j.arriveAfter || j.arriveBefore)
       ? h('span', { class: 'chip win' }, [j.arriveAfter && 'after ' + j.arriveAfter, j.arriveBefore && 'before ' + j.arriveBefore].filter(Boolean).join(' · ')) : null;
     const editIt = () => openJobSheet(null, j); // a tap on either box (COLLECT / IN HAND, DELIVER) edits the job
+    // the FIRST tag sits on the box of the stop it pins: the errand, the first pickup, or the delivery of a deliver-only job
+    const firstTag = () => (j.firstStop ? [' ', h('span', { class: 'pill first first-tag' }, 'FIRST')] : null);
     let grid;
     if (j.errandPlaceId) {
       const dw = j.dwellMin != null ? j.dwellMin : (S.places[j.errandPlaceId] || {}).dwellMin;
       grid = h('div', { class: 'job-grid' }, h('div', { class: 'box errand tap', onclick: editIt },
-        h('div', { class: 'eyebrow' }, 'ERRAND'),
+        h('div', { class: 'eyebrow' }, 'ERRAND', firstTag()),
         h('div', { class: 'name' }, dName(pName(j.errandPlaceId))),
         dw != null ? h('div', { class: 'muted sub' }, dw + ' min there') : null,
         win));
@@ -699,7 +725,7 @@
       // no pickups = already in hand: green IN HAND box (not the amber COLLECT box)
       const left = pk.length
         ? h('div', { class: 'box collect tap', onclick: editIt },
-          h('div', { class: 'eyebrow' }, 'COLLECT'),
+          h('div', { class: 'eyebrow' }, 'COLLECT', firstTag()),
           pk.map((p) => h('div', { class: 'pick' + (p.done ? ' done' : '') },
             h('div', { class: 'name' }, (p.done ? '✓ ' : '') + dName(pName(p.placeId))),
             p.item ? h('div', { class: 'muted sub' }, p.item) : null)))
@@ -710,8 +736,8 @@
         left,
         h('div', { class: 'arrow', 'aria-hidden': 'true' }, '→'),
         h('div', { class: 'box deliver tap', onclick: editIt },
-          h('div', { class: 'eyebrow' }, 'DELIVER'),
-          j.deliveryPlaceId ? h('div', { class: 'name' }, dName(pName(j.deliveryPlaceId))) : h('div', { class: 'muted' }, 'Collect only'),
+          h('div', { class: 'eyebrow' }, 'DELIVER', pk.length ? null : firstTag()),
+          j.deliveryPlaceId ? h('div', { class: 'name' }, dName(pName(j.deliveryPlaceId))) : h('div', { class: 'muted' }, 'Just collect — stays with you'),
           win));
     }
     const idx = urgentList.indexOf(j);
@@ -750,13 +776,13 @@
     const f0 = edit ? JobEdit.formOf(edit) : null;
     let mode = f0 ? f0.mode : 'delivery';
     const st = f0
-      ? { pickups: f0.pickups, deliveryPlaceId: f0.deliveryPlaceId, errandPlaceId: f0.errandPlaceId, dwellMin: f0.dwellMin, notes: f0.notes, urgent: f0.urgent, after: f0.after, before: f0.before, inHandItem: f0.inHandItem }
-      : { pickups: [{ placeId: null, item: '' }], deliveryPlaceId: null, errandPlaceId: null, dwellMin: '', notes: pre ? pre.notes || '' : '', urgent: false, after: '', before: '', inHandItem: pre ? pre.item || '' : '' };
+      ? { pickups: f0.pickups, deliveryPlaceId: f0.deliveryPlaceId, errandPlaceId: f0.errandPlaceId, dwellMin: f0.dwellMin, notes: f0.notes, urgent: f0.urgent, after: f0.after, before: f0.before, inHandItem: f0.inHandItem, firstStop: f0.firstStop }
+      : { pickups: [{ placeId: null, item: '' }], deliveryPlaceId: null, errandPlaceId: null, dwellMin: '', notes: pre ? pre.notes || '' : '', urgent: false, after: '', before: '', inHandItem: pre ? pre.item || '' : '', firstStop: false };
     const hasDone = !!(edit && JobEdit.donePickups(edit).length);
     const sh = openSheet(edit ? 'Edit job' : 'Add job');
     if (edit) sh.sheet.id = 'editJobSheet';
     const formNow = () => ({ mode, pickups: st.pickups.map((p) => ({ ref: p.ref, placeId: p.placeId, item: p.item })), deliveryPlaceId: st.deliveryPlaceId, inHandItem: st.inHandItem,
-      errandPlaceId: st.errandPlaceId, dwellMin: st.dwellMin, notes: st.notes, urgent: st.urgent, after: st.after, before: st.before });
+      errandPlaceId: st.errandPlaceId, dwellMin: st.dwellMin, notes: st.notes, urgent: st.urgent, after: st.after, before: st.before, firstStop: !!st.firstStop });
     function placeBtn(id, placeholder, onPick, btnId) {
       return h('button', { id: btnId || null, style: 'width:100%;text-align:left', onclick: () => openPlacePicker((p) => { onPick(p); draw(); }) }, id ? pName(id) : placeholder);
     }
@@ -783,6 +809,8 @@
           h('label', { class: 'field' }, 'Deliver to'),
           h('div', { class: 'row' }, h('div', { class: 'grow' }, placeBtn(st.deliveryPlaceId, 'Pick delivery place', (pl) => { st.deliveryPlaceId = pl.id; }, 'jobDest')),
             st.deliveryPlaceId ? h('button', { onclick: () => { st.deliveryPlaceId = null; draw(); } }, '✕') : null));
+        // no delivery place = a "just collect" job: the item stays with you (the With you bar) until Dropped off / Deliver to…
+        if (!st.deliveryPlaceId && st.pickups.some((p) => p.placeId || p.done)) body.append(h('div', { class: 'muted', id: 'justCollectHint' }, 'Just collect — stays with you'));
         // no pickup place chosen = the item is already in hand: optional item name for the delivery itself
         if (!st.pickups.some((p) => p.placeId)) {
           body.append(h('label', { class: 'field' }, 'Item (optional — already in hand)'),
@@ -798,6 +826,8 @@
         h('label', { class: 'field' }, 'Notes'),
         h('input', { value: st.notes, placeholder: 'Optional', oninput: (e) => { st.notes = e.target.value; } }),
         mode === 'delivery' ? h('label', { class: 'toggle' }, h('input', { type: 'checkbox', checked: st.urgent, onchange: (e) => { st.urgent = e.target.checked; } }), 'Urgent') : null,
+        // First stop (today only): this entry's first stop is the first visit after the start; only one entry has it at a time
+        h('label', { class: 'toggle' }, h('input', { type: 'checkbox', id: 'firstStopToggle', checked: !!st.firstStop, onchange: (e) => { st.firstStop = e.target.checked; } }), 'First stop'),
         h('div', { class: 'row' },
           h('div', { class: 'grow' }, h('label', { class: 'field' }, 'Arrive after'), h('input', { type: 'time', value: st.after, oninput: (e) => { st.after = e.target.value; } })),
           h('div', { class: 'grow' }, h('label', { class: 'field' }, 'Arrive before'), h('input', { type: 'time', value: st.before, oninput: (e) => { st.before = e.target.value; } }))),
@@ -813,6 +843,7 @@
       if (S.plan) { S.plan.jobsChanged = true; await savePlan(); } // the route is NOT re-planned: the owner taps PLAN
       sh.close();
       render();
+      if (res.movedFrom) toast(JobEdit.firstStopToast(res.movedFrom, res.job, placeNameOf));
     }
     async function save() {
       if (edit) return saveEdit();
@@ -836,10 +867,18 @@
         if (pre && pre.looseId && !j.pickups.length) j.looseId = pre.looseId; // this in-hand job now tracks the loose item
       }
       S.jobs.push(j);
-      await saveJob(j);
-      if (j.looseId) await setLoose(OnBoard.convert(S.loose, j.looseId, j.id, Date.now()));
+      let moved = null;
+      if (st.firstStop) { // one First stop at a time: it leaves the entry that had it
+        const r = JobEdit.setFirstStop(S.jobs, j.id, true);
+        S.jobs = r.jobs; moved = r.movedFrom;
+        for (const id of r.changedIds) if (id !== j.id) await saveJob(S.jobs.find((x) => x.id === id));
+      }
+      const j1 = S.jobs.find((x) => x.id === j.id);
+      await saveJob(j1);
+      if (j1.looseId) await setLoose(OnBoard.convert(S.loose, j1.looseId, j1.id, Date.now()));
       sh.close();
       render();
+      if (moved) toast(JobEdit.firstStopToast(moved, j1, placeNameOf));
     }
     draw();
     if (pre) setTimeout(() => { const d = sh.body.querySelector('#jobDest'); if (d) d.focus(); }, 50); // the destination is what is left to choose
@@ -868,7 +907,7 @@
     if (!end) { banner('Pick an end place.', 'error'); return; }
     const allJobs = JSON.parse(JSON.stringify(S.jobs));
     // on a running day a SKIPPED stop is left exactly as it is: what it holds is not solved again (only Undo skip brings it back)
-    const jobs = replan ? OnBoard.jobsForPlan(allJobs, curPlan()) : allJobs;
+    const jobs = replan ? planJobs(OnBoard.jobsForPlan(allJobs, curPlan()), curPlan()) : allJobs;
     const stopIds = Solver.buildStops(jobs, S.places).stopIds;
     if (!stopIds.length) { toast('No pending jobs to plan.'); return; }
     if (stopIds.length > Solver.MAX_STOPS) { banner('Too many stops: ' + stopIds.length + ' distinct places (max ' + Solver.MAX_STOPS + '). Park some jobs first.', 'error'); return; }
@@ -891,7 +930,7 @@
         const d = new Date(); d.setHours(hh, mm, 0, 0);
         if (d > departAt) departAt = d;
       }
-      const places = JSON.parse(JSON.stringify(S.places));
+      const places = addVisitPlaces(JSON.parse(JSON.stringify(S.places)), stopIds);
       const input = { start, end, jobs, places, departAtISO: departAt.toISOString(), noDetour: false };
       const points = Solver.pointsFor(input);
       const prevNoDetour = S.plan ? S.plan.noDetour : false;
@@ -965,7 +1004,7 @@
       Solver, input: Object.assign({}, input, { noDetour }), nowMs, mem: S.mem, fetchLeg: planFetch(sess), seen: sess.learned, onProgress: progress,
       start: nodeOf('__start__', input.start, S.startSel !== 'gps' ? S.startSel : null),
       end: nodeOf('__end__', input.end, input.end.id),
-      nodeOfStop: (pid) => nodeOf(pid, input.places[pid], pid),
+      nodeOfStop: (pid) => nodeOf(pid, Solver.placeOf(input.places, pid), baseId(pid)), // a second visit = the same saved place (0 s, no request)
       timed: (p) => LunchBreak.applyBreak(p, curLunch(), S.settings, Date.now()),
     });
     saveMemory();
@@ -1019,8 +1058,8 @@
     opts = opts || {}; // opts.shiftMs: start the re-solve later/earlier (live-location offset)
     const P = S.plan, plan = curPlan(), m = plan.model;
     const from = lastDoneIdx(plan, true); // the fuel stop has no row in the matrices: anchor at the last real stop
-    const live = new Set(plan.stops.filter((s) => !s.status).map((s) => s.placeId));
-    const inModel = new Set(m.stopIds);
+    const live = new Set(plan.stops.filter((s) => !s.status).map((s) => baseId(s.placeId))); // saved places (a second visit = its place)
+    const inModel = new Set(m.stopIds.map(baseId));
     let aIdx = 0, anchor = { lat: m.start.lat, lng: m.start.lng }; // where we are: last done stop, else the start
     if (from >= 0) {
       const pid = plan.stops[from].placeId, ix = m.stopIds.indexOf(pid), pl = S.places[pid] || P.ctx.places[pid];
@@ -1028,12 +1067,14 @@
     }
     const placesOf = (j) => (j.errandPlaceId ? [j.errandPlaceId]
       : (j.pickups || []).filter((p) => !p.done).map((p) => p.placeId).concat(j.deliveryPlaceId ? [j.deliveryPlaceId] : []));
-    const jobs = S.jobs.filter((j) => !j.status || j.status === 'pending').filter((j) => {
+    const jobs = planJobs(S.jobs.filter((j) => !j.status || j.status === 'pending').filter((j) => {
       const ps = placesOf(j); // only jobs the cached matrices cover, with something still to do at a live stop
       return ps.length && ps.every((p) => inModel.has(p)) && ps.some((p) => live.has(p));
-    });
+    }), plan);
     const stopIds = Solver.buildStops(jobs, S.places).stopIds;
-    const idxList = [aIdx].concat(stopIds.map((pid) => m.stopIds.indexOf(pid) + 1), [m.stopIds.length + 1]);
+    addVisitPlaces(P.ctx.places, stopIds);
+    const mi = (key) => { const x = m.stopIds.indexOf(key); return x >= 0 ? x : m.stopIds.findIndex((y) => baseId(y) === baseId(key)); }; // same coordinates
+    const idxList = [aIdx].concat(stopIds.map((pid) => mi(pid) + 1), [m.stopIds.length + 1]);
     const matrices = Solver.reindexMatrices(m.matrices, idxList);
     const now = Date.now();
     const at = (from >= 0 ? now : Math.max(now, Date.parse(P.ctx.departAtISO))) + (opts.shiftMs || 0);
@@ -1357,7 +1398,7 @@
         dwellMin: dsec != null ? dsec / 60 : ((coordPlace(stop.placeId) || {}).dwellMin != null ? coordPlace(stop.placeId).dwellMin : null) };
       const evs = stop.fuel // the fuel stop is logged as a stop (kind 'fuel'), never as a job action
         ? [DL.recordFuel(day, Object.assign({ nowIso, stopId: stop.placeId, name: (coordPlace(stop.placeId) || {}).name || '', places: Object.assign({}, S.plan && S.plan.ctx.places, S.places) }, rch))]
-        : DL.recordDone(day, Object.assign({ nowIso, stopId: stop.placeId, actions: stop.actions, places: S.places }, rch));
+        : DL.recordDone(day, Object.assign({ nowIso, stopId: stop.placeId, actions: stop.actions, places: Object.assign({}, S.plan && S.plan.ctx.places, S.places) }, rch));
       if (plan && prev && to) holdDriven(day, plan, prev, to, coord, nowMs); // keep the leg just driven (zero requests)
       bgSaveDay(day);
       attachFix(evs, day);
@@ -1648,7 +1689,7 @@
   function stopMessage(stop, shiftMs) {
     const place = S.plan.ctx.places[stop.placeId] || S.places[stop.placeId];
     const items = stop.actions.filter((a) => a.kind === 'deliver').map(deliverItem).filter(Boolean).join(', ');
-    const live = S.places[stop.placeId] || place; // latest edits to number/salutation win
+    const live = S.places[baseId(stop.placeId)] || place; // latest edits to number/salutation win (a second visit: its saved place)
     const text = Messages.buildMessage({ place: live, settings: S.settings, arriveAt: new Date(stop.arriveAt + (shiftMs || 0)), items });
     return { place: live, text };
   }
@@ -1736,7 +1777,7 @@
     if (view.left > 0 && plan.stops.some((s) => s.status === 'skipped' && !s.fuel)) v.append(h('div', { class: 'prompt', id: 'skipPrompt' }, 'A stop was skipped. PLAN leaves it skipped; tap Undo skip on it to bring it back. ', h('button', { class: 'small', onclick: () => openTab('plan') }, 'Go to Plan')));
     if (P.prompt) {
       const stop = plan.stops.find((s) => s.placeId === P.prompt.placeId);
-      const place = S.places[P.prompt.placeId];
+      const place = S.places[baseId(P.prompt.placeId)];
       if (stop && place) {
         v.append(h('div', { class: 'prompt' }, h('div', { class: 'title' }, 'Send ETA to ' + dName(place.name) + '?'),
           h('div', { class: 'row', style: 'margin-top:8px' },
@@ -1892,6 +1933,7 @@
     if (stop.detour) pills.push(h('span', { class: 'pill detour' }, 'DETOUR'));
     if (stop.closedWarning) pills.push(h('span', { class: 'pill closed' }, 'CLOSED'));
     if (stop.late) pills.push(h('span', { class: 'pill closed' }, 'LATE'));
+    if (stop.first) pills.push(h('span', { class: 'pill first' }, 'FIRST')); // the First stop visit (a later second visit has none)
     // expanded section (state lives in openStops for this session only, keyed by place; not persisted)
     const wd = (() => { const d = new Date(stop.arriveAt).getDay(); return d === 0 ? 7 : d; })();
     const todays = (place.closedWindows || []).filter((w) => (Array.isArray(w.days) ? w.days : ALL_DAYS).indexOf(wd) >= 0);
@@ -1915,7 +1957,8 @@
     head.onclick = toggle;
     head.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } };
     const btns = navButtons(place, () => navTap(stop, i));
-    if (hasDelivery) btns.push(h('button', { class: 'small', onclick: () => { stopTapped(); noteMsg(stop.placeId); const m = stopMessage(stop, P.shiftMs); shareMessage(m.place, m.text); } }, 'MSG'));
+    // the ETA message goes to customers only: a stop with no delivery (a just-collect pickup) or a supplier place has no MSG
+    if (hasDelivery && (S.places[baseId(stop.placeId)] || place).type !== 'supplier') btns.push(h('button', { class: 'small', onclick: () => { stopTapped(); noteMsg(stop.placeId); const m = stopMessage(stop, P.shiftMs); shareMessage(m.place, m.text); } }, 'MSG'));
     btns.push(primaryBtn(stop, i)); // REACHED, then DONE: one button, the place and size DONE always had
     btns.push(h('button', { class: 'small', onclick: () => skipStop(stop, i) }, 'SKIP'));
     const rin = reachedInline(stop, i); // "Reached 14:10 · auto  Undo" at the end of the card's action lines (no extra row)
@@ -2175,8 +2218,8 @@
     const next = plan.stops.slice(i + 1).find((s) => !s.status);
     P.prompt = null;
     if (next && next.actions.some((a) => a.kind === 'deliver')) {
-      const np = S.places[next.placeId];
-      if (np && np.whatsapp) P.prompt = { placeId: next.placeId };
+      const np = S.places[baseId(next.placeId)];
+      if (np && np.whatsapp && np.type !== 'supplier') P.prompt = { placeId: next.placeId }; // suppliers are never messaged
     }
     if (!plan.stops.some((s) => !s.status)) toast('Run complete 🎉');
     await savePlan();
@@ -2258,10 +2301,11 @@
     const here = fix.ok && fix.accuracy <= Solver.LOC.MAX_ACCURACY_M ? { lat: fix.lat, lng: fix.lng } : ds ? { lat: ds.lat, lng: ds.lng } : { lat: m.start.lat, lng: m.start.lng };
     const plan = curPlan(), pend = pendingStops(plan);
     const pendIds = new Set(pend.map((s) => s.placeId));
+    const pendPlaces = new Set(pend.map((s) => baseId(s.placeId))); // a second visit '<place>#2' is that saved place
     // the jobs still to do at the pending stops (skipped stops stay skipped: OnBoard.jobsForPlan)
     const placesOfJob = (j) => (j.errandPlaceId ? [j.errandPlaceId] : (j.pickups || []).filter((p) => !p.done).map((p) => p.placeId).concat(j.deliveryPlaceId ? [j.deliveryPlaceId] : []));
-    const jobs = OnBoard.jobsForPlan(JSON.parse(JSON.stringify(S.jobs.filter((j) => !j.status || j.status === 'pending'))), plan)
-      .filter((j) => { const ps = placesOfJob(j); return ps.length && ps.every((p) => pendIds.has(p)); });
+    const jobs = planJobs(OnBoard.jobsForPlan(JSON.parse(JSON.stringify(S.jobs.filter((j) => !j.status || j.status === 'pending'))), plan), plan)
+      .filter((j) => { const ps = placesOfJob(j); return ps.length && ps.every((p) => pendPlaces.has(p)); });
     const places = Object.assign({}, P.ctx.places, S.places);
     const base = { start: here, end: { lat: m.end.lat, lng: m.end.lng }, jobs, places, departAtISO: nowIso, noDetour: P.noDetour, respectClosedWindows: !!m.respectClosed };
     const prec = Solver.precedence(base);
@@ -2270,7 +2314,7 @@
     const endPid = P.ctx.end && P.ctx.end.id && S.places[P.ctx.end.id] ? P.ctx.end.id : null;
     const end = nodeOf(TT.END, m.end, endPid);
     const nodes = new Map([[TT.ORIGIN, origin], [TT.END, end]]);
-    const pendNodes = pend.map((s) => { const pl = placeOf(s.placeId); const n = nodeOf(s.placeId, pl, s.placeId); nodes.set(s.placeId, n); return n; });
+    const pendNodes = pend.map((s) => { const pl = placeOf(s.placeId) || placeOf(baseId(s.placeId)); const n = nodeOf(s.placeId, pl, baseId(s.placeId)); nodes.set(s.placeId, n); return n; });
     const bucket = TT.bucketOf(now);
     // the plan's own table (indices: 0 start, 1..k stops, k+1 end) for any leg neither fetched nor learned
     const k = m.stopIds.length, sl = m.matrices[0];
@@ -2285,7 +2329,7 @@
     const ad = TT.solverAdapter(Solver, base, post);
     const fullMax = Number.isFinite(Number(S.settings.fullRefreshMax)) ? Number(S.settings.fullRefreshMax) : TT.FULL_REFRESH_MAX;
     const res = await TT.lookAhead({
-      origin, pending: pendNodes, end, links: linksOf(jobs), before: prec.before, current: pend.map((s) => s.placeId), fullRefreshMax: fullMax,
+      origin, pending: pendNodes, end, links: linksOf(jobs, places), before: prec.before, current: pend.map((s) => s.placeId), fullRefreshMax: fullMax,
       learned: learnedSec, fallback,
       fetchLive: async (a, b) => { const r = await ttLeg(a, b, null); if (r) TT.remember(S.mem, a, b, now, r, now); return r; },
       solve: (leg) => ad.solve((x, y) => leg(x === TT.ORIGIN ? TT.ORIGIN : x, y)),
@@ -2915,7 +2959,11 @@
       S.places = {}; S.jobs = [];
       for (const p of data.places) { normalizeWindows(p); await savePlace(p); }
       await WPStore.remove('plan', 'current');
-      for (const j of data.jobs) { S.jobs.push(j); await saveJob(j); }
+      let firstSeen = false; // First stop: true only (older exports have no field = off), one entry at most
+      for (const j of data.jobs) {
+        if (j && j.firstStop === true && !firstSeen && j.status !== 'done') firstSeen = true; else if (j) delete j.firstStop;
+        S.jobs.push(j); await saveJob(j);
+      }
       if (dl.present) {
         await WPStore.clear('daylogs'); S.days = {};
         for (const d of dl.records) { S.days[d.date] = d; await WPStore.set('daylogs', d.date, d); }

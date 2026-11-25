@@ -45,22 +45,47 @@
   const isPending = (j) => !j.status || j.status === 'pending';
   const isErrand = (j) => !!j.errandPlaceId;
 
+  // ---------- First stop and the second visit ----------
+  // A job (or errand) with firstStop = true pins its first stop: the errand place, its FIRST pickup, or its delivery when it is
+  // deliver-only. That place is the first visit after the start (hard; it beats urgent). A first pickup already collected = the
+  // first stop was made: no further effect. At that place everything that can be done on arrival is done in the first visit; a
+  // delivery there whose item is collected elsewhere today becomes a SECOND visit, a separate stop keyed '<placeId>#2' at the same
+  // coordinates (VISIT2). A job copy may carry visit2 = placeId: its delivery there belongs to a second visit already in the plan,
+  // so with no First stop at that place the whole (single, merged) visit keeps the '#2' key through a re-solve.
+  const VISIT2 = '#2';
+  const baseId = (key) => (typeof key === 'string' && key.length > VISIT2.length && key.slice(-VISIT2.length) === VISIT2 ? key.slice(0, -VISIT2.length) : key);
+  const isVisit2 = (key) => baseId(key) !== key;
+  const placeOf = (places, key) => (places && (places[key] || places[baseId(key)])) || null;
+  function firstStopPlace(j) {
+    if (!j || !j.firstStop || !isPending(j)) return null;
+    if (isErrand(j)) return j.errandPlaceId;
+    const pk = j.pickups || [];
+    if (pk.length) return pk[0].done ? null : pk[0].placeId;
+    return j.deliveryPlaceId || null;
+  }
+
   // ---------- stop set ----------
-  // One visit per distinct place; merges all pickups / deliveries / errands at that place.
+  // One visit per distinct place; merges all pickups / deliveries / errands at that place (the First stop's place may get a
+  // second visit, see above). stops[key].placeId = the saved place; first = the key of the First stop visit (or null).
   function buildStops(jobs, places) {
     const order = [];
     const map = {};
-    const get = (pid) => {
-      if (!map[pid]) {
-        map[pid] = { placeId: pid, pickups: [], deliveries: [], errands: [], errandDwell: null };
-        order.push(pid);
-      }
-      return map[pid];
-    };
     const active = (jobs || []).filter(isPending);
+    let first = null;
+    active.some((j) => { first = firstStopPlace(j); return first != null; });
+    const alias = {};
+    active.forEach((j) => { if (j.visit2 && j.visit2 !== first) alias[j.visit2] = j.visit2 + VISIT2; });
+    const keyOf = (pid) => (pid === first ? pid : alias[pid] || pid);
+    const get = (key) => {
+      if (!map[key]) {
+        map[key] = { placeId: baseId(key), pickups: [], deliveries: [], errands: [], errandDwell: null };
+        order.push(key);
+      }
+      return map[key];
+    };
     active.forEach((j) => {
       if (isErrand(j)) {
-        const s = get(j.errandPlaceId);
+        const s = get(keyOf(j.errandPlaceId));
         s.errands.push({ jobId: j.id, kind: 'errand', item: j.notes || 'Errand' });
         if (j.dwellMin != null && j.dwellMin !== '') {
           s.errandDwell = Math.max(s.errandDwell || 0, Number(j.dwellMin));
@@ -70,19 +95,30 @@
       const pk = j.pickups || [];
       const items = pk.map((p) => p.item).filter(Boolean).join(', ');
       pk.filter((p) => !p.done).forEach((p) =>
-        get(p.placeId).pickups.push({ jobId: j.id, kind: 'pickup', item: p.item || '' }));
+        get(keyOf(p.placeId)).pickups.push({ jobId: j.id, kind: 'pickup', item: p.item || '' }));
       if (j.deliveryPlaceId) {
-        get(j.deliveryPlaceId).deliveries.push({ jobId: j.id, kind: 'deliver', item: items });
+        const d = j.deliveryPlaceId;
+        const later = d === first && pk.some((p) => !p.done && p.placeId !== d); // collected elsewhere today: the second visit
+        get(later ? d + VISIT2 : keyOf(d)).deliveries.push({ jobId: j.id, kind: 'deliver', item: items });
       }
     });
-    return { stopIds: order, stops: map, jobs: active };
+    return { stopIds: order, stops: map, jobs: active, first: first != null && map[first] ? first : null, keyOf };
+  }
+  // pending pickup -> its delivery, as stop keys ([[pickupKey, deliveryKey]]): the reversed pairs are never needed
+  function linksOf(bs) {
+    const out = [];
+    const byId = {}; bs.jobs.forEach((j) => { byId[j.id] = j; });
+    bs.stopIds.forEach((key) => bs.stops[key].deliveries.forEach((d) => {
+      ((byId[d.jobId] || {}).pickups || []).filter((p) => !p.done).forEach((p) => { const q = bs.keyOf(p.placeId); if (q !== key) out.push([q, key]); });
+    }));
+    return out;
   }
 
   function pointsFor(input) {
     const bs = buildStops(input.jobs, input.places);
     const pts = [{ lat: input.start.lat, lng: input.start.lng }];
     bs.stopIds.forEach((pid) => {
-      const p = input.places[pid];
+      const p = placeOf(input.places, pid);
       pts.push({ lat: p.lat, lng: p.lng });
     });
     pts.push({ lat: input.end.lat, lng: input.end.lng });
@@ -98,7 +134,7 @@
     const idx = {};
     bs.stopIds.forEach((p, i) => { idx[p] = i; });
     bs.stopIds.forEach((pid) => {
-      if (!places[pid]) throw new Error('A job refers to a place that no longer exists (' + pid + ').');
+      if (!placeOf(places, pid)) throw new Error('A job refers to a place that no longer exists (' + pid + ').');
     });
     const matrices = input.matrices || [];
     if (!matrices.length) throw new Error('No travel-time matrices supplied.');
@@ -138,7 +174,7 @@
 
     bs.stopIds.forEach((pid, i) => {
       const s = bs.stops[pid];
-      const pl = places[pid];
+      const pl = placeOf(places, pid);
       const placeDwell = (pl.dwellMin != null ? Number(pl.dwellMin) : (DEFAULT_DWELL[pl.type] != null ? DEFAULT_DWELL[pl.type] : 10)) * 60;
       const hasOther = s.pickups.length + s.deliveries.length > 0;
       if (s.errandDwell != null) {
@@ -151,7 +187,7 @@
         const b = dayRel(j.arriveBefore), af = dayRel(j.arriveAfter);
         if (b != null) before[i] = Math.min(before[i], b);
         if (af != null) after[i] = Math.max(after[i], af);
-        if (b != null || af != null) targets[i].push({ jobId: j.id, before: b, after: af, label: a.item || j.notes || '' });
+        if (b != null || af != null) targets[i].push({ jobId: j.id, kind: a.kind, before: b, after: af, label: a.item || (a.kind === 'deliver' ? j.inHandItem : '') || j.notes || '' });
       };
       s.deliveries.forEach((a) => {
         addTarget(a);
@@ -178,7 +214,7 @@
       s.deliveries.forEach((d) => {
         const j = jobById[d.jobId];
         (j.pickups || []).filter((p) => !p.done).forEach((p) => {
-          const q = idx[p.placeId];
+          const q = idx[bs.keyOf(p.placeId)];
           if (q !== i && q != null) pre[i] |= (1 << q);
         });
       });
@@ -190,6 +226,13 @@
       }
       // (3) noDetour: stops with no urgent-job action wait for all urgent deliveries
       if (noDetour && !urgentAction[i]) pre[i] |= urgentDelMask & ~(1 << i);
+    }
+    // (4) First stop: its visit comes first after the start (hard, beats urgent); every other stop waits for it. The urgent rules
+    // then apply to everything after it, as above.
+    const firstIdx = bs.first != null ? idx[bs.first] : -1;
+    if (firstIdx >= 0) {
+      pre[firstIdx] = 0;
+      for (let i = 0; i < k; i++) if (i !== firstIdx) pre[i] |= (1 << firstIdx);
     }
 
     // admissible bound pieces
@@ -207,7 +250,7 @@
     for (let a = 0; a <= k; a++) for (let s = 0; s < slices.length; s++) minInEnd = Math.min(minInEnd, slices[s].f[a * N + (k + 1)]);
 
     // closed windows per stop (weekday-aware); only enforced (arrival waits) when input.respectClosedWindows
-    const closedWin = bs.stopIds.map((pid) => normWindows(places[pid].closedWindows));
+    const closedWin = bs.stopIds.map((pid) => normWindows(placeOf(places, pid).closedWindows));
     const respect = !!input.respectClosedWindows;
 
     const ctx = {
@@ -304,6 +347,26 @@
     const stops = [];
     const violations = [];
     const lastUrgentPos = order.reduce((acc, i, pos) => (c.urgentDel[i] ? pos : acc), -1);
+    const nameOf = (key) => (placeOf(places, key) || {}).name || baseId(key);
+    // the "it has to come after <pickup>" reason of a missed delivery window: the latest-visited pending pickup of that job, when
+    // going there first makes the delivery late although driving straight to it would not (collect-before-deliver is the cause)
+    const ruleOf = (i, pos, tg) => {
+      if (tg.kind !== 'deliver' || tg.before == null) return null;
+      const j = c.jobById[tg.jobId];
+      let best = null, bp = -1;
+      ((j && j.pickups) || []).filter((p) => !p.done).forEach((p) => {
+        const q = c.idx[bs.keyOf(p.placeId)];
+        const qp = q == null ? -1 : order.indexOf(q);
+        if (q != null && qp >= 0 && qp < pos && qp > bp) { bp = qp; best = { q, p }; }
+      });
+      if (!best) return null;
+      const direct = Math.max(c.leg(0, i + 1, 0), c.after[i]);
+      let via = Math.max(c.leg(0, best.q + 1, 0), c.after[best.q]) + c.dwell[best.q];
+      via = Math.max(via + c.leg(best.q + 1, i + 1, via), c.after[i]);
+      if (!(direct <= tg.before + 0.0001 && via > tg.before + 0.0001)) return null;
+      return { place: nameOf(bs.stopIds[best.q]), item: best.p.item || tg.label || '' };
+    };
+    const ruleAt = {};
     order.forEach((i, pos) => {
       const pid = bs.stopIds[i];
       const s = bs.stops[pid];
@@ -312,18 +375,18 @@
       if (c.after[i] > arrive) arrive = c.after[i];
       if (c.respect && c.closedWin[i].length) arrive = pushPastClosedRel(c, i, arrive);
       c.targets[i].forEach((tg) => {
+        const rule = ruleOf(i, pos, tg);
+        if (rule) ruleAt[pid + '|' + tg.jobId] = rule;
         if (tg.before != null && arrive > tg.before + 0.0001) {
           late += arrive - tg.before;
-          violations.push('Arrive-before missed at ' + places[pid].name + ': arrives ' +
-            formatETA(t0ms + arrive * 1000) + ', must be before ' + formatETAfromRel(c, tg.before) +
-            ' (job ' + tg.jobId + ')');
+          violations.push(missedText(nameOf(pid), t0ms + arrive * 1000, c.t0ms + tg.before * 1000, tg, rule));
         }
       });
       const dep = arrive + c.dwell[i];
-      const pl = places[pid];
+      const pl = placeOf(places, pid);
       const arriveAt = t0ms + Math.round(arrive * 1000);
       const closed = !!windowAt(c.closedWin[i], arriveAt); // weekday of the predicted arrival date
-      stops.push({
+      const out = {
         placeId: pid,
         arriveAt,
         departAt: t0ms + Math.round(dep * 1000),
@@ -331,7 +394,10 @@
         actions: [].concat(s.deliveries, s.errands, s.pickups).map((a) => ({ jobId: a.jobId, kind: a.kind, item: a.item })),
         detour: !c.urgentAction[i] && pos < lastUrgentPos,
         closedWarning: closed,
-      });
+      };
+      if (pid === bs.first) out.first = true;          // the First stop visit (the FIRST tag)
+      if (isVisit2(pid)) out.visitOf = baseId(pid);    // a second visit to that saved place
+      stops.push(out);
       t = dep; last = i + 1;
     });
     const e = t + c.leg(last, k + 1, t);
@@ -348,9 +414,11 @@
     bs.stopIds.forEach((pid, i) => {
       model.dwellSec[pid] = c.dwell[i];
       model.afterMs[pid] = c.after[i] > -Infinity ? Math.round(t0ms + c.after[i] * 1000) : null;
-      model.closed[pid] = places[pid].closedWindows || [];
-      model.names[pid] = places[pid].name;
-      model.beforeMs[pid] = c.targets[i].filter((tg) => tg.before != null).map((tg) => ({ jobId: tg.jobId, ms: Math.round(t0ms + tg.before * 1000) }));
+      const pl = placeOf(places, pid);
+      model.closed[pid] = pl.closedWindows || [];
+      model.names[pid] = pl.name;
+      model.beforeMs[pid] = c.targets[i].filter((tg) => tg.before != null).map((tg) => ({ jobId: tg.jobId, ms: Math.round(t0ms + tg.before * 1000),
+        kind: tg.kind, label: tg.label, rule: ruleAt[pid + '|' + tg.jobId] || null }));
     });
     return {
       order: order.map((i) => bs.stopIds[i]),
@@ -399,6 +467,14 @@
   }
   const isClosedAt = (windows, ms) => !!windowAt(normWindows(windows), ms);
   function formatETAfromRel(c, rel) { return formatETA(c.t0ms + rel * 1000); }
+  // The text of a missed arrive-before window. Never an internal job id: the item and the place. rule = {place, item} when the
+  // collect-before-deliver rule is what made it late.
+  function missedText(name, arriveMs, beforeMs, tg, rule) {
+    if (rule) return name + ' arrives ' + formatETA(arriveMs) + ', must be before ' + formatETA(beforeMs) + ' — it has to come after ' + rule.place + ' (' + (rule.item || 'the item') + ' is collected there)';
+    const what = String((tg && tg.label) || '').trim() || (tg && tg.kind === 'errand' ? 'Errand' : 'Item');
+    const rel = tg && tg.kind === 'deliver' ? ' to ' : tg && tg.kind === 'pickup' ? ' from ' : ' at ';
+    return 'Arrive-before missed at ' + name + ': arrives ' + formatETA(arriveMs) + ', must be before ' + formatETA(beforeMs) + ' (' + what + rel + name + ')';
+  }
 
   // ---------- live re-timing ----------
   // Recompute arrive/depart for every stop that is not done/skipped, WITHOUT changing the order, starting at the
@@ -489,7 +565,7 @@
       (m.beforeMs[s.placeId] || []).forEach((tg) => {
         if (s.arriveAt > tg.ms + 1) {
           s.late = true; lateMs += s.arriveAt - tg.ms;
-          violations.push('Arrive-before missed at ' + ((m.names || {})[s.placeId] || s.placeId) + ': arrives ' + formatETA(s.arriveAt) + ', must be before ' + formatETA(tg.ms) + ' (job ' + tg.jobId + ')');
+          violations.push(missedText((m.names || {})[s.placeId] || baseId(s.placeId), s.arriveAt, tg.ms, tg, tg.rule || null));
         }
       });
     });
@@ -616,5 +692,5 @@
     return { stopIds: bs.stopIds, before };
   }
 
-  return { solve, evaluate, precedence, retime, markLate, normWindows, pushPastClosed, reindexMatrices, distanceM, refreshDue, judgeFix, originFresh, liveView, timesLine, LOC, isClosedAt, buildStops, pointsFor, formatETA, formatDuration, hmToSec, MAX_STOPS, DEFAULT_DWELL };
+  return { VISIT2, baseId, isVisit2, placeOf, firstStopPlace, linksOf, missedText, solve, evaluate, precedence, retime, markLate, normWindows, pushPastClosed, reindexMatrices, distanceM, refreshDue, judgeFix, originFresh, liveView, timesLine, LOC, isClosedAt, buildStops, pointsFor, formatETA, formatDuration, hmToSec, MAX_STOPS, DEFAULT_DWELL };
 });

@@ -455,9 +455,8 @@
     const bs = Solver.buildStops(input.jobs, input.places);
     const k = bs.stopIds.length;
     const stops = bs.stopIds.map((pid) => o.nodeOfStop(pid));
-    const links = [];
-    bs.jobs.forEach((j) => { if (j.deliveryPlaceId) (j.pickups || []).filter((p) => !p.done).forEach((p) => { if (p.placeId !== j.deliveryPlaceId) links.push([p.placeId, j.deliveryPlaceId]); }); });
-    const dwellSum = bs.stopIds.reduce((a, pid) => a + (Number(input.places[pid].dwellMin) || 0) * 60, 0);
+    const links = Solver.linksOf(bs); // pickup -> delivery as stop keys (a First stop's second visit is its own key)
+    const dwellSum = bs.stopIds.reduce((a, pid) => a + (Number(Solver.placeOf(input.places, pid).dwellMin) || 0) * 60, 0);
     const live = k <= LIVE_TABLE_MAX;
     const bucket = planBucket(t0, dwellSum);
     const tab = await buildTable({ start: o.start, stops, end: o.end, links, mem: o.mem, bucket, planMs: t0, nowMs, live, liveDepartMs: t0, fetchLeg: o.fetchLeg, onProgress: o.onProgress, seen: o.seen });

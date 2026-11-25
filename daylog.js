@@ -476,6 +476,8 @@
       }
       changed.push(j);
     });
+    // First stop is for one day only: End day (and so the carry-forward to tomorrow) clears it on every job
+    (jobs || []).forEach((j) => { if (j && j.firstStop) { delete j.firstStop; if (changed.indexOf(j) < 0) changed.push(j); } });
     appendEvent(day, { t: nowIso, type: 'endday' });
     day.closed = true; day.endedAt = nowIso; day.closedAt = nowIso;
     refreshTotals(day, jobs, places);

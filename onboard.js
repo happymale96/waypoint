@@ -250,7 +250,8 @@
   function jobsForPlan(jobs, plan) {
     const skipped = ((plan && plan.stops) || []).filter((s) => s && s.status === 'skipped' && !s.fuel);
     if (!skipped.length) return jobs;
-    const held = (j, kind, pid) => skipped.some((s) => s.placeId === pid && (s.actions || []).some((a) => a.jobId === j.id && a.kind === kind));
+    const base = (id) => (typeof id === 'string' && id.length > 2 && id.slice(-2) === '#2' ? id.slice(0, -2) : id); // a second visit '<place>#2' (solver.js)
+    const held = (j, kind, pid) => skipped.some((s) => base(s.placeId) === pid && (s.actions || []).some((a) => a.jobId === j.id && a.kind === kind));
     const out = [];
     (jobs || []).forEach((j) => {
       if (j.errandPlaceId) { if (!held(j, 'errand', j.errandPlaceId)) out.push(j); return; }
