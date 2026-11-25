@@ -491,6 +491,72 @@ async function main() {
     await clickPrimary(iB);
     await waitFor(planStop('qB') + '.reachedAt != null', 'the manual Reached at B');
     check(await ev(planStop('qB') + '.reachedSource') === 'tap', 'a manual Reached tap on a not-yet-collectable delivery still works');
+
+    console.log('10. a delivery is never completed before its item is collected (Office: errand E, in-hand H, delivery D from P)');
+    await send('Page.navigate', { url: 'about:blank' });
+    await sleep(500);
+    await send('Storage.clearDataForOrigin', { origin: new URL(appUrl).origin, storageTypes: 'local_storage' });
+    await send('Page.navigate', { url: appUrl });
+    await waitFor('document.querySelector("#planBtn")', 'the Plan tab (fourth world)');
+    const W4 = {
+      'waypoint:places:qO': { id: 'qO', name: 'Office (L-Tech)', address: 'O', lat: 3.10, lng: 101.60, type: 'office', dwellMin: 10, closedWindows: [] },
+      'waypoint:places:qP': { id: 'qP', name: 'Pacific Klang Oil Seals Sdn Bhd', address: 'P', lat: 3.04, lng: 101.45, type: 'supplier', dwellMin: 10, closedWindows: [] },
+      'waypoint:jobs:E': { id: 'E', pickups: [], deliveryPlaceId: null, errandPlaceId: 'qO', dwellMin: 10, notes: 'Sign forms', urgent: false, urgentRank: 0, arriveBefore: null, arriveAfter: null, status: 'pending', doneAt: null, createdAt: '2026-11-25T00:00:00.000Z' },
+      'waypoint:jobs:H': { id: 'H', pickups: [], inHandItem: 'Spare fuse', deliveryPlaceId: 'qO', notes: '', urgent: false, urgentRank: 0, arriveBefore: null, arriveAfter: null, status: 'pending', doneAt: null, createdAt: '2026-11-25T00:01:00.000Z' },
+      'waypoint:jobs:D': { id: 'D', pickups: [{ placeId: 'qP', item: 'Whole sample set with mech seal' }], deliveryPlaceId: 'qO', notes: '', urgent: false, urgentRank: 0, arriveBefore: null, arriveAfter: null, status: 'pending', doneAt: null, createdAt: '2026-11-25T00:02:00.000Z' },
+    };
+    await ev('(() => { Object.keys(localStorage).filter((k) => /^waypoint:(jobs|places|plan|daylogs):/.test(k) && k !== "waypoint:places:home").forEach((k) => localStorage.removeItem(k)); const w = ' + JSON.stringify(W4) + '; Object.keys(w).forEach((k) => localStorage.setItem(k, JSON.stringify(w[k]))); return true; })()');
+    await send('Page.navigate', { url: appUrl });
+    await waitFor('document.querySelector("#planBtn")', 'the Plan tab (fourth world, reloaded)');
+    await ev('(() => { const p = WaypointDebug.S.places.qO; window.__gps = { lat: p.lat + 0.03, lng: p.lng + 0.02, accuracy: 20 }; return true; })()'); // near the Office, not at it
+    await click('#planBtn');
+    await waitFor('window.WaypointDebug && WaypointDebug.S.plan && WaypointDebug.S.tab === "route" && document.querySelectorAll(".timeline .card.stop").length === 2', 'the P / Office route', 12000);
+    const pend = (id) => 'WaypointDebug.S.plan.result.plans[0].stops.find((s) => s.placeId === ' + JSON.stringify(id) + ' && !s.status)';
+    const pIdx = (id) => ev('WaypointDebug.S.plan.result.plans[0].stops.findIndex((s) => s.placeId === ' + JSON.stringify(id) + ' && !s.status)');
+    const job = (id) => ev('(() => { const j = WaypointDebug.S.jobs.find((x) => x.id === ' + JSON.stringify(id) + '); return j ? { status: j.status, doneAt: j.doneAt || null, picked: (j.pickups || []).map((p) => !!p.done) } : null; })()');
+    const bannerText = () => ev('(() => { const b = document.getElementById("banner"); return b && !b.hidden ? b.textContent : ""; })()');
+    const order0 = await ev('WaypointDebug.S.plan.result.plans[0].stops.map((s) => s.placeId)');
+    check(order0.indexOf('qP') < order0.indexOf('qO'), 'the plan has P before the Office', order0);
+    // the driver goes to the Office first: REACHED, then DONE on the Office card
+    const officeAt = async () => { const i = await pIdx('qO'); await clickPrimary(i); await waitFor(pend('qO') + '.reachedAt != null', 'Reached at the Office'); await advanceMs(2000); return i; };
+    const iO = await officeAt();
+    await clickPrimary(iO);
+    await waitFor('WaypointDebug.S.plan.result.plans[0].stops.some((s) => s.placeId === "qO" && s.status === "done")', 'DONE at the Office');
+    const [e1, hJ, d1] = [await job('E'), await job('H'), await job('D')];
+    check(e1.status === 'done' && hJ.status === 'done', 'E and H are done', [e1, hJ]);
+    check(d1.status === 'pending' && d1.doneAt == null && d1.picked[0] === false, 'D stays open, no done time', d1);
+    const n1 = await bannerText();
+    check(/Whole sample set with mech seal \(Pacific Klang Oil Seals\) — not collected yet, left open\. Tap PLAN to schedule it\./.test(n1), 'the notice names D and Pacific Klang', n1);
+    const dlog1 = await ev('(() => { const d = WaypointDebug.S.days[Object.keys(WaypointDebug.S.days).sort().pop()]; return d.events.filter((e) => e.type === "done").map((e) => e.jobId + ":" + e.kind); })()');
+    check(dlog1.indexOf('D:deliver') < 0 && dlog1.indexOf('E:errand') >= 0 && dlog1.indexOf('H:deliver') >= 0, 'the day log has E and H, not D', dlog1);
+    // PLAN on the running day: D's pickup at P, then a later Office stop
+    await click('#tabs button[data-tab="plan"]');
+    await sleep(150);
+    await click('#planBtn');
+    await waitFor('WaypointDebug.S.tab === "route" && ' + pend('qP') + ' && ' + pend('qO'), 'the PLAN with P and a later Office', 12000);
+    const iP2 = await pIdx('qP'), iO2 = await pIdx('qO');
+    check(iP2 >= 0 && iO2 > iP2, 'PLAN: P comes before the later Office stop', { iP2, iO2 });
+    // A3: the new Office card holds only D: DONE before P completes nothing and the stop stays
+    await officeAt();
+    await ev('(() => { document.getElementById("banner").hidden = true; return true; })()');
+    await clickPrimary(await pIdx('qO'));
+    await sleep(400);
+    check(!!(await ev(pend('qO'))) && (await job('D')).status === 'pending', 'A3: DONE on a card of only uncollected deliveries completes nothing; the stop stays');
+    check(/not collected yet, left open/.test(await bannerText()), 'A3: the same notice', await bannerText());
+    // collect at P, then complete the Office: D done
+    const iP = await pIdx('qP');
+    await clickPrimary(iP); await waitFor(pend('qP') + '.reachedAt != null', 'Reached at P'); await advanceMs(2000);
+    await clickPrimary(await pIdx('qP'));
+    await waitFor('!(' + pend('qP') + ')', 'DONE at P');
+    check((await job('D')).picked[0] === true, 'D collected at P');
+    await advanceMs(2000);
+    await clickPrimary(await pIdx('qO'));
+    await waitFor('!(' + pend('qO') + ')', 'DONE at the later Office');
+    const d3 = await job('D');
+    check(d3.status === 'done' && d3.doneAt != null, 'D done at the later Office', d3);
+    const csv = await ev('(() => { const d = WaypointDebug.S.days[Object.keys(WaypointDebug.S.days).sort().pop()]; return DayLog.toCSV(DayLog.summarise(d, WaypointDebug.S.jobs, WaypointDebug.S.places)); })()');
+    const rowD = csv.split('\r\n').find((l) => l.indexOf('Whole sample set with mech seal') >= 0) || '';
+    check(/^[^,]+,[^,]+,delivery,Whole sample set with mech seal,Pacific Klang Oil Seals,Office \(L-Tech\),\d\d:\d\d,\d\d:\d\d,done,/.test(rowD), 'CSV: D with its collected and done times', rowD);
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {
     await cleanup();

@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '04cd32e2'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '4058925d'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -773,6 +773,13 @@
         ? h('div', { class: 'job-actions' }, h('span', { class: 'sub' }, 'Delete this job?'),
           h('button', { class: 'small', onclick: () => drawFoot(false) }, 'Cancel'),
           h('button', { class: 'small danger', onclick: async () => {
+            // deleted while the day runs and the job was in today's plan: the day log records it like Route -> Cancel job (status
+            // "cancelled", no reason; never carried). No day running: simply deleted (OnBoard.cancelOnDelete says which).
+            try {
+              const running = !!(S.plan && dayRunning()), day = running ? S.days[planDayKey()] : null;
+              const c = OnBoard.cancelOnDelete({ job: j, plan: curPlan(), day, running, nameOf: placeNameOf });
+              if (c) { DL.recordCancel(day, { nowIso: new Date().toISOString(), jobId: c.jobId, item: c.item, place: c.place, via: 'plan-delete' }); if (day.decisions[c.jobId]) delete day.decisions[c.jobId].reason; await saveDay(day); }
+            } catch (e) { /* never block the delete */ }
             await WPStore.remove('jobs', j.id); S.jobs = S.jobs.filter((x) => x !== j);
             if (S.plan && dayRunning()) { S.plan.jobsChanged = true; await savePlan(); } // the Route is NOT changed: the "tap PLAN" notice
             render();
@@ -1476,6 +1483,7 @@
     }
     if (day) { DL.recordUndo(day, { nowIso: new Date().toISOString(), stopId: stop.placeId }); bgSaveDay(day); }
     cur.stops[li] = Reached.undoDone(stop); // pending again; reachedAt / reachedSource stay (the stop is back to "reached")
+    if (stop.leftOpen) { cur.stops[li].actions = stop.actions.concat(stop.leftOpen); delete cur.stops[li].leftOpen; } // the deliveries left open are back on the card
     S.loc.origin = null;
     P.prompt = null;
     retimeNow();
@@ -1629,7 +1637,9 @@
 
       const urgentChip = h('span', { class: 'chip urgent' }, 'URGENT'), lateChip = h('span', { class: 'chip late' }, 'LATE');
       const collected = sec('Collected', 'collect', s.collected.map((c) => line(h('span', null, c.item || '(item)', ' - ', c.place), hm(c.t))), 'Nothing collected');
-      const delivered = sec('Delivered', 'deliver', s.delivered.map((d) => line(h('span', null, d.item || '(item)', ' - ', d.place), hm(d.t),
+      // a delivered item collected today lists its source on the same line, with the collected time: "· from Pacific Klang 10:05"
+      const delivered = sec('Delivered', 'deliver', s.delivered.map((d) => line(h('span', null, d.item || '(item)', ' - ', d.place,
+        d.from && d.collectedAt != null ? h('span', { class: 'muted sum-src' }, ' · from ' + d.from + ' ' + hm(d.collectedAt)) : null), hm(d.t),
         [d.urgent ? urgentChip.cloneNode(true) : null, d.late ? lateChip.cloneNode(true) : null].filter(Boolean))), 'Nothing delivered');
       const errands = sec('Errands done', 'errand', s.errands.map((e) => line(h('span', null, e.item, ' - ', e.place), hm(e.t))), 'No errands');
       const fuelLine = s.fuel ? h('div', { class: 'card sum-sec fuel', id: 'sumFuel' }, line('Fuel: ' + s.fuel.place + ' ' + hm(s.fuel.t))) : null;
@@ -2248,6 +2258,11 @@
     if (!ls) return;
     const stop = ls.stop, i = ls.i;
     const nowIso = new Date().toISOString();
+    // a delivery whose item is not collected yet is never completed: it stays open on its job (OnBoard.doneSplit); a card holding
+    // nothing else completes nothing and stays as it is. Either way the notice names the item and where it is collected.
+    const split = stop.fuel ? { apply: stop.actions || [], held: [], notice: null } : OnBoard.doneSplit(stop, S.jobs, placeNameOf);
+    if (split.held.length && !split.apply.length) { banner(split.notice, 'info'); return; }
+    if (split.held.length) { stop.leftOpen = split.held; stop.actions = split.apply; } // Undo of this DONE puts them back on the card
     for (const a of stop.actions) {
       const j = S.jobs.find((x) => x.id === a.jobId);
       if (!j) continue;
@@ -2283,7 +2298,7 @@
     if (!plan.stops.some((s) => !s.status)) toast('Run complete 🎉');
     await savePlan();
     render();
-    dayCompleteBanner();
+    if (split.notice) banner(split.notice, 'info'); else dayCompleteBanner();
     afterStop('done'); // after DONE: the live look-ahead (Part F) or one next-stop re-time; never blocks
   }
 

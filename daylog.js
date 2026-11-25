@@ -29,10 +29,12 @@
 
   const SCHEMA = 1;
   const KEEP_DAYS = 120;
-  const REPAIR_VERSION = 2; // one-time history repair (see repairHistory / runRepairOnce)
+  const REPAIR_VERSION = 3; // one-time history repair (see repairHistory / repair25Nov / runRepairOnce)
   const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  // The reason chips of a not-done job. A reason is only ever what the driver tapped (day.decisions[jobId].reason): nothing infers one.
   const REASONS = ['Closed', 'Item not ready', 'Ran out of time', 'Customer postponed', 'Other'];
-  const CSV_HEADER = ['date', 'driver', 'type', 'item', 'from', 'to', 'done time', 'status', 'reason', 'urgent', 'late'];
+  const CANCELLED = 'cancelled'; // the CSV status of a job cancelled that day (Route: SKIP -> Cancel job; deleted on Plan while the day runs)
+  const CSV_HEADER = ['date', 'driver', 'type', 'item', 'from', 'to', 'collected time', 'done time', 'status', 'reason', 'urgent', 'late'];
   const SUFFIX_RE = /[\s,]+(?:sdn\.?\s*bhd\.?|s\/b\.?|bhd\.?)\s*$/i; // same display rule as the app's dName()
   const pad2 = (n) => (n < 10 ? '0' : '') + n;
   const clean = (n) => { const s = String(n == null ? '' : n); const t = s.replace(SUFFIX_RE, '').trim(); return t || s; };
@@ -156,8 +158,10 @@
   }
   // A job cancelled mid-day (Route card: SKIP -> Cancel job) and its Undo. info: {nowIso, jobId, item, place}. A cancelled job is out of
   // the day's rows (never Not done, never carried to tomorrow) and listed under "Cancelled" (item and place).
+  // info.via: 'route' (default) | 'plan-delete' (the job was deleted on the Plan tab while the day was running) | 'repair'.
   function recordCancel(day, info) {
     const e = { t: info.nowIso, type: 'cancel', jobId: info.jobId, stopId: null, lat: null, lng: null, accuracy: null, item: info.item || '', place: info.place || '' };
+    if (info.via && info.via !== 'route') e.via = info.via;
     day.events.push(e);
     return e;
   }
@@ -170,7 +174,7 @@
   function cancelsOf(day) {
     const out = [];
     (day.events || []).forEach((e) => {
-      if (e.type === 'cancel') out.push({ jobId: e.jobId, item: e.item || '', place: e.place || '', t: ms(e.t) });
+      if (e.type === 'cancel') out.push({ jobId: e.jobId, item: e.item || '', place: e.place || '', t: ms(e.t), via: e.via || 'route' });
       else if (e.type === 'undo' && e.of === 'cancel') { for (let i = out.length - 1; i >= 0; i--) if (out[i].jobId === e.jobId) { out.splice(i, 1); break; } }
     });
     return out;
@@ -183,9 +187,11 @@
   // The driver's lunch break (Route tab bar): the real interval, on the day record. An assumed break never started is not logged.
   function recordBreakStart(day, info) { day.breakStartedAt = info.nowIso; day.breakEndedAt = null; day.timeSplitV = TIME_SPLIT_V; }
   function recordBreakEnd(day, info) { if (day.breakStartedAt) day.breakEndedAt = info.nowIso; }
+  // A pickup's event also carries collectedAt (the time the item was collected: the CSV "collected time"); older records have none.
   function recordDone(day, info) { // info: {nowIso, stopId, actions:[{jobId,kind,item}], places{}, reachedAt?, reachedSource?, dwellMin?}
     snapPlace(day, info.places, info.stopId);
-    return info.actions.map((a) => appendEvent(day, Object.assign({ t: info.nowIso, type: 'done', jobId: a.jobId || null, stopId: info.stopId, kind: a.kind, item: a.item || '' }, reachedFields(info))));
+    return info.actions.map((a) => appendEvent(day, Object.assign({ t: info.nowIso, type: 'done', jobId: a.jobId || null, stopId: info.stopId, kind: a.kind, item: a.item || '' },
+      a.kind === 'pickup' ? { collectedAt: info.nowIso } : {}, reachedFields(info))));
   }
   // The fuel stop: recorded as a stop with its done time (kind 'fuel', no job). It is never a job: job counts ignore it and
   // closeDay never carries it forward. info: {nowIso, stopId, name, places{}}
@@ -328,17 +334,19 @@
     const placeOf = (id) => (places && places[id]) || day.places[id] || null;
     const nameOf = (id) => (placeOf(id) ? clean(placeOf(id).name) : '(deleted place)');
     const groups = doneGroups(day);
-    const active = [].concat(...groups.map((g) => g.events));
+    // a done event voided by a repair (e.voided) still counts as a visit (km, times, the stop order) but never completes a job
+    const active = [].concat(...groups.map((g) => g.events)).filter((e) => !e.voided);
     const dayStart = dayStartMs(day.date);
     const snap = day.planSnapshot;
 
-    // scope = every job planned that day (+ any job with a done event), minus the jobs cancelled that day (listed apart)
+    // scope = every job planned that day (+ any job with a done event), minus the jobs cancelled that day (listed apart).
+    // A cancel counts while its job is cancelled or gone (deleted); a repair's cancel (via 'repair') counts whatever the job says.
     const cancelled = cancelsOf(day);
-    const cancelledIds = new Set(cancelled.map((c) => c.jobId).filter((id) => !jobMap[id] || jobMap[id].status === 'cancelled'));
+    const cancelledIds = new Set(cancelled.filter((c) => c.via === 'repair' || !jobMap[c.jobId] || jobMap[c.jobId].status === 'cancelled').map((c) => c.jobId));
     const ids = Object.keys(day.jobsSnap).filter((id) => !cancelledIds.has(id));
     active.forEach((e) => { if (e.jobId && ids.indexOf(e.jobId) < 0 && !cancelledIds.has(e.jobId)) ids.push(e.jobId); });
 
-    const rows = ids.map((id) => {
+    const rowOf = (id) => {
       const live = jobMap[id], sn = day.jobsSnap[id];
       const base = sn || (live ? snapJob(live) : { id, kind: 'delivery', pickups: [], deliveryPlaceId: null, errandPlaceId: null, inHandItem: '', urgent: false, arriveBefore: null, notes: '' });
       const evs = active.filter((e) => e.jobId === id);
@@ -364,13 +372,22 @@
       const late = !!(type !== 'errand' && dl.length && winMin != null && doneMs != null && Math.floor((doneMs - dayStart) / 60000) > winMin);
       const withYou = !complete && !isErrand && type !== 'collect' && (type === 'in-hand' || collectedAny);
       const carry = dec.carry !== false;
+      // collected time = the latest pickup of this job that day that recorded one (blank: in hand, errands, older records)
+      const colMs = pk.reduce((m, e) => { const c = ms(e.collectedAt || null); return c != null && !isNaN(c) && (m == null || c > m) ? c : m; }, null);
       return {
         jobId: id, type, item: items.join(', '), from: type === 'in-hand' ? 'in hand' : fromIds.map(nameOf).join(' + '), to: toId ? nameOf(toId) : '',
-        fromIds, toId, doneMs, complete, withYou, collectedAll, collectedAny,
+        fromIds, toId, doneMs, collectedMs: isErrand || type === 'in-hand' ? null : colMs, complete, withYou, collectedAll, collectedAny,
         urgent: live ? !!live.urgent : !!base.urgent, late, reason: dec.reason || '', carry,
         status: complete ? 'done' : withYou ? 'collected, not delivered' : 'not done',
         notes: (live && live.notes) || base.notes || '',
       };
+    };
+    const rows = ids.map(rowOf);
+    // the cancelled jobs as rows too (the CSV lists them with status "cancelled"; they are never done, never carried)
+    const cancelledRows = cancelled.filter((c, i, a) => cancelledIds.has(c.jobId) && a.findIndex((x) => x.jobId === c.jobId) === i).map((c) => {
+      const r = Object.assign(rowOf(c.jobId), { complete: false, withYou: false, doneMs: null, carry: false, status: CANCELLED, cancelled: true });
+      if (!r.item) r.item = c.item; // a job known only from its cancel event
+      return r;
     });
 
     const collected = [], delivered = [], errands = [];
@@ -378,7 +395,8 @@
       const row = rows.find((r) => r.jobId === e.jobId);
       const t = ms(e.t);
       if (e.kind === 'pickup') collected.push({ jobId: e.jobId, item: e.item || (row && row.item) || '', place: nameOf(e.stopId), t });
-      else if (e.kind === 'deliver') delivered.push({ jobId: e.jobId, item: (row && row.item) || e.item || '', place: nameOf(e.stopId), t, urgent: !!(row && row.urgent), late: !!(row && row.late) });
+      else if (e.kind === 'deliver') delivered.push({ jobId: e.jobId, item: (row && row.item) || e.item || '', place: nameOf(e.stopId), t, urgent: !!(row && row.urgent), late: !!(row && row.late),
+        from: row && row.type === 'delivery' ? row.from : '', collectedAt: row ? row.collectedMs : null });
       else if (e.kind === 'errand') errands.push({ jobId: e.jobId, item: (row && row.item) || e.item || 'Errand', place: nameOf(e.stopId), t });
     });
 
@@ -469,7 +487,7 @@
       cancelled: cancelled.filter((c) => cancelledIds.has(c.jobId)).map((c) => ({ jobId: c.jobId, item: c.item, place: c.place, t: c.t })),
       notDone: rows.filter((r) => !r.complete),
       plan: { plannedKm: snap ? snap.plannedKm : null, plannedDriveMin: snap ? snap.plannedDriveMin : null, replans, outOfOrder, stopsDone: visitSeq.length, stopsPlanned: order.length },
-      rows,
+      rows, cancelledRows,
       route: { key, points: pts, needs: enough && pointsOk && (!mOk || !sOk), startDropped: planStartOk && !useStart },
     };
   }
@@ -567,6 +585,7 @@
       if (t == null || isNaN(t)) return;
       const key = dateKey(t), day = days[key];
       if (!day) return; // never create a record from job data alone
+      if (cancelsOf(day).some((c) => c.jobId === j.id)) return; // cancelled that day: never backfilled as done
       const iso = new Date(t).toISOString();
       const ev = (stopId, kind, item) => ({ t: iso, type: 'done', jobId: j.id, stopId, lat: null, lng: null, accuracy: null, kind, item: item || '', backfill: true });
       let evs = [];
@@ -603,8 +622,33 @@
     out.changed.forEach((k) => { if (days[k].closed) refreshTotals(days[k], jobs, places); });
     return out;
   }
+  // Repair 3 (once): the 25 Nov 2026 record. The Office card was completed before the Pacific Klang item was collected, so the
+  // delivery "Whole sample set with mech seal" (Pacific Klang Oil Seals -> Office) was marked done 11:01; the collect "Whole sample
+  // set" (Pacific Klang Oil Seals) was deleted on the Plan tab and exported as "not done - carried" / "Closed". Both become cancelled,
+  // reason "No longer needed"; the delivery's done event is voided (no done time; it stays a visit, so km and times are untouched).
+  // Matched by date + item + place. Either one not found = nothing changes. Never throws. -> {changed: bool, jobIds: []}
+  const R25 = { date: '2026-11-25', place: 'pacific klang oil seals', deliverItem: 'whole sample set with mech seal', collectItem: 'whole sample set', to: 'office', reason: 'No longer needed' };
+  function repair25Nov(days, jobs, places, nowIso) {
+    try {
+      const day = days && days[R25.date];
+      if (!day || !Array.isArray(day.events)) return { changed: false, jobIds: [] };
+      const norm = (s) => String(s || '').trim().toLowerCase();
+      const s = summarise(day, jobs, places);
+      const del = s.rows.find((r) => r.type === 'delivery' && r.complete && norm(r.item) === R25.deliverItem && norm(r.from).indexOf(R25.place) >= 0 && norm(r.to).indexOf(R25.to) >= 0);
+      const col = s.rows.find((r) => r.jobId !== (del && del.jobId) && r.type !== 'errand' && r.type !== 'in-hand' && !r.complete && norm(r.item) === R25.collectItem && norm(r.from).indexOf(R25.place) >= 0);
+      if (!del || !col) return { changed: false, jobIds: [] };
+      day.events.forEach((e) => { if (e.type === 'done' && e.jobId === del.jobId && e.kind === 'deliver' && !e.voided) e.voided = 'repair-2026-11-25'; });
+      [[del, del.to], [col, col.from]].forEach(([r, place]) => {
+        recordCancel(day, { nowIso: nowIso || new Date().toISOString(), jobId: r.jobId, item: r.item, place, via: 'repair' });
+        day.decisions[r.jobId] = Object.assign({}, day.decisions[r.jobId], { reason: R25.reason });
+      });
+      return { changed: true, jobIds: [del.jobId, col.jobId] };
+    } catch (e) { return { changed: false, jobIds: [], error: String(e && e.message || e) }; }
+  }
+
   // Runs the repair once per REPAIR_VERSION over a WPStore-like store ({get,set,list,remove}). Before changing anything
   // it copies the whole stored history to backup:daylogs-repair-<v>. Returns the repair result, or null if already done.
+  // A device already at version 2 runs only the new step (repair25Nov); the general repair (repairHistory) is not run again.
   async function runRepairOnce(store, jobs, places, nowIso) {
     const flag = await store.get('meta', 'daylogRepair');
     if (flag && flag.version >= REPAIR_VERSION) return null;
@@ -612,14 +656,19 @@
     const days = {};
     list.forEach((d) => { days[d.date] = d; });
     const fixed = JSON.parse(JSON.stringify(days)); // the repair works on a copy; storage is untouched until the backup exists
-    const res = repairHistory(fixed, jobs, places);
+    const res = flag && flag.version >= 2 ? { removed: [], backfilled: {}, changed: [], routeDropped: [] } : repairHistory(fixed, jobs, places);
+    res.nov25 = repair25Nov(fixed, jobs, places, nowIso);
+    if (res.nov25.changed) {
+      if (res.changed.indexOf(R25.date) < 0) res.changed.push(R25.date);
+      if (fixed[R25.date].closed) refreshTotals(fixed[R25.date], jobs, places);
+    }
     if (res.removed.length || res.changed.length) {
       const bk = 'daylogs-repair-' + REPAIR_VERSION;
       if (!(await store.get('backup', bk))) await store.set('backup', bk, { at: nowIso, days: list });
       for (const k of res.changed) await store.set('daylogs', k, fixed[k]);
       for (const k of res.removed) await store.remove('daylogs', k);
     }
-    await store.set('meta', 'daylogRepair', { version: REPAIR_VERSION, at: nowIso, removed: res.removed, backfilled: res.backfilled });
+    await store.set('meta', 'daylogRepair', { version: REPAIR_VERSION, at: nowIso, removed: res.removed, backfilled: res.backfilled, nov25: res.nov25.changed });
     return res;
   }
 
@@ -688,11 +737,12 @@
     const s = String(v == null ? '' : v);
     return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   }
-  function toCSV(sum) { // one row per job
+  function toCSV(sum) { // one row per job; the day's cancelled jobs last, status "cancelled"
     const lines = [CSV_HEADER.join(',')];
-    sum.rows.forEach((r) => {
-      const status = r.complete ? 'done' : r.status + (r.carry ? ' - carried' : ' - dropped');
-      lines.push([fmtDate(sum.date), sum.driverId, r.type, r.item, r.from, r.to, r.doneMs != null ? fmtTime(r.doneMs) : '', status, r.reason, r.urgent ? 'yes' : 'no', r.late ? 'yes' : 'no'].map(csvCell).join(','));
+    const tm = (v) => (v != null ? fmtTime(v) : '');
+    sum.rows.concat(sum.cancelledRows || []).forEach((r) => {
+      const status = r.cancelled ? CANCELLED : r.complete ? 'done' : r.status + (r.carry ? ' - carried' : ' - dropped');
+      lines.push([fmtDate(sum.date), sum.driverId, r.type, r.item, r.from, r.to, tm(r.collectedMs), tm(r.doneMs), status, r.reason, r.urgent ? 'yes' : 'no', r.late ? 'yes' : 'no'].map(csvCell).join(','));
     });
     return lines.join('\r\n') + '\r\n';
   }
@@ -721,7 +771,7 @@
   }
 
   return {
-    SCHEMA, KEEP_DAYS, REASONS, CSV_HEADER,
+    SCHEMA, KEEP_DAYS, REASONS, CSV_HEADER, CANCELLED, repair25Nov,
     dateKey, fmtDate, fmtTime, fmtDur, fmtKm, addDaysKey, dayStartMs, ageDays,
     newDay, appendEvent, recordPlan, recordReplan, recordDone, recordFuel, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, recordNav, recordSkip, recordUndoSkip, recordDropoff, recordUndoDropoff, recordCancel, recordUndoCancel, cancelsOf, recordBreakStart, recordBreakEnd, TIME_SPLIT_V, arrivedEnd, doneGroups, hasActiveDone,
     ptKey, legKey, seqKey, legFromMatrices, captureLeg, holdLeg, legsFrom, missingLegs, routedPairs, plannedFromMatrices,

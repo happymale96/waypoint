@@ -338,6 +338,40 @@
     const plan = state.plan && prev.stops ? Object.assign({}, state.plan, { stops: JSON.parse(JSON.stringify(prev.stops)), order: prev.order ? prev.order.slice() : prev.stops.map((s) => s.placeId) }) : state.plan;
     return { jobs, plan, loose };
   }
+  // DONE on a card (the tap, or any other path that completes a stop): a delivery whose item is not collected yet is NOT done.
+  // A deliver action is held when its job has a pickup that is not done and is not collected at this same stop by this DONE. Every
+  // other action (pickups, errands, in-hand deliveries, deliveries already collected, just-collect jobs) completes as before.
+  // stop = {placeId, actions}; jobs = [job]; nameOf(placeId) for the notice. -> {apply: [action], held: [action],
+  // notice: '<item> (<pickup place>) — not collected yet, left open. Tap PLAN to schedule it.' | null}
+  function doneSplit(stop, jobs, nameOf) {
+    const acts = (stop && stop.actions) || [];
+    const base = (id) => (typeof id === 'string' && id.length > 2 && id.slice(-2) === '#2' ? id.slice(0, -2) : id);
+    const here = base(stop && stop.placeId);
+    const nm = nameOf || ((id) => id);
+    const apply = [], held = [], lines = [];
+    acts.forEach((a) => {
+      const j = a.kind === 'deliver' ? findJob(jobs, a.jobId) : null;
+      const collectsHere = (p) => p.placeId === here && acts.some((x) => x.kind === 'pickup' && x.jobId === a.jobId);
+      const missing = j ? (j.pickups || []).filter((p) => !p.done && !collectsHere(p)) : [];
+      if (!missing.length) { apply.push(a); return; }
+      held.push(a);
+      const item = (a.item || '').trim() || uniq((j.pickups || []).map((p) => (p.item || '').trim()).filter(Boolean)).join(', ') || 'Item';
+      lines.push(item + ' (' + uniq(missing.map((p) => nm(p.placeId))).join(' + ') + ') — not collected yet, left open.');
+    });
+    return { apply, held, notice: lines.length ? lines.join(' ') + ' Tap PLAN to schedule it.' : null };
+  }
+  // A job deleted on the Plan tab: while the day is running and the job was in today's plan (a line on a stop of the current plan,
+  // or in the day log's plan snapshot) and not finished, the day log records it exactly like Route -> Cancel job (a cancel event:
+  // status "cancelled", no reason). Otherwise (no day running, not in today's plan, already done) nothing is logged: it is simply
+  // deleted. o = {job, plan, day, running, nameOf} -> {jobId, item, place} | null
+  function cancelOnDelete(o) {
+    const j = o && o.job;
+    if (!j || !o.running || !o.day || o.day.closed) return null;
+    if (j.status && j.status !== 'pending' && j.status !== 'parked') return null;
+    const onPlan = ((o.plan && o.plan.stops) || []).some((s) => (s.actions || []).some((a) => a.jobId === j.id));
+    const inSnap = !!(o.day.jobsSnap && o.day.jobsSnap[j.id]);
+    return onPlan || inSnap ? cancelInfo(j, o.nameOf) : null;
+  }
   // The jobs a Route card holds (pending stop): one entry per job, in card order -> [{jobId, kinds:[...], item}]
   function jobsOnCard(stop) {
     const out = [];
@@ -365,6 +399,6 @@
   return {
     STATUS, DROP_RADIUS_M, isCollectOnly, looseFromJob, addForJob, removeForJob, looseForCancel, addForCancel, dropOff, undoDrop, setDropPlace, convert, looseHeldAt,
     onBoard, barLabel, whenLabel, distanceM, nearestPlace, summaryExtra, backfillKeys, backfill, runBackfillOnce, exportLoose, importLoose,
-    isDayRunning, jobsForPlan, closedRouteCard, cancelFromPlan, jobsOnCard, cancelInfo, cancelJobs, undoCancel,
+    isDayRunning, jobsForPlan, closedRouteCard, cancelFromPlan, jobsOnCard, cancelInfo, cancelJobs, undoCancel, doneSplit, cancelOnDelete,
   };
 });
