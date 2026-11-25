@@ -41,7 +41,7 @@
   function deliveryOpenAt(j, at) {
     if (!j || j.errandPlaceId || !j.deliveryPlaceId) return false;
     if (j.status === 'done') { const d = toMs(j.doneAt); return d != null && d > at; }
-    if (j.status === 'dropped') return false;
+    if (j.status === 'dropped' || j.status === 'cancelled') return false;
     return true;
   }
 
@@ -65,6 +65,30 @@
     return !it || (list || []).some((x) => x.id === it.id) ? (list || []) : (list || []).concat([it]);
   };
   const removeForJob = (list, jobId) => (list || []).filter((x) => x.sourceJobId !== jobId);
+  // A job CANCELLED mid-day whose item is already with the driver (a pickup collected; or an in-hand item not tracked by a loose item)
+  // leaves that item in the loose store (same shape, id loose_<jobId>); Undo of the cancel removes it again (removeForJob).
+  function looseForCancel(job, ctx) {
+    if (!job || job.errandPlaceId) return null;
+    const nameOf = (ctx && ctx.nameOf) || ((id) => id);
+    const at = ctx && ctx.at != null ? ctx.at : Date.now();
+    const got = (job.pickups || []).filter((p) => p.done);
+    if (!got.length) {
+      if ((job.pickups || []).length || job.looseId) return null; // nothing collected yet / the loose item tracks itself again
+      return { id: 'loose_' + job.id, item: job.inHandItem || '', notes: job.notes || '', collectedFrom: '', collectedAt: isoOf(at), sourceJobId: job.id, status: 'with-me' };
+    }
+    const last = got.reduce((m, p) => Math.max(m, toMs(p.doneAt) || 0), 0);
+    return {
+      id: 'loose_' + job.id,
+      item: uniq(got.map((p) => (p.item || '').trim()).filter(Boolean)).join(', '),
+      notes: job.notes || '',
+      collectedFrom: uniq(got.map((p) => nameOf(p.placeId))).join(' + '),
+      collectedAt: isoOf(last || at), sourceJobId: job.id, status: 'with-me',
+    };
+  }
+  const addForCancel = (list, job, ctx) => {
+    const it = looseForCancel(job, ctx);
+    return !it || (list || []).some((x) => x.id === it.id) ? (list || []) : (list || []).concat([it]);
+  };
   const mapItem = (list, id, fn) => (list || []).map((x) => (x.id === id ? fn(Object.assign({}, x)) : x));
 
   function dropOff(list, id, atMs, placeName) {
@@ -95,7 +119,7 @@
       const cv = toMs(it.convertedAt);
       if (cv != null && cv > at) return true;
       const j = findJob(jobs, it.convertedJobId);
-      return !j || j.status === 'dropped';
+      return !j || j.status === 'dropped' || j.status === 'cancelled';
     }
     return true;
   }
@@ -262,6 +286,69 @@
     });
     return out;
   }
+  // Cancel jobs on today's route: every pending stop loses those jobs' lines (pickups, delivery, errand); a pending stop left with
+  // nothing is removed; done / skipped stops stay as they were. Returns a new plan (order follows the stops); the input is untouched.
+  function cancelFromPlan(plan, jobIds) {
+    const ids = new Set(jobIds || []);
+    const stops = [];
+    (plan.stops || []).forEach((s) => {
+      if (s.status || s.fuel) { stops.push(s); return; }
+      const acts = (s.actions || []).filter((a) => !ids.has(a.jobId));
+      if (!acts.length && (s.actions || []).length) return;
+      stops.push(acts.length === (s.actions || []).length ? s : Object.assign({}, s, { actions: acts }));
+    });
+    return Object.assign({}, plan, { stops, order: stops.map((s) => s.placeId) });
+  }
+  // What a cancelled job is called in the summary: its item and its place (the delivery, else the errand, else its last pickup).
+  function cancelInfo(j, nameOf) {
+    const nm = nameOf || ((id) => id);
+    const pk = j.pickups || [];
+    const item = j.errandPlaceId ? (j.notes || 'Errand') : (uniq(pk.map((p) => (p.item || '').trim()).filter(Boolean)).join(', ') || j.inHandItem || '');
+    const pid = j.deliveryPlaceId || j.errandPlaceId || (pk.length ? pk[pk.length - 1].placeId : null);
+    return { jobId: j.id, item, place: pid ? nm(pid) : '' };
+  }
+  // CANCEL jobs mid-day (Route card: SKIP -> Cancel job). state = {jobs, plan, loose}; ctx = {nameOf, at (ms)}.
+  // Each job becomes status 'cancelled' (never pending again: PLAN never brings it back, End day never carries it); today's plan loses
+  // its lines and any stop left empty (cancelFromPlan); an item already collected goes to the loose store (With you). Pure: returns
+  // {jobs, plan, loose, cancelled:[{jobId, item, place}], prev} where prev is what undoCancel needs.
+  function cancelJobs(state, ids, ctx) {
+    const at = ctx && ctx.at != null ? ctx.at : Date.now();
+    const want = new Set(ids || []);
+    const prev = { jobs: {}, stops: state.plan ? JSON.parse(JSON.stringify(state.plan.stops || [])) : null, order: state.plan && state.plan.order ? state.plan.order.slice() : null, loose: (state.loose || []).slice() };
+    let loose = (state.loose || []).slice();
+    const cancelled = [];
+    const jobs = (state.jobs || []).map((j) => {
+      if (!want.has(j.id) || (j.status && j.status !== 'pending')) return j;
+      prev.jobs[j.id] = JSON.parse(JSON.stringify(j));
+      const c = Object.assign({}, j, { status: 'cancelled', cancelledAt: isoOf(at) });
+      cancelled.push(cancelInfo(j, ctx && ctx.nameOf));
+      loose = addForCancel(loose, j, { nameOf: ctx && ctx.nameOf, at });
+      return c;
+    });
+    const done = cancelled.map((c) => c.jobId);
+    const plan = state.plan ? cancelFromPlan(state.plan, done) : null;
+    return { jobs, plan, loose, cancelled, prev };
+  }
+  // Undo of a cancel: the jobs, their stops and lines (the plan as it was) and the loose store come back. -> {jobs, plan, loose}
+  function undoCancel(state, prev) {
+    const jobs = (state.jobs || []).map((j) => (prev.jobs[j.id] ? JSON.parse(JSON.stringify(prev.jobs[j.id])) : j));
+    const ids = new Set(Object.keys(prev.jobs));
+    const had = new Set((prev.loose || []).map((x) => x.id));
+    const loose = (state.loose || []).filter((x) => !(ids.has(x.sourceJobId) && !had.has(x.id)));
+    const plan = state.plan && prev.stops ? Object.assign({}, state.plan, { stops: JSON.parse(JSON.stringify(prev.stops)), order: prev.order ? prev.order.slice() : prev.stops.map((s) => s.placeId) }) : state.plan;
+    return { jobs, plan, loose };
+  }
+  // The jobs a Route card holds (pending stop): one entry per job, in card order -> [{jobId, kinds:[...], item}]
+  function jobsOnCard(stop) {
+    const out = [];
+    ((stop && stop.actions) || []).forEach((a) => {
+      let r = out.find((x) => x.jobId === a.jobId);
+      if (!r) { r = { jobId: a.jobId, kinds: [], item: '' }; out.push(r); }
+      r.kinds.push(a.kind);
+      if (!r.item && a.item) r.item = a.item;
+    });
+    return out;
+  }
   // The Route tab of a closed day: today's record is closed and no PLAN / replan has been made since -> {closedAtMs}, else null.
   function closedRouteCard(day) {
     if (!day || !day.closed) return null;
@@ -276,8 +363,8 @@
   }
 
   return {
-    STATUS, DROP_RADIUS_M, isCollectOnly, looseFromJob, addForJob, removeForJob, dropOff, undoDrop, setDropPlace, convert, looseHeldAt,
+    STATUS, DROP_RADIUS_M, isCollectOnly, looseFromJob, addForJob, removeForJob, looseForCancel, addForCancel, dropOff, undoDrop, setDropPlace, convert, looseHeldAt,
     onBoard, barLabel, whenLabel, distanceM, nearestPlace, summaryExtra, backfillKeys, backfill, runBackfillOnce, exportLoose, importLoose,
-    isDayRunning, jobsForPlan, closedRouteCard,
+    isDayRunning, jobsForPlan, closedRouteCard, cancelFromPlan, jobsOnCard, cancelInfo, cancelJobs, undoCancel,
   };
 });

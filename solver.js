@@ -76,6 +76,7 @@
     const alias = {};
     active.forEach((j) => { if (j.visit2 && j.visit2 !== first) alias[j.visit2] = j.visit2 + VISIT2; });
     const keyOf = (pid) => (pid === first ? pid : alias[pid] || pid);
+    const entry = {}; // jobId -> the stop key of "this entry's stop" (the After rule): its delivery, else its last pending pickup, else the errand
     const get = (key) => {
       if (!map[key]) {
         map[key] = { placeId: baseId(key), pickups: [], deliveries: [], errands: [], errandDwell: null };
@@ -86,6 +87,7 @@
     active.forEach((j) => {
       if (isErrand(j)) {
         const s = get(keyOf(j.errandPlaceId));
+        entry[j.id] = keyOf(j.errandPlaceId);
         s.errands.push({ jobId: j.id, kind: 'errand', item: j.notes || 'Errand' });
         if (j.dwellMin != null && j.dwellMin !== '') {
           s.errandDwell = Math.max(s.errandDwell || 0, Number(j.dwellMin));
@@ -94,16 +96,78 @@
       }
       const pk = j.pickups || [];
       const items = pk.map((p) => p.item).filter(Boolean).join(', ');
-      pk.filter((p) => !p.done).forEach((p) =>
-        get(keyOf(p.placeId)).pickups.push({ jobId: j.id, kind: 'pickup', item: p.item || '' }));
+      pk.filter((p) => !p.done).forEach((p) => {
+        get(keyOf(p.placeId)).pickups.push({ jobId: j.id, kind: 'pickup', item: p.item || '' });
+        entry[j.id] = keyOf(p.placeId);
+      });
       if (j.deliveryPlaceId) {
         const d = j.deliveryPlaceId;
         const later = d === first && pk.some((p) => !p.done && p.placeId !== d); // collected elsewhere today: the second visit
-        get(later ? d + VISIT2 : keyOf(d)).deliveries.push({ jobId: j.id, kind: 'deliver', item: items });
+        const dk = later ? d + VISIT2 : keyOf(d);
+        get(dk).deliveries.push({ jobId: j.id, kind: 'deliver', item: items });
+        entry[j.id] = dk;
       }
     });
-    return { stopIds: order, stops: map, jobs: active, first: first != null && map[first] ? first : null, keyOf };
+    return { stopIds: order, stops: map, jobs: active, first: first != null && map[first] ? first : null, keyOf, entry };
   }
+
+  // ---------- the "After" rule (one day only; job.afterPlaces = [placeId]) ----------
+  // "This entry's stop" (its delivery, else its last pending pickup, else the errand place) comes after the LAST visit today to each
+  // chosen place: a hard "must come before" edge from every pending stop of that place, like collect-before-deliver. A chosen place with
+  // nothing pending today (done, skipped, cancelled) is satisfied. An impossible rule (on the First stop, or a cycle through other After
+  // rules or collect-before-deliver) is left out, never silently: one text per impossible group, "Can't put X after Y: ... Remove one of
+  // the rules." First stop and collect-before-deliver always win. hard = the masks of those rules (stop index -> stops that must come
+  // earlier). Returns {kept: masks of the After edges kept, conflicts: [text]}.
+  function ancestors(pre, k) { // transitive closure: anc[i] = every stop that must come before i
+    const anc = pre.slice();
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let i = 0; i < k; i++) {
+        let a = anc[i];
+        for (let j = 0; j < k; j++) if (a & (1 << j)) a |= anc[j];
+        if (a !== anc[i]) { anc[i] = a; changed = true; }
+      }
+    }
+    return anc;
+  }
+  function afterRules(bs, idx, hard, firstIdx, nameOf) {
+    const k = bs.stopIds.length;
+    const kept = new Array(k).fill(0), conflicts = [], edges = [];
+    bs.jobs.forEach((j) => {
+      const list = Array.isArray(j.afterPlaces) ? j.afterPlaces.filter((p, n, a) => typeof p === 'string' && a.indexOf(p) === n) : [];
+      const ek = bs.entry[j.id];
+      if (!list.length || ek == null || idx[ek] == null) return;
+      const e = idx[ek];
+      list.forEach((p) => {
+        const ts = [];
+        bs.stopIds.forEach((key, i) => { if (i !== e && baseId(key) === p) ts.push(i); });
+        if (!ts.length) return; // nothing pending there today: satisfied
+        if (e === firstIdx) { conflicts.push(cantText(nameOf(ek), nameOf(p), nameOf(ek) + ' is the First stop')); return; }
+        edges.push({ e, ts, ek, p });
+      });
+    });
+    if (!edges.length) return { kept, conflicts };
+    const all = hard.slice();
+    edges.forEach((x) => x.ts.forEach((t) => { all[x.e] |= 1 << t; }));
+    const anc = ancestors(all, k), ancHard = ancestors(hard, k);
+    const groups = [];
+    edges.forEach((x) => {
+      const onCycle = x.ts.some((t) => anc[t] & (1 << x.e)); // e must already come before t: a cycle
+      if (!onCycle) { x.ts.forEach((t) => { kept[x.e] |= 1 << t; }); return; }
+      let scc = 1 << x.e; // the stops mutually ordered with e: one message per group
+      for (let i = 0; i < k; i++) if ((anc[i] & (1 << x.e)) && (anc[x.e] & (1 << i))) scc |= 1 << i;
+      const hardWay = x.ts.some((t) => ancHard[t] & (1 << x.e));
+      const g = groups.find((y) => y.scc === scc);
+      const text = cantText(nameOf(x.ek), nameOf(x.p), hardWay
+        ? nameOf(x.p) + ' has to come after ' + nameOf(x.ek) + ' (an item collected at ' + nameOf(x.ek) + ' is delivered there)'
+        : nameOf(x.p) + ' is already set to come after ' + nameOf(x.ek));
+      if (g) g.text = text; else groups.push({ scc, text }); // the rule that closes the circle is the one named
+    });
+    groups.forEach((g) => conflicts.push(g.text));
+    return { kept, conflicts };
+  }
+  const cantText = (a, b, why) => "Can't put " + a + ' after ' + b + ': ' + why + '. Remove one of the rules.';
   // pending pickup -> its delivery, as stop keys ([[pickupKey, deliveryKey]]): the reversed pairs are never needed
   function linksOf(bs) {
     const out = [];
@@ -206,7 +270,7 @@
     // static prerequisites (bitmasks over stop indices)
     let urgentDelMask = 0;
     for (let i = 0; i < k; i++) if (urgentDel[i]) urgentDelMask |= (1 << i);
-    const pre = new Array(k).fill(0);
+    const hard = new Array(k).fill(0), urg = new Array(k).fill(0);
     const noDetour = !!input.noDetour;
     for (let i = 0; i < k; i++) {
       const s = bs.stops[bs.stopIds[i]];
@@ -215,25 +279,39 @@
         const j = jobById[d.jobId];
         (j.pickups || []).filter((p) => !p.done).forEach((p) => {
           const q = idx[bs.keyOf(p.placeId)];
-          if (q !== i && q != null) pre[i] |= (1 << q);
+          if (q !== i && q != null) hard[i] |= (1 << q);
         });
       });
       // (2) urgent deliveries before non-urgent deliveries
-      if (nonUrgentDel[i]) pre[i] |= urgentDelMask & ~(1 << i);
+      if (nonUrgentDel[i]) urg[i] |= urgentDelMask & ~(1 << i);
       // (2b) urgentRank order among urgent deliveries (stop key = lowest rank delivered there)
       if (urgentDel[i]) {
-        for (let o = 0; o < k; o++) if (o !== i && urgentDel[o] && rankKey[o] < rankKey[i]) pre[i] |= (1 << o);
+        for (let o = 0; o < k; o++) if (o !== i && urgentDel[o] && rankKey[o] < rankKey[i]) urg[i] |= (1 << o);
       }
       // (3) noDetour: stops with no urgent-job action wait for all urgent deliveries
-      if (noDetour && !urgentAction[i]) pre[i] |= urgentDelMask & ~(1 << i);
+      if (noDetour && !urgentAction[i]) urg[i] |= urgentDelMask & ~(1 << i);
     }
-    // (4) First stop: its visit comes first after the start (hard, beats urgent); every other stop waits for it. The urgent rules
-    // then apply to everything after it, as above.
+    // (4) First stop: its visit comes first after the start (hard, beats urgent and After); every other stop waits for it. The
+    // urgent rules then apply to everything after it, as above.
     const firstIdx = bs.first != null ? idx[bs.first] : -1;
     if (firstIdx >= 0) {
-      pre[firstIdx] = 0;
-      for (let i = 0; i < k; i++) if (i !== firstIdx) pre[i] |= (1 << firstIdx);
+      hard[firstIdx] = 0; urg[firstIdx] = 0;
+      for (let i = 0; i < k; i++) if (i !== firstIdx) hard[i] |= (1 << firstIdx);
     }
+    // (5) After (beats urgent): the kept After edges; an urgent edge that would contradict them is left out (no banner)
+    const nameOfKey = (key) => (placeOf(places, key) || {}).name || baseId(key);
+    const ar = afterRules(bs, idx, hard, firstIdx, nameOfKey);
+    const pre = hard.map((m, i) => m | ar.kept[i]);
+    const anyAfter = ar.kept.some((m) => m);
+    for (let i = 0; i < k; i++) {
+      if (!anyAfter) { pre[i] |= urg[i]; continue; }
+      for (let o = 0; o < k; o++) {
+        if (!(urg[i] & (1 << o))) continue;
+        const anc = ancestors(pre, k);
+        if (!(anc[o] & (1 << i))) pre[i] |= 1 << o; // o before i, unless i already has to come before o
+      }
+    }
+    const afterReq = anyAfter ? ancestors(ar.kept, k) : null;
 
     // admissible bound pieces
     const minIn = new Float64Array(k);
@@ -256,7 +334,7 @@
     const ctx = {
       input, places, bs, k, N, idx, t0ms, dayStart, slices, jobById,
       dwell, before, after, targets, urgentDel, urgentAction, pre, minIn, minInEnd, urgentDelMask,
-      closedWin, respect,
+      closedWin, respect, afterConflicts: ar.conflicts, afterReq,
     };
     ctx.leg = function (a, b, t) {
       let best = 0, bd = Infinity;
@@ -347,6 +425,8 @@
     const stops = [];
     const violations = [];
     const lastUrgentPos = order.reduce((acc, i, pos) => (c.urgentDel[i] ? pos : acc), -1);
+    // a stop an After rule puts before an urgent delivery is not a detour
+    const urgentNeeds = c.afterReq ? order.reduce((m, i) => (c.urgentDel[i] ? m | c.afterReq[i] : m), 0) : 0;
     const nameOf = (key) => (placeOf(places, key) || {}).name || baseId(key);
     // the "it has to come after <pickup>" reason of a missed delivery window: the latest-visited pending pickup of that job, when
     // going there first makes the delivery late although driving straight to it would not (collect-before-deliver is the cause)
@@ -392,7 +472,7 @@
         departAt: t0ms + Math.round(dep * 1000),
         waitSec: Math.round(arrive - arrive0),
         actions: [].concat(s.deliveries, s.errands, s.pickups).map((a) => ({ jobId: a.jobId, kind: a.kind, item: a.item })),
-        detour: !c.urgentAction[i] && pos < lastUrgentPos,
+        detour: !c.urgentAction[i] && pos < lastUrgentPos && !(urgentNeeds & (1 << i)),
         closedWarning: closed,
       };
       if (pid === bs.first) out.first = true;          // the First stop visit (the FIRST tag)
@@ -652,7 +732,7 @@
     try { c = prepare(input); } catch (e) { return { plans: [], stopIds: bs.stopIds, error: e.message }; }
     if (c.k === 0) {
       const p = buildPlan(c, []);
-      return { plans: [p], stopIds: [], error: null, stats: { nodes: 0, ms: 0, mode: 'strict', truncated: false } };
+      return { plans: [p], stopIds: [], error: null, afterConflicts: [], stats: { nodes: 0, ms: 0, mode: 'strict', truncated: false } };
     }
     const limit = opts.timeLimitMs != null ? opts.timeLimitMs : 1800;
     let r = search(c, false, started + limit);
@@ -663,13 +743,13 @@
     }
     if (!r.top.length) {
       return {
-        plans: [], stopIds: bs.stopIds,
+        plans: [], stopIds: bs.stopIds, afterConflicts: c.afterConflicts,
         error: 'No order satisfies the pickup / urgent rules (they contradict each other). Un-flag an urgent job or park one.',
       };
     }
     const plans = r.top.map((x) => buildPlan(c, x.order));
     return {
-      plans, stopIds: bs.stopIds, error: null,
+      plans, stopIds: bs.stopIds, error: null, afterConflicts: c.afterConflicts, // the After rules left out, each as its banner text
       stats: { nodes: r.nodes, ms: Date.now() - started, mode, truncated: r.timedOut },
     };
   }

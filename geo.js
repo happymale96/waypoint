@@ -61,7 +61,7 @@
     const attempt = (opts) => new Promise((resolve) => {
       try {
         geo.getCurrentPosition(
-          (p) => resolve({ ok: true, lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy, at: p.timestamp != null ? p.timestamp : Date.now() }), // at = when the position was measured (ms)
+          (p) => resolve({ ok: true, lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy, at: p.timestamp != null ? p.timestamp : Date.now(), speed: p.coords.speed != null && isFinite(p.coords.speed) ? p.coords.speed : null }), // at = when the position was measured (ms); speed m/s or null (auto-Reached "stopped" rule)
           (e) => resolve({ ok: false, code: e && e.code === 1 ? 'denied' : e && e.code === 3 ? 'timeout' : 'unavailable' }),
           opts);
       } catch (e) { resolve({ ok: false, code: 'unavailable' }); }

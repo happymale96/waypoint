@@ -35,17 +35,17 @@ function world(o) {
 const target = (fix, w) => Reached.autoReachTarget(fix, w.stops, { enabled: true, visible: true, now: NOW, jobs: w.jobs });
 
 console.log('23. auto-reach candidates');
-eq(target(near('D', 100), world()), null, 'a. 100 m from D, C not done -> no target');
-eq(target(near('D', 100), world({ cReached: true })), null, 'b. C Reached but not Done -> no target');
-eq(target(near('D', 100), world({ cDone: true })), 'D', 'c. C Done -> target D');
+eq(target(near('D', 60), world()), null, 'a. 100 m from D, C not done -> no target');
+eq(target(near('D', 60), world({ cReached: true })), null, 'b. C Reached but not Done -> no target');
+eq(target(near('D', 60), world({ cDone: true })), 'D', 'c. C Done -> target D');
 {
   const w = world();
   w.stops.find((s) => s.id === 'A').lat = LL.D[0] + 0.0005; w.stops.find((s) => s.id === 'A').lng = LL.D[1]; // A and D 55 m apart
-  eq(target(fixAt(LL.D[0] + 0.00025, LL.D[1]), w), 'A', 'd. within 150 m of both A and D, C not done -> target A');
+  eq(target(fixAt(LL.D[0] + 0.00025, LL.D[1]), w), 'A', 'd. within 80 m of both A and D, C not done -> target A');
 }
-eq(target(near('D', 100), world({ cSkipped: true })), null, 'e. C skipped -> no target');
-eq(target(near('D', 100), world({ dPickup: true })), 'D', 'f. D is also the pickup of a pending third job -> target D');
-eq(target(near('D', 100), world({ withYou: true })), 'D', 'g. a "with you" item to deliver at D -> target D');
+eq(target(near('D', 60), world({ cSkipped: true })), null, 'e. C skipped -> no target');
+eq(target(near('D', 60), world({ dPickup: true })), 'D', 'f. D is also the pickup of a pending third job -> target D');
+eq(target(near('D', 60), world({ withYou: true })), 'D', 'g. a "with you" item to deliver at D -> target D');
 {
   const w = world();
   const fuelStop = { id: '__fuel__', lat: 3.30, lng: 101.80, fuel: true, actions: [] };

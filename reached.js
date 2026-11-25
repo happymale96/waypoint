@@ -13,7 +13,13 @@
 })(typeof self !== 'undefined' ? self : this, function (Solver) {
   'use strict';
 
-  const RADIUS_M = 150;            // auto-reach: within this distance of the stop
+  const RADIUS_M = 80;             // auto-reach: within this distance of the stop (Settings -> Auto-Reached distance, 30-300)
+  const RADIUS_MIN = 30, RADIUS_MAX = 300;
+  const STOPPED_MPS = 2;           // a fix reporting a speed counts as stopped at 2 m/s or less
+  const STILL_MS = 20000;          // no speed: inside the distance for at least 20 s (no fix outside in between)
+  // the stored setting -> a whole number of metres in 30..300 (anything else = the default 80)
+  const radiusOf = (v) => { const n = Math.round(Number(v)); return isFinite(n) && n >= RADIUS_MIN && n <= RADIUS_MAX && v !== '' && v != null ? n : RADIUS_M; };
+  const RADIUS_FLAG = 'autoReach80_2026_11_25';
   const MAX_ACCURACY_M = 100;      // auto-reach: fix accuracy 100 m or better
   const TAP_GUARD_MS = 500;        // after REACHED the button ignores taps for this long
   const MIN_ON_SITE_MS = 60000;    // under this between Reached and Done = a double-tap: arrival is estimated instead
@@ -25,7 +31,7 @@
 
   // ---------- the stop's state ----------
   // The one primary button: REACHED until the stop is reached, then DONE.
-  const buttonLabel = (stop) => (isReached(stop) ? 'DONE' : 'REACHED');
+  const buttonLabel = (stop) => (isReached(stop) ? '✓ DONE' : 'REACHED');
   // A tap on the primary button within 500 ms of the stop becoming reached is ignored (accidental double-tap).
   const tapIgnored = (stop, nowMs) => isReached(stop) && nowMs - stop.reachedAt >= 0 && nowMs - stop.reachedAt < TAP_GUARD_MS;
   // New stop objects (the inputs are never changed).
@@ -112,16 +118,36 @@
       return a.kind === 'errand';
     });
   }
+  // opts.radiusM = the Auto-Reached distance (default 80 m). This is the "where" rule only; autoReachStep adds "stopped".
   function autoReachTarget(fix, stops, opts) {
     opts = opts || {};
-    if (!opts.enabled || !opts.visible) return null;
-    if (!fix || fix.lat == null || fix.lng == null || fix.at == null) return null;
-    if (!(fix.accuracy <= MAX_ACCURACY_M)) return null;
-    if (!Solver.originFresh({ usedAt: fix.at }, opts.now)) return null;
+    if (!usableFix(fix, opts)) return null;
+    const r = radiusOf(opts.radiusM);
     const inRange = (stops || []).filter((s) => isPending(s) && !isReached(s) && !s.noAutoReach && s.lat != null && s.lng != null
-      && canAutoReach(s, opts.jobs) && Solver.distanceM(fix, s) <= RADIUS_M);
+      && canAutoReach(s, opts.jobs) && Solver.distanceM(fix, s) <= r);
     if (inRange.length !== 1 || inRange[0].isEnd) return null;
     return inRange[0].id;
+  }
+  function usableFix(fix, opts) {
+    if (!opts.enabled || !opts.visible) return false;
+    if (!fix || fix.lat == null || fix.lng == null || fix.at == null) return false;
+    if (!(fix.accuracy <= MAX_ACCURACY_M)) return false;
+    return Solver.originFresh({ usedAt: fix.at }, opts.now);
+  }
+  // Auto-Reached with the "stopped" rule. track = {stopId, since} | null: the stop the last fixes were inside the distance of, and
+  // the time of the first of them (no speed, nothing outside in between). Fires only when the fix is inside the distance (the rule
+  // above) AND (a) it reports a speed of at most 2 m/s, or (b) it reports no speed and a fix at least 20 s older was inside the
+  // distance of the same stop with no fix outside in between. Inside at more than 2 m/s never fires and resets (b). A fix that is
+  // not usable (stale, poor accuracy, page hidden, setting off) changes nothing. -> {id | null, track}
+  function autoReachStep(track, fix, stops, opts) {
+    opts = opts || {};
+    if (!usableFix(fix, opts)) return { id: null, track: track || null };
+    const id = autoReachTarget(fix, stops, opts);
+    if (!id) return { id: null, track: null };
+    const speed = fix.speed == null || !isFinite(fix.speed) ? null : Number(fix.speed);
+    if (speed != null) return speed <= STOPPED_MPS ? { id, track: null } : { id: null, track: null };
+    if (track && track.stopId === id && track.since != null && fix.at - track.since >= STILL_MS) return { id, track: null };
+    return { id: null, track: track && track.stopId === id && track.since != null ? track : { stopId: id, since: fix.at } };
   }
 
   // ---------- driving / on site / between stops / lunch ----------
@@ -413,7 +439,7 @@
     return p.join(' · ');
   }
 
-  return { RADIUS_M, MAX_ACCURACY_M, TAP_GUARD_MS, MIN_ON_SITE_MS, isReached, buttonLabel, tapIgnored, stampReached, undoReached, undoDone, carryForward,
+  return { RADIUS_M, RADIUS_MIN, RADIUS_MAX, RADIUS_FLAG, STOPPED_MPS, STILL_MS, radiusOf, autoReachStep, MAX_ACCURACY_M, TAP_GUARD_MS, MIN_ON_SITE_MS, isReached, buttonLabel, tapIgnored, stampReached, undoReached, undoDone, carryForward,
     keptState, keepStateOf, stampNav, WATCH_OPTS, WATCH_RETIME_MS, shouldWatch, retimeDue,
     reachedText, onSiteStop, canAutoReach, autoReachTarget, daySplit, dayTimeline, timelineEventsOfSummary, splitOfSummary, splitLine, stopLine };
 });

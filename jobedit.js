@@ -47,8 +47,36 @@
       errandPlaceId: job.errandPlaceId || null, dwellMin: job.dwellMin != null ? String(job.dwellMin) : '',
       notes: job.notes || '', urgent: !!job.urgent, after: job.arriveAfter || '', before: job.arriveBefore || '',
       firstStop: !!job.firstStop,
+      afterPlaces: afterOf(job),
     };
   }
+
+  // ---------- After (one day only): job.afterPlaces = [placeId] ----------
+  // This entry's stop comes after the last visit today to each chosen place (solver.js afterRules). Stored only when not empty.
+  const afterOf = (j) => (j && Array.isArray(j.afterPlaces) ? j.afterPlaces.filter((p, n, a) => typeof p === 'string' && p && a.indexOf(p) === n) : []);
+  // every place of a job: its pickups (pending), delivery, errand
+  const placesOfJob = (j) => (j.errandPlaceId ? [j.errandPlaceId]
+    : (j.pickups || []).filter((p) => !p.done).map((p) => p.placeId).concat(j.deliveryPlaceId ? [j.deliveryPlaceId] : [])).filter(Boolean);
+  // The choices of the After field: the places that have an open job or errand today (pending, not this entry), without this
+  // entry's own places; a place already chosen stays listed so it can be cleared. -> [placeId] in first-seen order.
+  function afterChoices(jobs, form, editId) {
+    const own = new Set(form.mode === 'errand' ? [form.errandPlaceId]
+      : (form.pickups || []).map((p) => p.placeId).concat([form.deliveryPlaceId]));
+    const out = [];
+    (jobs || []).forEach((j) => {
+      if (j.id === editId || (j.status && j.status !== 'pending')) return;
+      placesOfJob(j).forEach((p) => { if (!own.has(p) && out.indexOf(p) < 0) out.push(p); });
+    });
+    afterOf(form).forEach((p) => { if (!own.has(p) && out.indexOf(p) < 0) out.push(p); });
+    return out;
+  }
+  // the form's chosen list, cleaned for saving (own places dropped)
+  function afterToSave(form) {
+    const own = new Set(form.mode === 'errand' ? [form.errandPlaceId] : (form.pickups || []).map((p) => p.placeId).concat([form.deliveryPlaceId]));
+    return afterOf(form).filter((p) => !own.has(p));
+  }
+  // the Plan card's small line: "after Asian Automotive, Carrier" ('' = none)
+  const afterLine = (job, nameOf) => { const a = afterOf(job); return a.length ? 'after ' + a.map(nameOf).join(', ') : ''; };
 
   // ---------- First stop (one entry at a time, for one day) ----------
   // The place a job's First stop pins: the errand place, its first pickup, or its delivery when it is deliver-only (solver.js
@@ -131,6 +159,8 @@
     else { j.urgent = false; j.urgentRank = 0; }
     list[i] = j;
     // First stop: as the form says (a form without the field keeps it); on = it leaves every other job
+    // After: as the form says (a form without the field keeps it)
+    if (form.afterPlaces != null) { const a = afterToSave(form); if (a.length) j.afterPlaces = a; else delete j.afterPlaces; }
     let movedFrom = null;
     if (form.firstStop != null) {
       if (form.firstStop) j.firstStop = true; else delete j.firstStop;
@@ -142,5 +172,5 @@
     return { ok: true, jobs: list, job: j, ignored, movedFrom, changedIds: list.filter((x, k) => x !== jobs[k]).map((x) => x.id) };
   }
 
-  return { validate, isEditable, donePickups, formOf, updateJob, firstStopPlaceOf, setFirstStop, firstStopToast };
+  return { validate, isEditable, donePickups, formOf, updateJob, firstStopPlaceOf, setFirstStop, firstStopToast, afterOf, afterChoices, afterToSave, afterLine };
 });

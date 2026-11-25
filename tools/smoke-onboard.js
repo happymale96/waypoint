@@ -320,7 +320,11 @@ async function main() {
     console.log('RUN 3 (fresh storage): PLAN on a running day keeps a skipped stop skipped');
     await fresh();
     await planNow(4);
-    await ev('(() => { const c = [...document.querySelectorAll(".timeline .card.stop")].find((x) => x.querySelector(".nm") && x.querySelector(".nm").textContent.indexOf("Carrier") === 0); [...c.querySelectorAll(".stop-btns button")].find((b) => b.textContent === "SKIP").click(); return true; })()');
+    const tapSkip = (nm) => ev('(() => { const c = [...document.querySelectorAll(".timeline .card.stop")].find((x) => x.querySelector(".nm") && x.querySelector(".nm").textContent.indexOf(' + JSON.stringify(nm) + ') === 0); [...c.querySelectorAll(".stop-btns button")].find((b) => b.textContent === "SKIP").click(); return true; })()');
+    await tapSkip('Carrier');
+    await waitFor('document.querySelector("#skipSheet #skipToday") && document.querySelector("#skipSheet #cancelJob")', 'the SKIP choices');
+    check(await ev('[...document.querySelectorAll("#skipSheet .pick-row .title")].map((t) => t.textContent).join("|")') === 'Skip for today|Cancel job', 'SKIP offers "Skip for today" and "Cancel job"');
+    await click('#skipToday');
     await waitFor(planStop('carrier') + '.status === "skipped"', 'Carrier to be skipped');
     const skippedCards = () => ev('[...document.querySelectorAll(".timeline .card.stop.skipped")].map((c) => ({ t: c.textContent, undo: !!c.querySelector("button[aria-label=\\"Undo skip\\"]") }))');
     const jobsRun3 = await S('jobs.length');
@@ -342,6 +346,29 @@ async function main() {
     await planNow(4);
     const pendC = await ev('(() => { const p = WaypointDebug.S.plan.result.plans[0], s = p.stops.find((x) => x.placeId === "carrier"); const c = [...document.querySelectorAll(".timeline .card.stop")].find((x) => x.textContent.indexOf("Carrier") >= 0); return { n: p.stops.filter((x) => x.placeId === "carrier").length, status: s && s.status, arriveAt: s && s.arriveAt, txt: c ? c.textContent : "", skipped: document.querySelectorAll(".timeline .card.stop.skipped").length }; })()');
     check(pendC.n === 1 && !pendC.status && pendC.skipped === 0 && pendC.arriveAt > 0 && /\d\d:\d\d/.test(pendC.txt), 'after Undo skip and PLAN: Carrier is pending, with an ETA', pendC);
+
+    console.log('RUN 3b (fresh storage): SKIP -> "Cancel job" on the Delta Works card (one job)');
+    await fresh();
+    await planNow(4);
+    const jobsBefore3b = await S('jobs.length');
+    await tapSkip('Delta');
+    await waitFor('document.querySelector("#skipSheet #cancelJob")', 'the SKIP choices');
+    await click('#cancelJob');
+    await waitFor('!document.querySelector("#skipSheet") && WaypointDebug.S.jobs.find((j) => j.id === "jd1").status === "cancelled"', 'the job to be cancelled');
+    const afterCancel = await ev('(() => { const p = WaypointDebug.S.plan.result.plans[0]; const cards = [...document.querySelectorAll(".timeline .card.stop")]; const sup = cards.find((c) => /Supplier One/.test(c.textContent)); return { delta: cards.some((c) => /Delta Works/.test(c.textContent)), stops: p.stops.map((s) => s.placeId), sup: sup ? [...sup.querySelectorAll(".act")].map((a) => a.textContent) : null, toast: document.getElementById("toast").textContent }; })()');
+    check(!afterCancel.delta && afterCancel.stops.indexOf('d1') < 0, 'the Delta Works card is gone from the route', afterCancel);
+    check(afterCancel.sup && afterCancel.sup.length === 1 && /valve/.test(afterCancel.sup[0]), 'the Supplier One card keeps only the other job (valve), without the cancelled line', afterCancel.sup);
+    check(/^Cancelled: sensor \(Delta Works\) · Undo$/.test(afterCancel.toast), 'an Undo toast: "Cancelled: sensor (Delta Works) · Undo"', afterCancel.toast);
+    check(await S('jobs.length') === jobsBefore3b, 'no job removed from storage (it is cancelled, not deleted)');
+    await click('#routeEndDay');
+    await waitFor('document.querySelector("#sumCancelled")', 'the summary with a Cancelled section');
+    const sc = await text('#sumCancelled');
+    check(/Cancelled/.test(sc) && /sensor - Delta Works/.test(sc), 'the summary shows the Cancelled line: sensor - Delta Works', sc);
+    check(!/sensor/.test(await text('.sum-sec.notdone') || ''), 'and not under Not done (never carried to tomorrow)', await text('.sum-sec.notdone'));
+    await click('#closeDay');
+    await waitFor('Object.values(WaypointDebug.S.days).some((d) => d.closed)', 'the day to close');
+    check(await S('jobs.find((j) => j.id === "jd1").status') === 'cancelled' && !(await ev('Object.values(WaypointDebug.S.days).find((d) => d.closed).carried.some((c) => c.jobId === "jd1")')), 'Close day: not carried, still cancelled');
+    await clickText('.sum-actions button', 'Back');
 
     console.log('RUN 4 (fresh storage): the one-time dwell migration and the customer message time');
     await fresh();

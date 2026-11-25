@@ -53,7 +53,9 @@ const SEED = {
 
 // ---------- the First stop worlds (25 Nov 2026): a fixed minute table, symmetric; H = Home (start and end) ----------
 const MINS = { 'H-O': 32, 'H-K': 46, 'H-A': 40, 'H-C': 42, 'H-E': 50, 'O-K': 68, 'O-A': 22, 'O-C': 25, 'O-E': 50, 'A-C': 11, 'A-E': 60, 'A-K': 65, 'C-E': 61, 'C-K': 66, 'E-K': 11 };
-const LL = { H: HOME, O: { lat: 3.15, lng: 101.72 }, K: { lat: 3.0, lng: 101.45 }, A: { lat: 3.14, lng: 101.76 }, C: { lat: 3.17, lng: 101.74 }, E: { lat: 3.02, lng: 101.5 } };
+const LL = { H: HOME, O: { lat: 3.15, lng: 101.72 }, K: { lat: 3.0, lng: 101.45 }, A: { lat: 3.14, lng: 101.76 }, C: { lat: 3.17, lng: 101.74 }, E: { lat: 3.02, lng: 101.5 }, S: { lat: 3.25, lng: 101.62 } };
+// the After world (s3, the T2 data of test/after.test.js): its own minute table; S = HeveaPac
+const MINS3 = { 'O-S': 30, 'O-A': 22, 'O-C': 25, 'O-E': 50, 'A-C': 11, 'A-S': 45, 'A-E': 62, 'C-S': 46, 'C-E': 61, 'S-E': 73, 'H-A': 40, 'H-C': 42, 'H-S': 60, 'H-E': 50, 'H-O': 32 };
 const wplace = (id, name, L, type) => Object.assign({ id, name, address: name + ' Rd', type: type || 'other', dwellMin: 0, closedWindows: [] }, LL[L]);
 const WORLD = {
   'waypoint:settings:main': SEED['waypoint:settings:main'],
@@ -74,6 +76,19 @@ const SEEDS = {
     'waypoint:jobs:j2': job('j2', { pickups: [{ placeId: 'office', item: 'Brackets', done: false }], deliveryPlaceId: 'asian', createdAt: '2026-11-25T00:02:00.000Z' }),
     'waypoint:jobs:j6': job('j6', { pickups: [{ placeId: 'carrier', item: 'Compressor', done: false }], deliveryPlaceId: 'office', createdAt: '2026-11-25T00:03:00.000Z' }),
   }),
+  s3: { // T2: four deliver-only jobs at HeveaPac, Asian, Carrier, Eastern; every dwell 10; lunch break off; start at the Office
+    'waypoint:settings:main': Object.assign({}, SEED['waypoint:settings:main'], { lunchBreakOn: false }),
+    'waypoint:places:home': Object.assign({}, SEED['waypoint:places:home']),
+    'waypoint:places:office': Object.assign(wplace('office', 'Office', 'O', 'office'), { dwellMin: 10 }),
+    'waypoint:places:heveapac': Object.assign(wplace('heveapac', 'HeveaPac', 'S'), { dwellMin: 10 }),
+    'waypoint:places:asian': Object.assign(wplace('asian', 'Asian Automotive', 'A'), { dwellMin: 10 }),
+    'waypoint:places:carrier': Object.assign(wplace('carrier', 'Carrier', 'C'), { dwellMin: 10 }),
+    'waypoint:places:eastern': Object.assign(wplace('eastern', 'Eastern Press', 'E'), { dwellMin: 10 }),
+    'waypoint:jobs:jS': job('jS', { inHandItem: 'Rubber sheets', deliveryPlaceId: 'heveapac', createdAt: '2026-11-25T00:01:00.000Z' }),
+    'waypoint:jobs:jA': job('jA', { inHandItem: 'Brackets', deliveryPlaceId: 'asian', createdAt: '2026-11-25T00:02:00.000Z' }),
+    'waypoint:jobs:jC': job('jC', { inHandItem: 'Sensor', deliveryPlaceId: 'carrier', createdAt: '2026-11-25T00:03:00.000Z' }),
+    'waypoint:jobs:jE': job('jE', { inHandItem: 'Gasket', deliveryPlaceId: 'eastern', createdAt: '2026-11-25T00:04:00.000Z' }),
+  },
 };
 
 // runs in the page before anything else: mocks + seed. The clock starts at 11:00 local and its offset survives a reload.
@@ -101,7 +116,7 @@ const INIT = `(() => {
   const km = (a, b) => { const r = Math.PI / 180, dl = (b.lat - a.lat) * r, dg = (b.lng - a.lng) * r;
     const x = Math.sin(dl / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dg / 2) ** 2; return 12742 * Math.asin(Math.sqrt(x)); };
   const WORLD_ID = new URLSearchParams(location.search).get('world') || 'base';
-  const LL = ${JSON.stringify(LL)}, MINS = ${JSON.stringify(MINS)};
+  const LL = ${JSON.stringify(LL)}, MINS = WORLD_ID === 's3' ? ${JSON.stringify(MINS3)} : ${JSON.stringify(MINS)};
   const letterOf = (p) => { let b = null, bd = Infinity; Object.keys(LL).forEach((x) => { const d = km(p, LL[x]); if (d < bd) { bd = d; b = x; } }); return bd < 0.3 ? b : null; };
   const tableSec = (a, b) => { // the First stop worlds only: travel times from the fixed minute table
     if (WORLD_ID === 'base') return null;
@@ -435,6 +450,31 @@ async function main() {
     check(await S('jobs.find((j) => j.id === "j6").status') === 'pending', 'DONE on stop 1 leaves the Carrier -> Office delivery open');
     check(await ev('WaypointDebug.S.plan.result.plans[0].stops.find((s) => s.placeId === "office#2").status') == null, 'the second Office card is still pending');
     check(await noJobIds(), 'no "job j_" text on screen');
+
+    console.log('10. the After rule (T2 data): the S job after A and C, through the edit form');
+    await fresh('s3');
+    await ev('window.__pos = ' + JSON.stringify(LL.O)); // start at the Office
+    await ev('[...document.querySelectorAll(".card.job")].find((c) => /HeveaPac/.test(c.textContent)).querySelector(".edit-btn").click()');
+    await waitFor('document.querySelector(".sheet #afterList")', 'the After field in the edit form');
+    const afterRows = () => ev('[...document.querySelectorAll("#afterList .after-opt")].map((b) => ({ t: b.querySelector(".title").textContent.replace("✓", "").trim(), on: b.getAttribute("aria-pressed") === "true" }))');
+    const a0 = await afterRows();
+    check(JSON.stringify(a0.map((r) => r.t)) === JSON.stringify(['Asian Automotive', 'Carrier', 'Eastern Press']) && a0.every((r) => !r.on), 'After lists the other open places (not HeveaPac), none chosen', a0);
+    await ev('[...document.querySelectorAll("#afterList .after-opt")].find((b) => /Asian/.test(b.textContent)).click()');
+    await sleep(100);
+    await ev('[...document.querySelectorAll("#afterList .after-opt")].find((b) => /Carrier/.test(b.textContent)).click()');
+    await sleep(100);
+    const a1 = await afterRows();
+    check(JSON.stringify(a1.map((r) => r.on)) === '[true,true,false]', 'Asian Automotive and Carrier chosen', a1);
+    await sheetBtn('Save changes');
+    await waitFor('!document.querySelector(".sheet")', 'the form closes');
+    check(JSON.stringify(await S('jobs.find((j) => j.id === "jS").afterPlaces')) === '["asian","carrier"]', 'saved: afterPlaces = asian, carrier');
+    const afterLineOf = () => ev('(() => { const c = [...document.querySelectorAll(".card.job")].find((x) => /HeveaPac/.test(x.textContent)); const l = c && c.querySelector(".after-line"); return l ? l.textContent : null; })()');
+    check(await afterLineOf() === 'after Asian Automotive, Carrier', 'the Plan card line: "after Asian Automotive, Carrier"', await afterLineOf());
+    await planNow(4, 30000); // 4 stops = 20 live requests, 300 ms apart
+    check(JSON.stringify(await stopNames()) === JSON.stringify(['asian', 'carrier', 'heveapac', 'eastern']), 'PLAN: Asian Automotive, Carrier, HeveaPac, Eastern Press (A, C, S, E)', await stopNames());
+    check(await ev('!document.querySelector("#afterBanner")'), 'no red After banner');
+    await tab('plan');
+    check(await afterLineOf() === 'after Asian Automotive, Carrier', 'the Plan card still shows the after line after PLAN', await afterLineOf());
 
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {

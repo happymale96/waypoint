@@ -154,6 +154,27 @@
     day.events.push(e);
     return e;
   }
+  // A job cancelled mid-day (Route card: SKIP -> Cancel job) and its Undo. info: {nowIso, jobId, item, place}. A cancelled job is out of
+  // the day's rows (never Not done, never carried to tomorrow) and listed under "Cancelled" (item and place).
+  function recordCancel(day, info) {
+    const e = { t: info.nowIso, type: 'cancel', jobId: info.jobId, stopId: null, lat: null, lng: null, accuracy: null, item: info.item || '', place: info.place || '' };
+    day.events.push(e);
+    return e;
+  }
+  function recordUndoCancel(day, info) {
+    const e = { t: info.nowIso, type: 'undo', of: 'cancel', jobId: info.jobId, stopId: null, lat: null, lng: null, accuracy: null };
+    day.events.push(e);
+    return e;
+  }
+  // the day's cancels still standing (an Undo removes the latest cancel of that job)
+  function cancelsOf(day) {
+    const out = [];
+    (day.events || []).forEach((e) => {
+      if (e.type === 'cancel') out.push({ jobId: e.jobId, item: e.item || '', place: e.place || '', t: ms(e.t) });
+      else if (e.type === 'undo' && e.of === 'cancel') { for (let i = out.length - 1; i >= 0; i--) if (out[i].jobId === e.jobId) { out.splice(i, 1); break; } }
+    });
+    return out;
+  }
   function recordUndoDropoff(day, info) {
     const e = { t: info.nowIso, type: 'undo', of: 'dropoff', jobId: null, stopId: null, lat: null, lng: null, accuracy: null, looseId: info.looseId };
     day.events.push(e);
@@ -311,9 +332,11 @@
     const dayStart = dayStartMs(day.date);
     const snap = day.planSnapshot;
 
-    // scope = every job planned that day (+ any job with a done event)
-    const ids = Object.keys(day.jobsSnap);
-    active.forEach((e) => { if (e.jobId && ids.indexOf(e.jobId) < 0) ids.push(e.jobId); });
+    // scope = every job planned that day (+ any job with a done event), minus the jobs cancelled that day (listed apart)
+    const cancelled = cancelsOf(day);
+    const cancelledIds = new Set(cancelled.map((c) => c.jobId).filter((id) => !jobMap[id] || jobMap[id].status === 'cancelled'));
+    const ids = Object.keys(day.jobsSnap).filter((id) => !cancelledIds.has(id));
+    active.forEach((e) => { if (e.jobId && ids.indexOf(e.jobId) < 0 && !cancelledIds.has(e.jobId)) ids.push(e.jobId); });
 
     const rows = ids.map((id) => {
       const live = jobMap[id], sn = day.jobsSnap[id];
@@ -443,6 +466,7 @@
       startedSource: ms(day.edits.startedAt) != null ? 'edited' : snap ? 'first plan' : '—',
       collected, delivered, errands,
       stillWithYou, droppedOff,
+      cancelled: cancelled.filter((c) => cancelledIds.has(c.jobId)).map((c) => ({ jobId: c.jobId, item: c.item, place: c.place, t: c.t })),
       notDone: rows.filter((r) => !r.complete),
       plan: { plannedKm: snap ? snap.plannedKm : null, plannedDriveMin: snap ? snap.plannedDriveMin : null, replans, outOfOrder, stopsDone: visitSeq.length, stopsPlanned: order.length },
       rows,
@@ -478,6 +502,8 @@
     });
     // First stop is for one day only: End day (and so the carry-forward to tomorrow) clears it on every job
     (jobs || []).forEach((j) => { if (j && j.firstStop) { delete j.firstStop; if (changed.indexOf(j) < 0) changed.push(j); } });
+    // so is the After rule (job.afterPlaces)
+    (jobs || []).forEach((j) => { if (j && j.afterPlaces !== undefined) { delete j.afterPlaces; if (changed.indexOf(j) < 0) changed.push(j); } });
     appendEvent(day, { t: nowIso, type: 'endday' });
     day.closed = true; day.endedAt = nowIso; day.closedAt = nowIso;
     refreshTotals(day, jobs, places);
@@ -689,6 +715,7 @@
     sec('Errands done', sum.errands.map((e) => '- ' + t(e.t) + ' ' + e.item + ' - ' + e.place));
     sec('Still with me', sum.stillWithYou.map((r) => '- ' + (r.item || '(item)') + (r.loose && r.from ? ' (from ' + r.from + ')' : '') + (r.loose && !r.to ? '' : ' -> ' + r.to)));
     sec('Dropped off', (sum.droppedOff || []).map((d) => '- ' + t(d.t) + ' ' + (d.item || '(item)') + (d.place ? ' (' + d.place + ')' : '')));
+    sec('Cancelled', (sum.cancelled || []).map((c) => '- ' + (c.item || '(item)') + (c.place ? ' - ' + c.place : '')));
     sec('Not done', sum.notDone.map((r) => '- ' + (r.item || r.type) + (r.to ? ' -> ' + r.to : '') + (r.urgent ? ' [URGENT]' : '') + (r.reason ? ' (' + r.reason + ')' : '') + (r.carry ? ' [carried to tomorrow]' : ' [dropped]')));
     return L.join('\n');
   }
@@ -696,7 +723,7 @@
   return {
     SCHEMA, KEEP_DAYS, REASONS, CSV_HEADER,
     dateKey, fmtDate, fmtTime, fmtDur, fmtKm, addDaysKey, dayStartMs, ageDays,
-    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordFuel, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, recordNav, recordSkip, recordUndoSkip, recordDropoff, recordUndoDropoff, recordBreakStart, recordBreakEnd, TIME_SPLIT_V, arrivedEnd, doneGroups, hasActiveDone,
+    newDay, appendEvent, recordPlan, recordReplan, recordDone, recordFuel, recordUndo, recordArrivedEnd, recordUndoArrivedEnd, recordNav, recordSkip, recordUndoSkip, recordDropoff, recordUndoDropoff, recordCancel, recordUndoCancel, cancelsOf, recordBreakStart, recordBreakEnd, TIME_SPLIT_V, arrivedEnd, doneGroups, hasActiveDone,
     ptKey, legKey, seqKey, legFromMatrices, captureLeg, holdLeg, legsFrom, missingLegs, routedPairs, plannedFromMatrices,
     summarise, closeDay, reopenDay, refreshTotals, recordFor, activityKey, hasActivity, isEmptyRecord, openDayKey, endDay,
     REPAIR_VERSION, repairHistory, runRepairOnce, exportPayload, importPayload, pruneDates, weekRange, weekTotals, historyKeys, toCSV, csvCell, toWhatsApp,

@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '8b2f797f'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '04cd32e2'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -53,7 +53,9 @@
       afterStop: 'auto', // After each stop, look for a faster order: 'auto' (switch automatically) | 'ask' | 'off'
       fullRefreshMax: TravelTimes.FULL_REFRESH_MAX, // look-ahead: this many pending stops or fewer -> every needed pair is refreshed
       fuelBrand: 'Caltex', fuelDwellMin: 7, fuelMaxSearches: 50,
-      autoReach: true, // mark Reached automatically within 150 m (app open); stored on the device, in Export / Import
+      autoReach: true, // mark Reached automatically within autoReachM metres and stopped (app open); stored on the device, in Export / Import
+      autoReachM: Reached.RADIUS_M, // Settings -> Auto-Reached distance (m), whole number 30..300, default 80
+      keepScreenOn: true, // Settings -> Keep screen on while a day is running (Screen Wake Lock; wakelock.js)
       // the driver's lunch break (Settings -> Lunch break; device-stored, in Export / Import)
       lunchBreakOn: LunchBreak.DEFAULTS.lunchBreakOn, lunchBreakFrom: LunchBreak.DEFAULTS.lunchBreakFrom, lunchBreakMin: LunchBreak.DEFAULTS.lunchBreakMin,
     };
@@ -89,6 +91,7 @@
     await runPinMigration(false); // once per device: every office-type place is pinned (no toast)
     await runTomTomMigration(); // once per device: TomTom service = Routing; the Bahasa Malaysia template's old default -> the new one
     await runPlacesRepair(); // once per device: Google Places "this month" never below "today"
+    await runAutoReachMigration(); // once per device: Auto-Reached distance = 80 m
     await loadDays();
     S.loose = (await WPStore.list('loose')).filter((x) => x && x.id);
     await backfillLoose(); // once: today's / the latest closed day's collect-only jobs get their loose item
@@ -146,6 +149,16 @@
     if (!rec[Messages.TEMPLATE_FLAG]) { S.settings.templates = Messages.migrateTemplates(S.settings.templates).templates; rec[Messages.TEMPLATE_FLAG] = true; changed = true; }
     if (!changed) return;
     await saveSettings();
+    await WPStore.set('meta', 'migrations', rec);
+  }
+  // One-time (2026-11-25, flag meta/migrations.autoReach80_2026_11_25): the Auto-Reached distance is set to 80 m on every device that
+  // already has the app (it behaved like 150 m before). A distance changed later in Settings is never touched again.
+  async function runAutoReachMigration() {
+    const rec = (await WPStore.get('meta', 'migrations')) || { done: [] };
+    if (rec[Reached.RADIUS_FLAG]) return;
+    S.settings.autoReachM = Reached.RADIUS_M;
+    await saveSettings();
+    rec[Reached.RADIUS_FLAG] = true;
     await WPStore.set('meta', 'migrations', rec);
   }
   const dwellToastText = (r) => 'Updated: ' + r.suppliers + ' supplier places to 10 min, ' + r.customers + ' customer places to 30 min, ETA padding to 10 min';
@@ -553,6 +566,9 @@
   let boardOpen = false;
   // after a job was edited on a day that has a plan: the route is NOT re-planned by itself; this line stays until the next PLAN
   const JOBS_CHANGED_TEXT = 'Jobs changed - tap PLAN to update the route';
+  // the After rules the last PLAN could not keep (Solver afterRules): the red banner, one line per impossible rule, until the next PLAN
+  const afterBanner = () => (S.plan && (S.plan.afterConflicts || []).length && !routeClosed()
+    ? h('div', { class: 'violations after-banner', id: 'afterBanner', role: 'alert' }, S.plan.afterConflicts.map((t) => h('div', null, t))) : null);
   const jobsChangedNote = () => (S.plan && S.plan.jobsChanged ? h('div', { class: 'jobs-changed', id: 'jobsChangedNote', role: 'status' }, JOBS_CHANGED_TEXT) : null);
   function onBoardBar() {
     const items = onBoardNow();
@@ -664,6 +680,7 @@
     if (ttn) v.append(ttn);
     const note = jobsChangedNote();
     if (note) v.append(note);
+    { const ab = afterBanner(); if (ab) v.append(ab); }
     v.append(
       h('div', { class: 'chips-row', id: 'headerChips' },
         chip(startLabel, 'start', () => openPlacePicker((p) => { S.startSel = p.id; render(); }, 'Start from',
@@ -755,11 +772,16 @@
       const actions = confirming
         ? h('div', { class: 'job-actions' }, h('span', { class: 'sub' }, 'Delete this job?'),
           h('button', { class: 'small', onclick: () => drawFoot(false) }, 'Cancel'),
-          h('button', { class: 'small danger', onclick: async () => { await WPStore.remove('jobs', j.id); S.jobs = S.jobs.filter((x) => x !== j); render(); } }, 'Delete'))
+          h('button', { class: 'small danger', onclick: async () => {
+            await WPStore.remove('jobs', j.id); S.jobs = S.jobs.filter((x) => x !== j);
+            if (S.plan && dayRunning()) { S.plan.jobsChanged = true; await savePlan(); } // the Route is NOT changed: the "tap PLAN" notice
+            render();
+          } }, 'Delete'))
         : h('div', { class: 'job-actions' },
           j.errandPlaceId ? null : h('button', { class: 'small urgent-toggle', 'aria-pressed': j.urgent ? 'true' : 'false', title: j.urgent ? 'Clear urgent' : 'Mark urgent', onclick: () => setUrgent(j, !j.urgent) }, 'Urgent'),
           h('button', { class: 'icon-btn edit-btn', 'aria-label': 'Edit job', title: 'Edit', onclick: editIt }, svgIcon(ICON_EDIT)), park, del);
-      foot.replaceChildren(...[j.notes ? h('div', { class: 'job-notes' }, j.notes) : null,
+      const aft = JobEdit.afterLine(j, (id) => dName(pName(id))); // the After rule: "after Asian Automotive, Carrier"
+      foot.replaceChildren(...[aft ? h('div', { class: 'job-notes after-line' }, aft) : null, j.notes ? h('div', { class: 'job-notes' }, j.notes) : null,
         j.carriedFrom ? h('div', { class: 'job-notes carried' }, 'Carried from ' + DayLog.fmtDate(j.carriedFrom) + (j.carryReason ? ' · ' + j.carryReason : '')) : null, actions].filter(Boolean));
     }
     drawFoot(false);
@@ -776,13 +798,25 @@
     const f0 = edit ? JobEdit.formOf(edit) : null;
     let mode = f0 ? f0.mode : 'delivery';
     const st = f0
-      ? { pickups: f0.pickups, deliveryPlaceId: f0.deliveryPlaceId, errandPlaceId: f0.errandPlaceId, dwellMin: f0.dwellMin, notes: f0.notes, urgent: f0.urgent, after: f0.after, before: f0.before, inHandItem: f0.inHandItem, firstStop: f0.firstStop }
-      : { pickups: [{ placeId: null, item: '' }], deliveryPlaceId: null, errandPlaceId: null, dwellMin: '', notes: pre ? pre.notes || '' : '', urgent: false, after: '', before: '', inHandItem: pre ? pre.item || '' : '', firstStop: false };
+      ? { pickups: f0.pickups, deliveryPlaceId: f0.deliveryPlaceId, errandPlaceId: f0.errandPlaceId, dwellMin: f0.dwellMin, notes: f0.notes, urgent: f0.urgent, after: f0.after, before: f0.before, inHandItem: f0.inHandItem, firstStop: f0.firstStop, afterPlaces: f0.afterPlaces.slice() }
+      : { pickups: [{ placeId: null, item: '' }], deliveryPlaceId: null, errandPlaceId: null, dwellMin: '', notes: pre ? pre.notes || '' : '', urgent: false, after: '', before: '', inHandItem: pre ? pre.item || '' : '', firstStop: false, afterPlaces: [] };
     const hasDone = !!(edit && JobEdit.donePickups(edit).length);
     const sh = openSheet(edit ? 'Edit job' : 'Add job');
     if (edit) sh.sheet.id = 'editJobSheet';
     const formNow = () => ({ mode, pickups: st.pickups.map((p) => ({ ref: p.ref, placeId: p.placeId, item: p.item })), deliveryPlaceId: st.deliveryPlaceId, inHandItem: st.inHandItem,
-      errandPlaceId: st.errandPlaceId, dwellMin: st.dwellMin, notes: st.notes, urgent: st.urgent, after: st.after, before: st.before, firstStop: !!st.firstStop });
+      errandPlaceId: st.errandPlaceId, dwellMin: st.dwellMin, notes: st.notes, urgent: st.urgent, after: st.after, before: st.before, firstStop: !!st.firstStop, afterPlaces: st.afterPlaces.slice() });
+    // After (today only): a multi-select of the places with an open job or errand today, not this entry's own place; empty = none
+    function afterField() {
+      const choices = JobEdit.afterChoices(S.jobs, formNow(), edit ? edit.id : null);
+      const row = (pid) => {
+        const on = st.afterPlaces.indexOf(pid) >= 0, pl = S.places[pid];
+        return h('button', { type: 'button', class: 'pick-row after-opt' + (on ? ' on' : ''), 'aria-pressed': String(on), 'data-place': pid,
+          onclick: () => { st.afterPlaces = on ? st.afterPlaces.filter((x) => x !== pid) : st.afterPlaces.concat([pid]); draw(); } },
+        h('span', { class: 'title' }, (on ? '✓ ' : '') + dName(pName(pid))), h('span', { class: 'muted' }, pl ? Messages.typeLabel(pl.type) : ''));
+      };
+      return [h('label', { class: 'field' }, 'After (optional) — this stop comes after these places'),
+        choices.length ? h('div', { class: 'after-list', id: 'afterList' }, choices.map(row)) : h('div', { class: 'muted', id: 'afterNone' }, 'No other place has an open job today')];
+    }
     function placeBtn(id, placeholder, onPick, btnId) {
       return h('button', { id: btnId || null, style: 'width:100%;text-align:left', onclick: () => openPlacePicker((p) => { onPick(p); draw(); }) }, id ? pName(id) : placeholder);
     }
@@ -828,6 +862,7 @@
         mode === 'delivery' ? h('label', { class: 'toggle' }, h('input', { type: 'checkbox', checked: st.urgent, onchange: (e) => { st.urgent = e.target.checked; } }), 'Urgent') : null,
         // First stop (today only): this entry's first stop is the first visit after the start; only one entry has it at a time
         h('label', { class: 'toggle' }, h('input', { type: 'checkbox', id: 'firstStopToggle', checked: !!st.firstStop, onchange: (e) => { st.firstStop = e.target.checked; } }), 'First stop'),
+        ...afterField(),
         h('div', { class: 'row' },
           h('div', { class: 'grow' }, h('label', { class: 'field' }, 'Arrive after'), h('input', { type: 'time', value: st.after, oninput: (e) => { st.after = e.target.value; } })),
           h('div', { class: 'grow' }, h('label', { class: 'field' }, 'Arrive before'), h('input', { type: 'time', value: st.before, oninput: (e) => { st.before = e.target.value; } }))),
@@ -866,6 +901,8 @@
         if (st.urgent) { j.urgent = true; j.urgentRank = urgentSorted().length + 1; }
         if (pre && pre.looseId && !j.pickups.length) j.looseId = pre.looseId; // this in-hand job now tracks the loose item
       }
+      const aft = JobEdit.afterToSave(Object.assign(formNow(), { mode })); // After (today only): stored only when chosen
+      if (aft.length) j.afterPlaces = aft;
       S.jobs.push(j);
       let moved = null;
       if (st.firstStop) { // one First stop at a time: it leaves the entry that had it
@@ -954,6 +991,7 @@
       const msgAt = S.plan && S.plan.ctx && S.plan.ctx.msgAt && replan ? S.plan.ctx.msgAt : {}; // MSG taps of the day (look-ahead rule)
       S.plan = { ctx: { start, end, jobs, places, departAtISO: input.departAtISO, matrices: got.matrices, dayKey, msgAt }, noDetour: replan ? prevNoDetour : false, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: { calls: got.calls, fromCache: got.fromCache, partial: !!got.partial, estimated: !!got.estimated, estimatedOrder: !!got.orderEstimated, refused: !!(routed ? routed.down : got.estimated), downStatus: routed ? (routed.down ? routed.down.status : null) : (got.error ? got.error.status : null), noRoute: S.tt.noRoute > noRoute0, service: ttService() } };
       if (routed) { S.plan.result = routed.res; S.plan.idx = 0; S.plan.alt = null; } else solveFresh();
+      S.plan.afterConflicts = (S.plan.result && S.plan.result.afterConflicts) || []; // After rules left out (the red banner)
       if (jobs !== allJobs) S.plan.ctx.jobs = allJobs; // lookups by job id still find the whole job (the solve above used the trimmed copy)
       if (carryLegs) S.plan.ctx.carryLegs = carryLegs;
       if (prevPlan) {
@@ -979,6 +1017,7 @@
     } finally {
       S.busy = false;
       render();
+      wake.sync({ retry: true }).then(paintWake); // after PLAN: keep the screen on while the day runs
       const sess = S.tt.planSess;
       const first = S.tab === 'route' && S.plan && !(S.loc.origin && S.tt.lastLiveAt != null && Date.now() - S.tt.lastLiveAt < 5000)
         ? refreshFromLocation({ trigger: 'plan', sess }) : null; // the Route tab's first re-time is part of this PLAN
@@ -1267,7 +1306,7 @@
     const P = S.plan, plan = curPlan();
     if (!P || !plan) return null;
     return {
-      v: 1, savedAt: new Date().toISOString(), tab: S.tab, jobsChanged: !!P.jobsChanged, noDetour: P.noDetour, provider: P.provider || null, ctx: P.ctx,
+      v: 1, savedAt: new Date().toISOString(), tab: S.tab, jobsChanged: !!P.jobsChanged, noDetour: P.noDetour, provider: P.provider || null, ctx: P.ctx, afterConflicts: P.afterConflicts || [],
       plan: Object.assign({}, plan, { model: Object.assign({}, plan.model, { matrices: null }) }), // matrices are stored once, in ctx
     };
   }
@@ -1286,7 +1325,7 @@
       delete snap.plan.endNavStartedAt; // the end point's navigation tap belongs to that day too
     }
     S.plan = {
-      ctx: snap.ctx, noDetour: !!snap.noDetour, jobsChanged: !!snap.jobsChanged, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: snap.provider || null,
+      ctx: snap.ctx, noDetour: !!snap.noDetour, jobsChanged: !!snap.jobsChanged, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: snap.provider || null, afterConflicts: Array.isArray(snap.afterConflicts) ? snap.afterConflicts : [],
       result: { plans: [snap.plan], error: null, stats: null, stopIds: snap.plan.model.stopIds },
     };
     if (['plan', 'route', 'places', 'settings'].includes(snap.tab)) S.tab = snap.tab;
@@ -1600,6 +1639,9 @@
       const droppedRows = (s.droppedOff || []).map((d) => h('div', { class: 'muted sum-dropped' }, 'Dropped off: ' + (d.item || '(item)') + ' ' + hm(d.t) + (d.place ? ' (' + dName(d.place) + ')' : '')));
       const withYou = h('div', { class: 'card sum-sec inhand', id: 'sumWithYou' }, h('div', { class: 'eyebrow' }, 'Still with you'),
         withRows.length ? withRows : h('div', { class: 'muted' }, 'Nothing in the van'), droppedRows);
+      // jobs cancelled mid-day (SKIP -> Cancel job): item and place; never carried to tomorrow
+      const cancelledSec = (s.cancelled || []).length ? h('div', { class: 'card sum-sec cancelled', id: 'sumCancelled' }, h('div', { class: 'eyebrow' }, 'Cancelled'),
+        s.cancelled.map((c) => line(h('span', { class: 'cancelled-line' }, (c.item || '(item)') + (c.place ? ' - ' + dName(c.place) : ''))))) : null;
 
       const notDone = sec('Not done', 'notdone', s.notDone.map((r) => {
         const dec = () => (day.decisions[r.jobId] = day.decisions[r.jobId] || {});
@@ -1634,7 +1676,7 @@
       // replaceChildren() turns a null into the text "null": only real nodes go in
       sh.body.replaceChildren(...[
         h('div', { class: 'muted sum-sub' }, day.driverId + ' · ' + (day.closed ? 'closed ' + (day.endedAt ? DL.fmtDate(DL.dateKey(Date.parse(day.endedAt))) + ' ' + hm(Date.parse(day.endedAt)) : '') : 'open') + (ro() ? ' · read-only' : '')),
-        tiles, timeRow, replansLine, splitCard, collected, delivered, errands, fuelLine, withYou, notDone,
+        tiles, timeRow, replansLine, splitCard, collected, delivered, errands, fuelLine, withYou, cancelledSec, notDone,
         h('div', { class: 'sum-actions' }, h('div', { class: 'row' }, copyBtn, csvBtn), h('div', { class: 'row' }, main, h('button', { onclick: sh.close }, 'Back')))].filter(Boolean));
     }
     draw();
@@ -1720,6 +1762,7 @@
     if (rbox) v.append(rbox);
     const note = jobsChangedNote();
     if (note) v.append(note);
+    { const ab = afterBanner(); if (ab) v.append(ab); }
     const r = P.result;
     if (r.error) {
       v.append(h('div', { class: 'violations' }, r.error), h('button', { onclick: () => { S.tab = 'plan'; render(); } }, 'Back to Plan'));
@@ -1960,7 +2003,7 @@
     // the ETA message goes to customers only: a stop with no delivery (a just-collect pickup) or a supplier place has no MSG
     if (hasDelivery && (S.places[baseId(stop.placeId)] || place).type !== 'supplier') btns.push(h('button', { class: 'small', onclick: () => { stopTapped(); noteMsg(stop.placeId); const m = stopMessage(stop, P.shiftMs); shareMessage(m.place, m.text); } }, 'MSG'));
     btns.push(primaryBtn(stop, i)); // REACHED, then DONE: one button, the place and size DONE always had
-    btns.push(h('button', { class: 'small', onclick: () => skipStop(stop, i) }, 'SKIP'));
+    btns.push(h('button', { class: 'small', onclick: () => openSkipSheet(stop, i) }, 'SKIP')); // Skip for today / Cancel job
     const rin = reachedInline(stop, i); // "Reached 14:10 · auto  Undo" at the end of the card's action lines (no extra row)
     return h('div', { class: 'card stop ' + (st || '') + (stop.detour ? ' detour' : '') + (rin ? ' reached' : '') },
       head, more,
@@ -2026,7 +2069,10 @@
       const jobs = {}; // the jobs as they are NOW (a pickup's done flag is set by DONE at that pickup): Reached.canAutoReach
       ((P.ctx && P.ctx.jobs) || []).forEach((j) => { jobs[j.id] = j; });
       S.jobs.forEach((j) => { jobs[j.id] = j; });
-      const id = Reached.autoReachTarget(fix, stops, { enabled: S.settings.autoReach !== false, visible: document.visibilityState === 'visible', now: Date.now(), jobs });
+      // within the Auto-Reached distance AND stopped (speed <= 2 m/s, or no speed and inside for 20 s): Reached.autoReachStep
+      const step = Reached.autoReachStep(S.arTrack, fix, stops, { enabled: S.settings.autoReach !== false, visible: document.visibilityState === 'visible', now: Date.now(), jobs, radiusM: Reached.radiusOf(S.settings.autoReachM) });
+      S.arTrack = step.track;
+      const id = step.id;
       if (!id) return false;
       const idx = plan.stops.findIndex((s) => s.placeId === id && !s.status), live = plan.stops[idx];
       if (!reachStop(live, 'auto')) return false;
@@ -2045,6 +2091,19 @@
   // once per 30 s (an auto-reach re-times at once). Errors never toast: denied / unavailable stop it until the next
   // visibility change; a timeout leaves it running (the platform keeps trying).
   const W = { id: null, starting: false, blocked: false, lastRetimeAt: null };
+  // ---------- KEEP THE SCREEN ON while a day is running (wakelock.js) ----------
+  // A day is running for the lock: a plan exists for TODAY and End day has not closed it (any tab counts). The browser drops the
+  // lock whenever the page is hidden: it is asked again on visible, after PLAN, and kept in step on every render (End day releases).
+  function lockWanted() {
+    if (!S.settings || S.settings.keepScreenOn === false || !S.plan || !curPlan()) return false;
+    const k = planDayKey();
+    if (k !== DL.dateKey(Date.now())) return false;
+    const d = S.days[k];
+    return !(d && d.closed);
+  }
+  const wake = WakeKeep.create({ nav: () => navigator, wanted: lockWanted, visible: () => document.visibilityState === 'visible', onChange: () => paintWake() });
+  const wakeText = () => (S.settings.keepScreenOn === false ? '' : WakeKeep.STATUS_TEXT[wake.state()] || '');
+  function paintWake() { const el = document.getElementById('wakeState'); if (el) el.textContent = wakeText(); }
   function watchWanted() {
     const day = S.plan ? S.days[planDayKey()] : null;
     return Reached.shouldWatch({ visible: document.visibilityState === 'visible', hasPendingStop: hasPendingStop(curPlan()), dayClosed: !!(day && day.closed) });
@@ -2070,7 +2129,7 @@
   function onWatchPosition(p) {
     try {
       if (W.id == null || !watchWanted() || !p || !p.coords) return; // a late callback after clearWatch
-      takeFix({ ok: true, lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy, at: p.timestamp != null ? p.timestamp : Date.now() }, 'watch');
+      takeFix({ ok: true, lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy, at: p.timestamp != null ? p.timestamp : Date.now(), speed: p.coords.speed != null && isFinite(p.coords.speed) ? p.coords.speed : null }, 'watch');
     } catch (e) { /* never break the page */ }
   }
   function onWatchError(e) {
@@ -2226,6 +2285,75 @@
     render();
     dayCompleteBanner();
     afterStop('done'); // after DONE: the live look-ahead (Part F) or one next-stop re-time; never blocks
+  }
+
+  // ---------- SKIP: "Skip for today" or "Cancel job" ----------
+  // SKIP on a Route card asks first: Skip for today (exactly what SKIP did: the stop is skipped, its jobs roll to tomorrow) or Cancel
+  // job (the office no longer needs it: OnBoard.cancelJobs). One job on the card = that one; several = a list to tick.
+  function cardJobLabel(stop, r) {
+    const j = S.jobs.find((x) => x.id === r.jobId) || ((S.plan && S.plan.ctx.jobs) || []).find((x) => x.id === r.jobId);
+    const a = (stop.actions || []).find((x) => x.jobId === r.jobId) || {};
+    if (a.kind === 'pickup') return 'Collect ' + (a.item || 'items') + (j && j.deliveryPlaceId ? ' → ' + dName(pName(j.deliveryPlaceId)) : '');
+    if (a.kind === 'deliver') return 'Deliver ' + (deliverItem(a) || 'item');
+    return 'Errand: ' + (a.item || 'Errand');
+  }
+  function openSkipSheet(stop0, i0) {
+    stopTapped();
+    const ls = liveStop(stop0, i0);
+    if (!ls) return;
+    const stop = ls.stop, list = OnBoard.jobsOnCard(stop);
+    const sh = openSheet('SKIP · ' + dName((placeOfStop(stop) || {}).name || ''));
+    sh.sheet.id = 'skipSheet';
+    const ticked = new Set();
+    function draw(picking) {
+      if (!picking) {
+        sh.body.replaceChildren(
+          h('button', { class: 'pick-row', id: 'skipToday', onclick: () => { sh.close(); skipStop(stop0, i0); } },
+            h('span', { class: 'title' }, 'Skip for today'), h('span', { class: 'muted' }, 'Stays pending and rolls to tomorrow')),
+          h('button', { class: 'pick-row', id: 'cancelJob', disabled: !list.length, onclick: () => { if (list.length === 1) { sh.close(); cancelOnRoute([list[0].jobId]); } else draw(true); } },
+            h('span', { class: 'title' }, 'Cancel job'), h('span', { class: 'muted' }, 'No longer needed: off the route, not carried to tomorrow')),
+          h('button', { onclick: sh.close }, 'Back'));
+        return;
+      }
+      const go = h('button', { class: 'primary', id: 'cancelTicked', disabled: !ticked.size, onclick: () => { sh.close(); cancelOnRoute(Array.from(ticked)); } }, 'Cancel ticked');
+      sh.body.replaceChildren(h('div', { class: 'muted' }, 'Tick the jobs to cancel. The others stay on the card.'),
+        h('div', { id: 'cancelList' }, list.map((r) => h('label', { class: 'check-row cancel-row' },
+          h('input', { type: 'checkbox', 'data-job': r.jobId, style: 'width:auto;min-height:0', onchange: (e) => { if (e.target.checked) ticked.add(r.jobId); else ticked.delete(r.jobId); go.disabled = !ticked.size; } }),
+          ' ' + cardJobLabel(stop, r)))),
+        h('div', { class: 'sticky-actions' }, h('button', { onclick: () => draw(false) }, 'Back'), go));
+    }
+    draw(false);
+  }
+  async function cancelOnRoute(ids) {
+    const P = S.plan, cur = curPlan();
+    if (!P || !cur || !ids.length) return;
+    const now = Date.now(), nowIso = iso(now);
+    const r = OnBoard.cancelJobs({ jobs: S.jobs, plan: cur, loose: S.loose }, ids, { nameOf: placeNameOf, at: now });
+    if (!r.cancelled.length) return;
+    S.jobs = r.jobs;
+    for (const c of r.cancelled) await saveJob(S.jobs.find((x) => x.id === c.jobId));
+    await setLoose(r.loose); // an item already collected: With you
+    try { const d = dayFor(now, true); r.cancelled.forEach((c) => DL.recordCancel(d, { nowIso, jobId: c.jobId, item: c.item, place: c.place })); bgSaveDay(d); } catch (e) { /* never break the cancel */ }
+    P.result.plans = [r.plan]; P.idx = 0; P.alt = null; S.loc.origin = null;
+    retimeNow(); // the same path SKIP uses: re-time, then the after-stop re-check
+    await savePlan();
+    render();
+    toastUndo('Cancelled: ' + r.cancelled.map((c) => (c.item || 'job') + (c.place ? ' (' + dName(c.place) + ')' : '')).join(', '), () => undoCancelTap(r));
+    afterStop('skip');
+  }
+  async function undoCancelTap(r) {
+    const P = S.plan, cur = curPlan();
+    if (!P || !cur) return;
+    const u = OnBoard.undoCancel({ jobs: S.jobs, plan: cur, loose: S.loose }, r.prev);
+    S.jobs = u.jobs;
+    for (const id of Object.keys(r.prev.jobs)) await saveJob(S.jobs.find((x) => x.id === id));
+    await setLoose(u.loose);
+    try { const d = dayFor(Date.now(), false); if (d) { Object.keys(r.prev.jobs).forEach((id) => DL.recordUndoCancel(d, { nowIso: iso(Date.now()), jobId: id })); bgSaveDay(d); } } catch (e) { /* ignore */ }
+    P.result.plans = [u.plan]; P.idx = 0; P.alt = null; P.reorder = null; S.loc.origin = null;
+    retimeNow();
+    await savePlan();
+    render();
+    refreshFromLocation({ trigger: 'undo' });
   }
 
   // A stop becomes skipped ONLY by this explicit tap (nothing else - DONE order, timing, replan - ever sets it).
@@ -2865,7 +2993,13 @@
       h('div', { class: 'card', id: 'reachedCard' }, h('h2', { style: 'margin-top:0' }, 'Reached'),
         h('label', { class: 'check-row' },
           h('input', { type: 'checkbox', id: 'autoReach', checked: s.autoReach !== false, style: 'width:auto;min-height:0', onchange: (e) => { s.autoReach = e.target.checked; saveSettings(); } }),
-          " Mark Reached automatically when I'm within 150 m (app open)")),
+          " Mark Reached automatically when I'm within " + Reached.radiusOf(s.autoReachM) + ' m and stopped (app open)'),
+        field('Auto-Reached distance (m)', h('input', { type: 'number', id: 'autoReachM', inputmode: 'numeric', min: String(Reached.RADIUS_MIN), max: String(Reached.RADIUS_MAX), step: '1', value: String(Reached.radiusOf(s.autoReachM)),
+          onchange: (e) => { const n = Number(e.target.value); if (Number.isInteger(n) && n >= Reached.RADIUS_MIN && n <= Reached.RADIUS_MAX) { s.autoReachM = n; saveSettings(); } else toast('Auto-Reached distance: a whole number from ' + Reached.RADIUS_MIN + ' to ' + Reached.RADIUS_MAX); render(); } })),
+        h('label', { class: 'check-row' },
+          h('input', { type: 'checkbox', id: 'keepScreenOn', checked: s.keepScreenOn !== false, style: 'width:auto;min-height:0', onchange: (e) => { s.keepScreenOn = e.target.checked; saveSettings(); wake.sync({ retry: true }).then(paintWake); } }),
+          ' Keep screen on while a day is running'),
+        h('div', { class: 'muted', id: 'wakeState' }, wakeText())),
       lunchSettingsCard(s, field),
       fuelSettingsCard(s, field),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Data'),
@@ -2962,6 +3096,7 @@
       let firstSeen = false; // First stop: true only (older exports have no field = off), one entry at most
       for (const j of data.jobs) {
         if (j && j.firstStop === true && !firstSeen && j.status !== 'done') firstSeen = true; else if (j) delete j.firstStop;
+        if (j) { const a = JobEdit.afterOf(j); if (a.length) j.afterPlaces = a; else delete j.afterPlaces; } // After: older exports have none = none
         S.jobs.push(j); await saveJob(j);
       }
       if (dl.present) {
@@ -3011,6 +3146,7 @@
     else renderSettings(v);
     window.scrollTo(0, scroll);
     syncWatch(); // the GPS watch follows the state (plan, pending stops, day closed) after every change
+    wake.sync().then(paintWake); // the screen lock too (End day / no day running releases it)
   }
 
   document.getElementById('tabs').addEventListener('click', (e) => {
@@ -3024,6 +3160,7 @@
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') { stopWatch(); return; }
     W.blocked = false; // a watch stopped by an error is retried now
+    wake.sync({ retry: true }).then(paintWake); // the browser dropped the screen lock when the page was hidden: ask again (day running only)
     if (!S.plan) return;
     lunchTick();
     if (retimeNow()) { savePlan(); if (S.tab === 'route') render(); }
@@ -3074,5 +3211,5 @@
     setupServiceWorker();
   }).catch((e) => banner('Startup failed: ' + e.message, 'error'));
 
-  window.WaypointDebug = { S, doPlan, render, minuteTick };
+  window.WaypointDebug = { S, doPlan, render, minuteTick, wake };
 })();

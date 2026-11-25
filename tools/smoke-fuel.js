@@ -261,7 +261,7 @@ async function main() {
 
     console.log('6. DONE on the fuel stop: logged as a stop, not a job');
     await click('.card.stop.fuel button.ok'); // REACHED first ...
-    await waitFor('/^DONE$/.test(document.querySelector(".card.stop.fuel button.ok").textContent)', 'the fuel button to read DONE');
+    await waitFor('/^✓ DONE$/.test(document.querySelector(".card.stop.fuel button.ok").textContent)', 'the fuel button to read ✓ DONE');
     await advance(1 / 60); // ... past the 500 ms double-tap guard ...
     await click('.card.stop.fuel button.ok'); // ... then DONE
     await waitFor('document.querySelector(".card.stop.done .title") && /Fuel/.test(document.querySelector(".card.stop.done .title").textContent)', 'the fuel stop to show as done');
