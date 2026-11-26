@@ -43,16 +43,20 @@ const GPS = { lat: 3.07, lng: 101.65 };
 // runs in the page before anything else: mocks + seed
 const INIT = `(() => {
   const RealDate = Date;
-  window.__off = 0; window.__online = true;
+  // world 2 (the 26 Nov Nilai case) is configured through localStorage.__world: its clock, GPS, Places results, leg minutes
+  let W = null; try { W = JSON.parse(localStorage.getItem('__world') || 'null'); } catch (e) { W = null; }
+  window.__world = W;
+  // the clock is pinned (never the real date): world 1 at 26 Nov 2026 09:00 MYT, world 2 at its own minute
+  window.__off = (W && W.at ? W.at : RealDate.UTC(2026, 10, 26, 1, 0, 0)) - RealDate.now(); window.__online = true;
   window.Date = class extends RealDate {
     constructor(...a) { if (a.length === 0) super(RealDate.now() + window.__off); else super(...a); }
     static now() { return RealDate.now() + window.__off; }
   };
   Object.defineProperty(Navigator.prototype, 'onLine', { get() { return window.__online !== false; }, configurable: true });
   try { delete Navigator.prototype.serviceWorker; } catch (e) { /* ignore */ }
-  const GPS = ${JSON.stringify(GPS)};
+  window.__gps = (W && W.gps) || ${JSON.stringify(GPS)};
   Object.defineProperty(navigator, 'geolocation', { configurable: true, value: {
-    getCurrentPosition(ok) { setTimeout(() => ok({ coords: { latitude: GPS.lat, longitude: GPS.lng, accuracy: 20 }, timestamp: Date.now() }), 0); },
+    getCurrentPosition(ok) { const g = window.__gps; setTimeout(() => ok({ coords: { latitude: g.lat, longitude: g.lng, accuracy: 20 }, timestamp: Date.now() }), 0); },
   } });
   try { navigator.permissions.query = async () => ({ state: 'granted', addEventListener() {} }); } catch (e) { /* ignore */ }
   const km = (a, b) => { const r = Math.PI / 180, dl = (b.lat - a.lat) * r, dg = (b.lng - a.lng) * r;
@@ -64,6 +68,7 @@ const INIT = `(() => {
     url = String(url);
     if (url.includes('places.googleapis.com')) {
       window.__calls.places++;
+      if (W && W.places) return json({ places: W.places });
       const b = JSON.parse(init.body), c = b.locationBias.circle.center, rad = b.locationBias.circle.radius / 1000;
       const out = [];
       for (let gi = Math.floor((c.latitude - 0.05) / 0.02); gi <= Math.ceil((c.latitude + 0.05) / 0.02); gi++) {
@@ -79,7 +84,10 @@ const INIT = `(() => {
       window.__calls.tomtom++;
       if (url.includes('/calculateRoute/')) { // the Routing API: one leg per request, coordinates in the path
         const q = [0].concat(url.split('/calculateRoute/')[1].split('/')[0].split(/[,:]/).map(Number));
-        const k = km({ lat: +q[1], lng: +q[2] }, { lat: +q[3], lng: +q[4] });
+        const qa = { lat: +q[1], lng: +q[2] }, qb = { lat: +q[3], lng: +q[4] };
+        const k = km(qa, qb);
+        const fixed = W && W.legs && W.legs.find((l) => km(l.a, qa) < 0.03 && km(l.b, qb) < 0.03); // world 2: the minutes Google showed
+        if (fixed) { window.__calls.legs = (window.__calls.legs || []).concat([fixed.name]); return json({ routes: [{ summary: { travelTimeInSeconds: fixed.min * 60, historicTrafficTravelTimeInSeconds: fixed.min * 60, lengthInMeters: Math.round(k * 1300) } }] }); }
         return json({ routes: [{ summary: { travelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), historicTrafficTravelTimeInSeconds: Math.round(k * 1.3 / 40 * 3600), lengthInMeters: Math.round(k * 1300) } }] });
       }
       const b = JSON.parse(init.body), data = [];
@@ -167,7 +175,13 @@ async function main() {
     const text = (sel) => ev('(() => { const e = document.querySelector(' + JSON.stringify(sel) + '); return e ? e.textContent : null; })()');
     const calls = () => ev('window.__calls.places');
     const advance = (min) => ev('window.__off += ' + (min * 60000));
-    const tap = async () => { await click('#fuelBtn'); await waitFor('document.querySelector("#fuelAdd")', 'the fuel preview'); };
+    const sheetText = () => ev('(() => { const b = document.querySelector(".backdrop"); return b ? b.innerText : ""; })()');
+    let sheetsSeen = 0, sheetsDirty = [];
+    const tap = async () => {
+      await click('#fuelBtn'); await waitFor('document.querySelector("#fuelAdd")', 'the fuel preview');
+      const t = await sheetText(); sheetsSeen++; // C: the sheet never prints a missing value
+      if (/null|undefined/.test(t)) sheetsDirty.push(t.replace(/\n/g, ' | '));
+    };
     const cancelSheet = async () => { await click('#fuelCancel'); await waitFor('!document.querySelector(".backdrop")', 'the sheet to close'); };
     const searchedN = async () => Number(/Searched (\d+) points/.exec(await text('#fuelSearched'))[1]);
 
@@ -284,6 +298,62 @@ async function main() {
     check((await ev('WaypointDebug.S.fuelStations.length')) === 0 && /^0 stations remembered/.test(await text('#fuelCount')), 'confirmed: the memory is empty');
     const exportJson = await ev('(() => { const x = { stations: WaypointDebug.S.fuelStations, brand: WaypointDebug.S.settings.fuelBrand, dwell: WaypointDebug.S.settings.fuelDwellMin, max: WaypointDebug.S.settings.fuelMaxSearches }; return x; })()');
     check(exportJson.brand === 'Caltex' && exportJson.dwell === 7 && exportJson.max === 50, 'the fuel settings are part of the stored settings (exported with them)', exportJson);
+
+    console.log('8. world 2: 26 Nov 2026 11:14 MYT, DONE in Nilai, Office then Home left, the first fuel search of the day');
+    const N = { lat: 2.8205, lng: 101.8040 }, O = { lat: 2.8230, lng: 101.8055 }, F = { lat: 3.09941, lng: 101.73900 }, H = { lat: 3.0757673, lng: 101.6609445 };
+    const ST = { lat: 2.8100, lng: 101.8290 }, ZUS = { lat: 2.8104, lng: 101.8293 };
+    const W2 = { at: Date.UTC(2026, 10, 26, 3, 0, 0), gps: N,
+      places: [
+        { id: 'zusPajam', displayName: { text: 'ZUS Coffee - Caltex Pajam' }, formattedAddress: 'Caltex Pajam, PT 2324 Jalan Pajam Nilai, 71700 Mantin, Negeri Sembilan', location: { latitude: ZUS.lat, longitude: ZUS.lng } },
+        { id: 'caltexPajam', displayName: { text: 'Caltex Pajam' }, formattedAddress: 'Caltex Pajam, PT2342, Jalan Pusat Perniagaan Sarjana 1, Pusat Perniagaan Sarjana, 71700 Mantin, Negeri Sembilan', location: { latitude: ST.lat, longitude: ST.lng } },
+      ],
+      legs: [{ name: 'O>S', a: O, b: ST, min: 11 }, { name: 'S>F', a: ST, b: F, min: 43 }, { name: 'O>F', a: O, b: F, min: 42 }, { name: 'F>H', a: F, b: H, min: 23 }] };
+    const SEED2 = {
+      'waypoint:settings:main': { googleKey: 'test-google', tomtomKey: 'test-tomtom', seeded: true, defaultLang: 'ms', nav: 'waze', driverName: 'Calvin' },
+      'waypoint:places:home': { id: 'home', name: 'Home (Bloomsvale)', address: 'Bloomsvale', lat: H.lat, lng: H.lng, type: 'home', dwellMin: 0, closedWindows: [] },
+      'waypoint:places:office': { id: 'office', name: 'Office (L-Tech)', address: 'L-Tech Automation', lat: F.lat, lng: F.lng, type: 'office', dwellMin: 10, closedWindows: [] },
+      'waypoint:places:pN': { id: 'pN', name: 'Nilai Customer', address: 'Arab Malaysia Industrial Estate, Nilai', lat: N.lat, lng: N.lng, type: 'factory', dwellMin: 15, closedWindows: [] },
+      'waypoint:jobs:jN': { id: 'jN', pickups: [], deliveryPlaceId: null, errandPlaceId: 'pN', dwellMin: 15, notes: 'Drop invoice', urgent: false, urgentRank: 0, arriveBefore: null, arriveAfter: null, status: 'pending', doneAt: null, createdAt: '2026-11-26T00:30:00.000Z' },
+      'waypoint:jobs:jF': { id: 'jF', pickups: [], inHandItem: 'Panel', deliveryPlaceId: 'office', notes: '', urgent: false, urgentRank: 0, arriveBefore: null, arriveAfter: null, status: 'pending', doneAt: null, createdAt: '2026-11-26T00:31:00.000Z' },
+    };
+    await ev('(() => { localStorage.clear(); const s = ' + JSON.stringify(SEED2) + '; Object.keys(s).forEach((k) => localStorage.setItem(k, JSON.stringify(s[k]))); localStorage.setItem("__seeded", "1"); localStorage.setItem("__world", ' + JSON.stringify(JSON.stringify(W2)) + '); return true; })()');
+    await send('Page.navigate', { url: appUrl });
+    await waitFor('document.querySelector("#planBtn") && window.__world', 'the Plan tab (world 2)');
+    check(await ev('new Date().toISOString().slice(0, 13)') === '2026-11-26T03', 'world 2 clock pinned to 26 Nov 2026 11:00 MYT');
+    await click('#planBtn');
+    await waitFor('window.WaypointDebug && WaypointDebug.S.plan && WaypointDebug.S.tab === "route" && document.querySelector("#fuelBtn")', 'the planned route (world 2)');
+    const ids2 = await ev('WaypointDebug.S.plan.result.plans[0].stops.map((s) => s.placeId).join()');
+    check(ids2 === 'pN,office', 'the route: Nilai, then Office (L-Tech), then Home', ids2);
+    await click('.card.stop button.ok'); // REACHED at Nilai ...
+    await waitFor('/^✓ DONE$/.test(document.querySelector(".card.stop button.ok").textContent)', 'the Nilai button to read ✓ DONE');
+    await advance(1 / 60);
+    await click('.card.stop button.ok'); // ... then DONE
+    await waitFor('WaypointDebug.S.plan.result.plans[0].stops[0].status === "done"', 'DONE at Nilai');
+    await advance(13);
+    const liveAt = async () => ev('(() => { window.__gps = ' + JSON.stringify(O) + '; WaypointDebug.S.loc.origin = { lat: ' + O.lat + ', lng: ' + O.lng + ', usedAt: Date.now() }; return true; })()');
+    await liveAt();
+    await sleep(400);
+    await liveAt();
+    const tt0 = await ev('window.__calls.tomtom'), lg0 = await ev('(window.__calls.legs || []).length');
+    await tap();
+    const tt1 = await ev('window.__calls.tomtom'), legs2 = await ev('(window.__calls.legs || []).slice(' + lg0 + ')');
+    check((await text('#fuelDetour')) === '+12 min · between your location and Office (L-Tech)', 'A1: the sheet shows "+12 min" (11 + 43 - 42), not "+0 min"', await text('#fuelDetour'));
+    check((await text('#fuelName')) === 'Caltex Pajam', 'B: the station offered is "Caltex Pajam", not the cafe inside it', await text('#fuelName'));
+    check(['O>S', 'S>F', 'O>F'].every((x) => legs2.includes(x)), 'A3: in, out and the direct leg it replaces were all fetched now', legs2);
+    check(tt1 - tt0 <= 16, 'A7: TomTom requests for this fuel search (' + (tt1 - tt0) + ') within the 16 of the design', tt1 - tt0);
+    const mem2 = await ev('WaypointDebug.S.fuelStations.map((s) => s.name).join("|")');
+    check(mem2 === 'Caltex Pajam', 'B: only the station is remembered (the cafe is not saved)', mem2);
+    await click('#fuelAdd');
+    await waitFor('document.querySelector(".card.stop.fuel")', 'the fuel stop card (world 2)');
+    check(/Caltex Pajam/.test(await ev('document.querySelector(".card.stop.fuel").innerText')), 'the Route card reads Caltex Pajam');
+    await liveAt();
+    await sleep(400);
+    await liveAt();
+    await tap();
+    check(/^Change fuel stop/.test(await ev('document.querySelector(".backdrop").innerText')), 'the Change fuel stop sheet is open');
+    check((await text('#fuelDetour')) === '+12 min · between your location and Office (L-Tech)', 'A6: the Change sheet compares against the route without the fuel stop: "+12 min"', await text('#fuelDetour'));
+    await cancelSheet();
+    check(sheetsSeen >= 7 && sheetsDirty.length === 0, 'C: no fuel sheet (' + sheetsSeen + ' seen) contains "null" or "undefined"', sheetsDirty);
 
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {

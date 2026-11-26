@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '4058925d'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = 'ee362ecf'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -92,6 +92,7 @@
     await runTomTomMigration(); // once per device: TomTom service = Routing; the Bahasa Malaysia template's old default -> the new one
     await runPlacesRepair(); // once per device: Google Places "this month" never below "today"
     await runAutoReachMigration(); // once per device: Auto-Reached distance = 80 m
+    try { await runFuelStationsClean(); } catch (e) { /* never block the launch */ } // once per device: no shops in the station memory
     await loadDays();
     S.loose = (await WPStore.list('loose')).filter((x) => x && x.id);
     await backfillLoose(); // once: today's / the latest closed day's collect-only jobs get their loose item
@@ -160,6 +161,13 @@
     await saveSettings();
     rec[Reached.RADIUS_FLAG] = true;
     await WPStore.set('meta', 'migrations', rec);
+  }
+  // One-time (2026-11-26, flag meta/migrations.fuelStationsClean2026_11_26): the station memory (the app's own cache, never the
+  // Places tab) loses the shops saved as stations ("ZUS Coffee - Caltex Pajam") and keeps one of two entries within 150 m
+  // (Fuel.cleanStations). Only meta/fuelStations is written: a fuel stop in today's route (plan ctx.places) and the day history are untouched.
+  async function runFuelStationsClean() {
+    const r = await Fuel.cleanStationsOnce(WPStore, fuelBrand());
+    if (r) S.fuelStations = r.list;
   }
   const dwellToastText = (r) => 'Updated: ' + r.suppliers + ' supplier places to 10 min, ' + r.customers + ' customer places to 30 min, ETA padding to 10 min';
   // An active plan: the stops not done take the new place dwell; the next re-time (existing path) moves the times. The order is kept.
@@ -2731,13 +2739,13 @@
           const found = [];
           const run = await Fuel.mapLimit(targets, 5, async (pt) => {
             const res = await Providers.searchGoogle(brand, s.googleKey, bumpPlacesCalls, { bias: { lat: pt.lat, lng: pt.lng, radius: FUEL_RADIUS_M } });
-            res.filter((r) => Fuel.nameHasBrand(r.name, brand)).forEach((r) => found.push({ placeId: r.id || ('ll:' + llKey(r)), name: r.name, address: r.address, lat: r.lat, lng: r.lng, brand }));
+            res.filter((r) => Fuel.nameHasBrand(r.name, brand) && Fuel.isStationName(r.name, brand)).forEach((r) => found.push({ placeId: r.id || ('ll:' + llKey(r)), name: r.name, address: r.address, lat: r.lat, lng: r.lng, brand }));
           }, (d, n) => { status.textContent = 'Searching ' + d + ' of ' + n + '…'; }, () => cancelled);
           if (cancelled) return;
           if (run.errors.length >= targets.length) { rememberedOnly = true; failNote = 'Google search failed (' + (run.errors[0].message || 'error') + ')'; }
           else fuelRun = { key: rkey, at: Date.now(), searched: targets.length };
           searched = targets.length;
-          S.fuelStations = Fuel.mergeStations(S.fuelStations, found);
+          S.fuelStations = Fuel.cleanStations(Fuel.mergeStations(S.fuelStations, found), brand); // two entries within 150 m: one stays
           await saveStations();
         }
       }
@@ -2748,8 +2756,9 @@
       const stationPts = known.map((st) => Object.assign({}, st, { fuel: true, key: llKey(st) }));
       const cands = Fuel.allCandidates(pts, stationPts, legs);
       const estMin = (a, b) => (a.key === b.key ? 0 : Budget.estSec(a, b) / 60);
-      const baseTT = makeTT(base, Date.now(), () => null, null); // A -> B: the plan's own table (no request)
-      const pick = await Fuel.realTimeShortlist(cands, estMin, async (a, b) => { const r = await ttLeg(a, b, null); return r && r.seconds != null ? r.seconds / 60 : null; }, baseTT, 8);
+      // in, out AND the direct leg it replaces, all from TomTom now (16 requests at most, as before); never the plan's table or an
+      // estimate for the direct leg (a live-GPS origin is not a plan point: the 35 km/h estimate made the figure "+0")
+      const pick = await Fuel.realTimeShortlist(cands, estMin, async (a, b) => { const r = await ttLeg(a, b, null); return r && r.seconds != null ? r.seconds / 60 : null; }, 8, 16);
       if (cancelled) return;
       const fzs = {};
       const fzOf = (st) => fzs[st.placeId] || (fzs[st.placeId] = makeFuelT(st, pick.times, pts, base));
@@ -2758,18 +2767,20 @@
       // --- 4d: preview ---
       let cur = 0;
       const draw = () => {
-        const c = sorted[cur], mins = Math.max(0, Math.round(c.detourMin));
-        sh.body.replaceChildren(
+        const c = sorted[cur];
+        // replaceChildren() turns a null into the text "null" (the old "nullnull"): only real nodes go in
+        sh.body.replaceChildren(...[
           h('div', { class: 'title', id: 'fuelName' }, c.station.name),
           c.station.address ? h('div', { class: 'muted', id: 'fuelAddr' }, c.station.address) : null,
-          h('div', { class: 'fuel-detour', id: 'fuelDetour' }, '+' + mins + ' min · between ' + (c.a.name || 'here') + ' and ' + (c.b.name || 'the end')),
+          h('div', { class: 'fuel-detour', id: 'fuelDetour' }, Fuel.detourText(c) + ' · between ' + (c.a.name || 'here') + ' and ' + (c.b.name || 'the end')),
           h('div', { class: 'muted fuel-small', id: 'fuelSearched' }, 'Searched ' + searched + ' points · ' + S.fuelStations.length + ' stations remembered' + (reuse ? ' (recent search reused)' : '')),
           rememberedOnly ? h('div', { class: 'muted fuel-small', id: 'fuelNote' }, (failNote ? failNote + ' - ' : '') + 'Using remembered stations only') : null,
           limited && !reuse ? h('div', { class: 'muted fuel-small', id: 'fuelLimited' }, 'Search limited today (Places daily guard) - result may not be the best') : null,
           h('div', { class: 'sticky-actions' },
             h('button', { class: 'primary', id: 'fuelAdd', onclick: async () => { const pick = sorted[cur]; sh.close(); await commitFuel(pick, fzOf(pick.station)); } }, 'Add'),
             h('button', { id: 'fuelNext', disabled: sorted.length < 2, onclick: () => { cur = (cur + 1) % sorted.length; draw(); } }, 'Next best'),
-            h('button', { id: 'fuelCancel', onclick: sh.close }, 'Cancel')));
+            h('button', { id: 'fuelCancel', onclick: sh.close }, 'Cancel')),
+        ].filter(Boolean));
       };
       draw();
     } catch (e) {

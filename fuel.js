@@ -1,5 +1,6 @@
 /* L-Tech Waypoint — fuel.js
- * "Add fuel stop": pure helpers (no DOM, no network, no storage). The app owns every call; this file owns the maths:
+ * "Add fuel stop": pure helpers (no DOM, no network; storage only through a store handed in, for the one-time station
+ * clean-up). The app owns every call; this file owns the maths:
  * where to look for stations along the remaining route, which legs may take a fuel stop, how many Places searches
  * are allowed, the permanent station memory merge, and the choice of the lowest-detour insertion.
  *
@@ -73,7 +74,8 @@
   // The points still ahead: the origin, each stop not done / skipped, the end point.
   function remainingPoints(route) {
     const pts = [Object.assign({ role: 'origin' }, route.origin)];
-    (route.stops || []).forEach((s) => { if (s.status !== 'done' && s.status !== 'skipped') pts.push(Object.assign({ role: 'stop' }, s)); });
+    // a fuel stop already in the route is never part of the route a fuel stop is planned around (Change compares without it)
+    (route.stops || []).forEach((s) => { if (s.status !== 'done' && s.status !== 'skipped' && !s.fuel) pts.push(Object.assign({ role: 'stop' }, s)); });
     pts.push(Object.assign({ role: 'end' }, route.end));
     return pts;
   }
@@ -141,16 +143,25 @@
     });
     return out;
   }
-  // Rank every candidate with the estimator (estMin(p, q) -> minutes), keep the best n (default 8), fetch the real times of
-  // their two station legs (fetchMin(p, q) -> Promise<minutes>; each distinct leg once: at most 2n requests), then choose
-  // among those n with the existing rule (pickInsertion; baseMin(p, q) = the route's own leg A -> B, no request).
-  // Points carry .key. Returns {sorted, requests, times: Map "a>b" -> minutes, estimated (TomTom out: the estimate ranking)}.
-  async function realTimeShortlist(candidates, estMin, fetchMin, baseMin, n) {
+  // Rank every candidate with the estimator (estMin(p, q) -> minutes), then walk that ranking and take up to n candidates
+  // (default 8) whose THREE legs fit in maxRequests distinct requests (default 2n = 16, the design's cap since 24 Nov): the leg
+  // into the station A -> S, the leg out S -> B, and the direct leg A -> B it replaces. All three come from the same source
+  // (fetchMin(p, q) -> Promise<minutes>, the live service, now), each distinct leg once. Added minutes = t(A,S) + t(S,B) - t(A,B).
+  // A candidate missing any of the three has detourMin null ("time not available") and ranks after every real figure.
+  // Points carry .key. Returns {sorted, requests, times: Map "a>b" -> minutes, estimated (TomTom out part-way)}.
+  async function realTimeShortlist(candidates, estMin, fetchMin, n, maxRequests) {
     n = n == null ? 8 : n;
-    const ranked = pickInsertion(candidates, estMin).slice(0, n);
-    const need = [], seen = new Set();
-    const want = (p, q) => { const k = p.key + '>' + q.key; if (!seen.has(k)) { seen.add(k); need.push([p, q, k]); } };
-    ranked.forEach((c) => { want(c.a, c.station); want(c.station, c.b); });
+    maxRequests = maxRequests == null ? 2 * n : maxRequests;
+    const lk = (p, q) => p.key + '>' + q.key;
+    const ranked = pickInsertion(candidates, estMin);
+    const picked = [], seen = new Set(), need = [];
+    for (const c of ranked) {
+      if (picked.length >= n) break;
+      const fresh = [[c.a, c.station], [c.station, c.b], [c.a, c.b]].filter(([p, q], i, arr) => p.key !== q.key && !seen.has(lk(p, q)) && arr.findIndex(([x, y]) => lk(x, y) === lk(p, q)) === i);
+      if (need.length + fresh.length > maxRequests) continue; // would go over the cap: a cheaper candidate further down may still fit
+      fresh.forEach(([p, q]) => { seen.add(lk(p, q)); need.push([p, q, lk(p, q)]); });
+      picked.push(c);
+    }
     const times = new Map();
     let down = false, requests = 0;
     await mapLimit(need, 4, async ([p, q, k]) => {
@@ -158,15 +169,21 @@
       requests++;
       try { const v = await fetchMin(p, q); if (v != null && isFinite(v)) times.set(k, v); } catch (e) { if (e && e.kind === 'limit') down = true; }
     });
-    if (down) return { sorted: ranked, requests, times, estimated: true };
-    const tt = (p, q) => {
-      const k = p.key + '>' + q.key;
-      if (times.has(k)) return times.get(k);
-      if (p.fuel || q.fuel) return null;
-      return baseMin(p, q);
-    };
-    return { sorted: pickInsertion(ranked.map((c) => ({ station: c.station, a: c.a, b: c.b, legIndex: c.legIndex })), tt), requests, times, estimated: false };
+    const tt = (p, q) => (p.key === q.key ? 0 : times.has(lk(p, q)) ? times.get(lk(p, q)) : null);
+    const rows = picked.map((c, order) => {
+      const ta = tt(c.a, c.station), tb = tt(c.station, c.b), tab = tt(c.a, c.b);
+      const real = ta != null && tb != null && tab != null && isFinite(ta + tb + tab);
+      return { station: c.station, a: c.a, b: c.b, legIndex: c.legIndex, detourMin: real ? ta + tb - tab : null, order };
+    });
+    rows.sort((x, y) => {
+      if ((x.detourMin == null) !== (y.detourMin == null)) return x.detourMin == null ? 1 : -1; // real figures first
+      if (x.detourMin != null) { const d = x.detourMin - y.detourMin; if (Math.abs(d) > 1e-9) return d; return (x.legIndex - y.legIndex) || (x.order - y.order); }
+      return x.order - y.order; // no figure: the estimate ranking
+    });
+    return { sorted: rows, requests, times, estimated: down };
   }
+  // The added-minutes text on the sheet: "+N min", or "time not available" when any of the three legs is missing (never "+0").
+  const detourText = (c) => (c && c.detourMin != null && isFinite(c.detourMin) ? '+' + Math.max(0, Math.round(c.detourMin)) + ' min' : 'time not available');
 
   // How many Places searches this tap may make.
   function searchBudget(needed, maxPerTap, callsToday, dailyGuard) {
@@ -203,8 +220,51 @@
   // Does a result name carry the brand (case-insensitive)?
   const nameHasBrand = (name, brand) => !!brand && String(name || '').toLowerCase().includes(String(brand).trim().toLowerCase());
 
-  // Remembered stations of the current brand.
-  const stationsOfBrand = (list, brand) => (list || []).filter((s) => nameHasBrand(s.name, brand) || (s.brand && String(s.brand).trim().toLowerCase() === String(brand || '').trim().toLowerCase()));
+  // Is this search result the fuel station itself (not a shop inside it)? The Places request carries no place type (adding
+  // one to the field mask was not checked against the billing SKU), so the name decides: kept when it starts with the brand,
+  // or when the only words before the brand are station words ("Stesen Minyak Caltex ..."); dropped when another business
+  // name comes before the brand ("ZUS Coffee - Caltex Pajam", "FamilyMart @ Caltex ..."). A name without the brand is kept
+  // only when it says Stesen / Station / Petrol / Minyak.
+  const STATION_WORDS = new Set(['stesen', 'station', 'petrol', 'minyak']);
+  function isStationName(name, brand) {
+    const low = String(name || '').trim().toLowerCase(), b = String(brand || '').trim().toLowerCase();
+    if (!low) return false;
+    const i = b ? low.indexOf(b) : -1;
+    if (i === 0) return true;
+    if (i > 0) return low.slice(0, i).split(/[^a-z0-9]+/).filter(Boolean).every((w) => STATION_WORDS.has(w));
+    return low.split(/[^a-z0-9]+/).some((w) => STATION_WORDS.has(w));
+  }
+  const DUP_M = 150;
+  // The station memory cleaned: entries that are not stations (isStationName with their own brand, else `brand`) go; of two
+  // entries within 150 m one stays: the one whose name starts with the brand, else the one remembered first. Inputs untouched.
+  function cleanStations(list, brand) {
+    const startsBrand = (s) => { const b = String(s.brand || brand || '').trim().toLowerCase(); return !!b && String(s.name || '').trim().toLowerCase().startsWith(b); };
+    const out = [];
+    (list || []).forEach((s) => {
+      if (!s || !isStationName(s.name, s.brand || brand)) return;
+      const j = out.findIndex((k) => isFinite(k.lat) && isFinite(s.lat) && haversineKm(k, s) * 1000 <= DUP_M);
+      if (j < 0) { out.push(Object.assign({}, s)); return; }
+      if (!startsBrand(out[j]) && startsBrand(s)) out[j] = Object.assign({}, s);
+    });
+    return out;
+  }
+  const CLEAN_FLAG = 'fuelStationsClean2026_11_26';
+  // Once per device (flag meta/migrations.<CLEAN_FLAG>): cleanStations over the stored memory (meta/fuelStations) only. The store
+  // is handed in (get / set, as WPStore); nothing else in it is read or written. -> null (already done) | {before, after, list}.
+  async function cleanStationsOnce(store, brand) {
+    const rec = (await store.get('meta', 'migrations')) || { done: [] };
+    if (rec[CLEAN_FLAG]) return null;
+    const fm = await store.get('meta', 'fuelStations');
+    const list = fm && Array.isArray(fm.list) ? fm.list : [];
+    const out = cleanStations(list, brand);
+    if (JSON.stringify(out) !== JSON.stringify(list)) await store.set('meta', 'fuelStations', Object.assign({}, fm, { list: out }));
+    rec[CLEAN_FLAG] = true;
+    await store.set('meta', 'migrations', rec);
+    return { before: list.length, after: out.length, list: out };
+  }
+
+  // Remembered stations of the current brand (never a shop inside a station).
+  const stationsOfBrand = (list, brand) => (list || []).filter((s) => (nameHasBrand(s.name, brand) || (s.brand && String(s.brand).trim().toLowerCase() === String(brand || '').trim().toLowerCase())) && isStationName(s.name, s.brand || brand));
 
   // Run fn over items, at most `limit` at a time. fn(item, index) never throws into the pool (errors are collected).
   // onProgress(doneCount, total) after each. Returns {results, errors}. cancelled() true = stop starting new ones.
@@ -226,7 +286,7 @@
 
   return {
     DAILY_GUARD, REUSE_MS, FUEL_ID,
-    haversineKm, corridorDetourKm, evenIndices, thinEvenly, samplePoints, remainingPoints, allowedLegs, shortlist, pickInsertion, allCandidates, realTimeShortlist,
-    searchBudget, mergeStations, sameRouteKey, nameHasBrand, stationsOfBrand, mapLimit,
+    haversineKm, corridorDetourKm, evenIndices, thinEvenly, samplePoints, remainingPoints, allowedLegs, shortlist, pickInsertion, allCandidates, realTimeShortlist, detourText,
+    searchBudget, mergeStations, sameRouteKey, nameHasBrand, isStationName, cleanStations, CLEAN_FLAG, cleanStationsOnce, stationsOfBrand, mapLimit,
   };
 });

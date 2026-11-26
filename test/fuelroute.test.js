@@ -24,15 +24,14 @@ const k = (p) => Object.assign({}, p, { key: key(p) });
   const estMin = (a, b) => Budget.estSec(a, b) / 60;
   const calls = [];
   const fetchMin = async (a, b) => { calls.push(a.key + '>' + b.key); return estMin(a, b) * (1.2 + (calls.length % 5) / 10); };
-  const res = await Fuel.realTimeShortlist(cands, estMin, fetchMin, estMin, 8);
+  const res = await Fuel.realTimeShortlist(cands, estMin, fetchMin, 8, 16);
   ok(calls.length <= 16 && res.requests === calls.length, 'at most 16 Routing requests (' + calls.length + ')', calls.length);
   ok(new Set(calls).size === calls.length, 'no leg is fetched twice');
-  const top8 = Fuel.pickInsertion(cands, estMin).slice(0, 8);
-  const fetchedKeys = new Set(top8.map((c) => c.station.placeId + '@' + c.legIndex));
-  ok(res.sorted.length > 0 && res.sorted.length <= 8 && fetchedKeys.has(res.sorted[0].station.placeId + '@' + res.sorted[0].legIndex), 'the chosen (station, position) is among the 8 fetched', res.sorted[0] && res.sorted[0].station.placeId);
+  const fetched = new Set(calls), got = (p, q) => p.key === q.key || fetched.has(p.key + '>' + q.key); // the same point = 0, no request
+  ok(res.sorted.length > 0 && res.sorted.length <= 8 && res.sorted.every((c) => got(c.a, c.station) && got(c.station, c.b) && got(c.a, c.b)), 'every (station, position) offered had its in, out and direct legs fetched (' + res.sorted.length + ' of at most 8)', res.sorted.length);
   ok(res.sorted.every((c, i) => i === 0 || c.detourMin >= res.sorted[i - 1].detourMin), 'ordered by the existing rule (smallest detour first)');
-  const down = await Fuel.realTimeShortlist(cands, estMin, async () => { const e = new Error('down'); e.kind = 'limit'; throw e; }, estMin, 8);
-  ok(down.estimated && down.sorted.length === 8, 'TomTom out: the estimate ranking is used (still the same 8)');
+  const down = await Fuel.realTimeShortlist(cands, estMin, async () => { const e = new Error('down'); e.kind = 'limit'; throw e; }, 8, 16);
+  ok(down.estimated && down.sorted.length === res.sorted.length && down.sorted.every((c) => c.detourMin == null), 'TomTom out: the same candidates in the estimate order, each "time not available"');
 
   console.log('\n' + passes + ' passed, ' + failures + ' failed');
   process.exit(failures ? 1 : 0);
