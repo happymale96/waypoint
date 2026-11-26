@@ -15,7 +15,7 @@ function pngSize(f) {
   return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) };
 }
 
-const EXPECT = [['icon-192.png', 192, 'any'], ['icon-512.png', 512, 'any'], ['maskable-192.png', 192, 'maskable'], ['icon-512-maskable.png', 512, 'maskable']];
+const EXPECT = [['icon-v2-192.png', 192, 'any'], ['icon-v2-512.png', 512, 'any'], ['maskable-v2-192.png', 192, 'maskable'], ['maskable-v2-512.png', 512, 'maskable']];
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
 const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
 const sw = fs.readFileSync(path.join(ROOT, 'sw.js'), 'utf8');
@@ -37,7 +37,7 @@ ok(/<header class="topbar"><picture>.*symbol-on-dark\.svg/.test(html), 'header u
   let sharp = null;
   try { sharp = require(path.join(__dirname, 'node_modules', 'sharp')); } catch (e) { /* sharp optional */ }
   if (!sharp) { ok(false, 'sharp is installed in tools/ (needed for the safe-zone check)'); return; }
-  const { data, info } = await sharp(path.join(ROOT, 'icon-512-maskable.png')).flatten({ background: '#ffffff' }).raw().toBuffer({ resolveWithObject: true });
+  const { data, info } = await sharp(path.join(ROOT, 'maskable-v2-512.png')).flatten({ background: '#ffffff' }).raw().toBuffer({ resolveWithObject: true });
   const N = info.width, ch = info.channels, c = N / 2, r = N * 0.4;
   let minX = N, maxX = -1, minY = N, maxY = -1, outside = 0;
   for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {

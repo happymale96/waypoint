@@ -7,9 +7,9 @@
  * - Icons / fonts / images: CACHE-FIRST.
  * - Cross-origin requests (TomTom, Google APIs, anything else) are never intercepted or cached.
  */
-const BUILD = '528bab74';
+const BUILD = '2f755525';
 const CACHE = 'waypoint-' + BUILD;
-const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'solver.js', 'reached.js', 'lunchbreak.js', 'budget.js', 'traveltimes.js', 'providers.js', 'storage.js', 'messages.js', 'daylog.js', 'geo.js', 'fuel.js', 'onboard.js', 'jobedit.js', 'wakelock.js', 'proof.js', 'camera.js', 'scan.js', 'manifest.json', 'icon-192.png', 'icon-512.png', 'maskable-192.png', 'icon-512-maskable.png', 'apple-touch-icon-180.png', 'favicon-48.png', 'favicon-32.png', 'favicon.svg', 'symbol-on-light.svg', 'symbol-on-dark.svg', 'symbol-header-onlight.svg', 'logo-horizontal-on-dark.svg', 'whatsapp-glyph.svg'];
+const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'solver.js', 'reached.js', 'lunchbreak.js', 'budget.js', 'traveltimes.js', 'providers.js', 'storage.js', 'messages.js', 'daylog.js', 'geo.js', 'fuel.js', 'onboard.js', 'jobedit.js', 'wakelock.js', 'proof.js', 'camera.js', 'scan.js', 'manifest.json', 'icon-v2-192.png', 'icon-v2-512.png', 'maskable-v2-192.png', 'maskable-v2-512.png', 'apple-touch-icon-180.png', 'favicon-48.png', 'favicon-32.png', 'favicon.svg', 'symbol-on-light.svg', 'symbol-on-dark.svg', 'symbol-header-onlight.svg', 'logo-horizontal-on-dark.svg', 'whatsapp-glyph.svg'];
 const NEVER_CACHE = /(^|\.)(tomtom\.com|googleapis\.com)$/i; // belt and braces: these are cross-origin anyway
 const CODE = /\.(html|js|css|json)$/i;
 const STATIC = /\.(png|jpe?g|gif|svg|ico|webp|woff2?|ttf|otf)$/i;

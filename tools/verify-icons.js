@@ -7,6 +7,8 @@
  *   - each PNG's IHDR width/height match its declared size (manifest "sizes", <link sizes>, or the size in the name)
  *   - each copied PNG/SVG's SHA-256 equals the matching line in the pack's SHA256SUMS.txt
  *   - the manifest has "any" and "maskable" entries at 192 and 512
+ *   - every SHELL entry in sw.js and tools/stamp-sw.js (except './') exists on disk
+ *   - the four -v2 manifest icons have their fixed SHA-256 values
  */
 const fs = require('fs');
 const path = require('path');
@@ -62,10 +64,10 @@ if (packDir) fs.readFileSync(path.join(packDir, 'SHA256SUMS.txt'), 'utf8').split
   const m = /^([0-9a-f]{64})\s+\*?(.+)$/i.exec(l.trim());
   if (m) sums.set(m[2].trim(), m[1].toLowerCase());
 });
-// repo file -> pack file (same role; repo keeps its existing name for icon-512-maskable.png)
+// repo file -> pack file (same role; the manifest icons carry a -v2 name in the repo so installed copies refetch them)
 const MAP = {
-  'icon-192.png': 'icon-192.png', 'icon-512.png': 'icon-512.png',
-  'maskable-192.png': 'maskable-192.png', 'icon-512-maskable.png': 'maskable-512.png',
+  'icon-v2-192.png': 'icon-192.png', 'icon-v2-512.png': 'icon-512.png',
+  'maskable-v2-192.png': 'maskable-192.png', 'maskable-v2-512.png': 'maskable-512.png',
   'apple-touch-icon-180.png': 'apple-touch-icon-180.png', 'favicon-48.png': 'favicon-48.png', 'favicon-32.png': 'favicon-32.png',
   'favicon.svg': 'favicon.svg', 'icon-maskable.svg': 'icon-maskable.svg', 'icon-rounded.svg': 'icon-rounded.svg',
   'symbol-on-light.svg': 'symbol-on-light.svg', 'symbol-on-dark.svg': 'symbol-on-dark.svg',
@@ -74,6 +76,29 @@ if (packDir) Object.entries(MAP).forEach(([repoFile, packFile]) => {
   const want = sums.get(packFile);
   const p = path.join(ROOT, repoFile);
   ok(!!want && fs.existsSync(p) && sha(p) === want, repoFile + ' matches pack ' + packFile);
+});
+
+console.log('service worker SHELL files exist');
+for (const f of ['sw.js', path.join('tools', 'stamp-sw.js')]) {
+  const src = fs.readFileSync(path.join(ROOT, f), 'utf8');
+  const m = /const SHELL = \[([\s\S]*?)\];/.exec(src);
+  ok(!!m, f + ' has a SHELL list');
+  if (m) for (const e of m[1].matchAll(/'([^']+)'/g)) {
+    if (e[1] === './') continue;
+    ok(fs.existsSync(path.join(ROOT, e[1])), f + ' SHELL: ' + e[1] + ' exists');
+  }
+}
+
+console.log('renamed manifest icons keep their exact bytes (SHA-256)');
+const RENAMED = {
+  'icon-v2-192.png': 'f7f0f5925498a0076fbcb6ff2d52e574c25f50fe4c63af92cb7511e20d38f943',
+  'icon-v2-512.png': '2ba074218424cc7a8834d375d6adfc1ed9ee977bb1302500e558c137b2184ed4',
+  'maskable-v2-192.png': 'b3fdfd6d8bd1bd40bd8a938ea82913fb1808a01c598fe8e7385363fa45172fb2',
+  'maskable-v2-512.png': 'c33cd9d44200f960bbce2e20487705f76318bae17176dcbf260a8cb7f2190c7b',
+};
+Object.entries(RENAMED).forEach(([f, want]) => {
+  const p = path.join(ROOT, f);
+  ok(fs.existsSync(p) && sha(p) === want, f + ' SHA-256 is ' + want.slice(0, 12) + '…');
 });
 
 console.log('derived header symbol');
