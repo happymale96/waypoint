@@ -87,10 +87,38 @@ console.log('expired');
 }
 
 console.log('fileName');
-eq(Proof.fileName(base, 1), '2026-11-26_beta-customer_1.jpg', 'date + slug + n');
-eq(Proof.fileName(Object.assign({}, base, { placeName: 'Pacific Klang Oil Seals Sdn. Bhd. (Klang)' }), 3), '2026-11-26_pacific-klang-oil-seals-sdn-bhd-klang_3.jpg', 'punctuation and spaces become single dashes');
-eq(Proof.fileName(Object.assign({}, base, { placeName: '  Café & Co.  ' }), 2), '2026-11-26_cafe-co_2.jpg', 'accents dropped, trimmed');
-eq(Proof.fileName(Object.assign({}, base, { placeName: '***', doneAt: new Date(Date.UTC(2026, 10, 25, 17, 0)).toISOString() }), 1), '2026-11-26_place_1.jpg', 'empty slug -> "place"; Malaysia date');
+eq(Proof.fileName(base, 1, 'item'), '2026-11-26_beta-customer_item_1.jpg', 'item: date + slug + item + n');
+eq(Proof.fileName(base, 2, 'do'), '2026-11-26_beta-customer_DO_2.jpg', 'DO: date + slug + DO + n');
+eq(Proof.fileName(base, 1), '2026-11-26_beta-customer_item_1.jpg', 'no kind given: item');
+eq(Proof.fileName(Object.assign({}, base, { placeName: 'Pacific Klang Oil Seals Sdn. Bhd. (Klang)' }), 3, 'item'), '2026-11-26_pacific-klang-oil-seals-sdn-bhd-klang_item_3.jpg', 'punctuation and spaces become single dashes');
+eq(Proof.fileName(Object.assign({}, base, { placeName: '  Café & Co.  ' }), 2, 'do'), '2026-11-26_cafe-co_DO_2.jpg', 'accents dropped, trimmed');
+eq(Proof.fileName(Object.assign({}, base, { placeName: '***', doneAt: new Date(Date.UTC(2026, 10, 25, 17, 0)).toISOString() }), 1, 'item'), '2026-11-26_place_item_1.jpg', 'empty slug -> "place"; Malaysia date');
+
+console.log('two kinds: share order, old photos, counts');
+{
+  // taken in mixed order: DO, item, DO, item, item (ids listed in a different order than taken, to show capture time wins)
+  const ph = (id, kind, s) => ({ id, kind, takenAt: T0 + s * 1000 });
+  const phs = [ph('d1', 'do', 1), ph('i1', 'item', 2), ph('d2', 'do', 3), ph('i2', 'item', 4), ph('i3', 'item', 5)];
+  const p = Object.assign({}, base, { photoIds: ['i3', 'd2', 'i1', 'd1', 'i2'] });
+  const list = Proof.shareList(p, phs.slice().reverse());
+  eq(list.map((x) => x.photo.id), ['i1', 'i2', 'i3', 'd1', 'd2'], 'share: item photos first in capture order, then DO photos in capture order');
+  eq(list.map((x) => x.name), ['2026-11-26_beta-customer_item_1.jpg', '2026-11-26_beta-customer_item_2.jpg', '2026-11-26_beta-customer_item_3.jpg',
+    '2026-11-26_beta-customer_DO_1.jpg', '2026-11-26_beta-customer_DO_2.jpg'], 'share names numbered per kind from 1');
+  const tie = Proof.shareList(Object.assign({}, base, { photoIds: ['b', 'a'] }), [{ id: 'a', kind: 'item', takenAt: T0 }, { id: 'b', kind: 'item', takenAt: T0 }]);
+  eq(tie.map((x) => x.photo.id), ['b', 'a'], 'same capture time: the order in photoIds');
+  const old = [{ id: 'o1', takenAt: T0 + 2000 }, { id: 'o2', takenAt: T0 + 1000 }, { id: 'n1', kind: 'do', takenAt: T0 }];
+  eq(Proof.kindOf(old[0]), 'item', 'a photo saved before this build (no kind) is an item photo');
+  eq(Proof.countKinds(old), { item: 2, do: 1 }, 'countKinds: no kind counts as item');
+  eq(Proof.shareList(base, old).map((x) => x.name.replace('2026-11-26_beta-customer_', '')), ['item_1.jpg', 'item_2.jpg', 'DO_1.jpg'], 'old photos share first, as item photos');
+  eq(Proof.caption(Object.assign({}, base, { photoIds: ['i1', 'd1'], counts: { item: 1, do: 1 } })), Proof.caption(base), 'the caption text is unchanged by the kinds');
+}
+
+console.log('CSV proof text');
+eq(Proof.csvCell(Proof.summaryOf({ id: 'a', photoIds: ['1', '2', '3', '4', '5'], counts: { item: 3, do: 2 }, noPhotoReason: '', receiver: '' })), '3 item, 2 DO photos', '"3 item, 2 DO photos"');
+eq(Proof.csvCell(Proof.summaryOf({ id: 'a', photoIds: ['1'], counts: { item: 0, do: 1 } })), '0 item, 1 DO photos', 'DO only');
+eq(Proof.csvCell({ photos: 2 }), '2 item, 0 DO photos', 'a summary from before this build ({photos} only): every photo is item');
+eq(Proof.csvCell(Proof.summaryOf({ id: 'a', photoIds: ['1', '2'] })), '2 item, 0 DO photos', 'a proof saved before this build (no counts): item photos');
+eq(Proof.csvCell({ photos: 0, noPhotoReason: 'Left at guard house' }), 'no photo: Left at guard house', 'no photo: unchanged');
 
 console.log('day log + CSV: receiver, proof');
 {
@@ -101,20 +129,24 @@ console.log('day log + CSV: receiver, proof');
   const day = DL.newDay('2026-11-26', 'Calvin');
   DL.recordPlan(day, { nowIso: new Date(T0 - 3 * 3600000).toISOString(), departAtIso: new Date(T0 - 3 * 3600000).toISOString(), start: places.S, jobs, places, stopOrder: ['S', 'C'] });
   DL.recordDone(day, { nowIso: new Date(T0 - 3600000).toISOString(), stopId: 'S', actions: [{ jobId: 'J1', kind: 'pickup', item: 'Gasket' }, { jobId: 'E1', kind: 'errand', item: 'Pay bill' }], places });
-  const pr = Proof.summaryOf({ id: 'pf9', photoIds: ['a', 'b'], noPhotoReason: '', receiver: ' Encik Ali ' });
+  const pr = Proof.summaryOf({ id: 'pf9', photoIds: ['a', 'b', 'c'], counts: { item: 2, do: 1 }, noPhotoReason: '', receiver: ' Encik Ali ' });
   const evs = DL.recordDone(day, { nowIso: new Date(T0).toISOString(), stopId: 'C', actions: [{ jobId: 'J1', kind: 'deliver', item: 'Gasket' }, { jobId: 'J2', kind: 'deliver', item: '' }], places, proof: pr, proofJobIds: ['J1', 'J2'] });
-  ok(evs.every((e) => e.proofId === 'pf9' && e.proof.photos === 2), 'the done events of the delivery carry the proof id', evs);
+  ok(evs.every((e) => e.proofId === 'pf9' && e.proof.photos === 3 && e.proof.itemPhotos === 2 && e.proof.doPhotos === 1), 'the done events of the delivery carry the proof id and the counts per kind', evs);
   const lines = DL.toCSV(DL.summarise(day, jobs, places)).trim().split('\r\n');
   ok(lines[0].endsWith(',late,receiver,proof'), 'CSV: receiver and proof are the last two columns', lines[0]);
   const row = (needle) => lines.find((l) => l.indexOf(needle) >= 0);
-  ok(row(',delivery,').endsWith(',Encik Ali,2 photos'), 'delivery row: receiver + "2 photos"', row(',delivery,'));
-  ok(row(',in-hand,').endsWith(',Encik Ali,2 photos'), 'in-hand delivery row: the same proof', row(',in-hand,'));
+  ok(row(',delivery,').endsWith(',Encik Ali,"2 item, 1 DO photos"'),'delivery row: receiver + "2 item, 1 DO photos" (quoted: it has a comma)', row(',delivery,'));
+  ok(row(',in-hand,').endsWith(',Encik Ali,"2 item, 1 DO photos"'), 'in-hand delivery row: the same proof', row(',in-hand,'));
+  ok(lines[0].split(',').length === 14 && lines.slice(1).every((l) => l.replace(/"[^"]*"/g, 'q').split(',').length === 14), 'still 14 columns in every row', lines);
+  const oldDay = DL.newDay('2026-11-26', 'Calvin');
+  DL.recordDone(oldDay, { nowIso: new Date(T0).toISOString(), stopId: 'C', actions: [{ jobId: 'J2', kind: 'deliver', item: '' }], places, proof: { id: 'old', photos: 2, noPhotoReason: '', receiver: '' } });
+  ok(DL.toCSV(DL.summarise(oldDay, [jobs[1]], places)).trim().split('\r\n')[1].endsWith(',"2 item, 0 DO photos"'), 'a day-log proof from before this build ({photos: 2}): "2 item, 0 DO photos"');
   ok(row(',errand,').endsWith(',,'), 'errand row: both empty', row(',errand,'));
   const noPh = Proof.summaryOf({ id: 'pf10', photoIds: [], noPhotoReason: 'Photos not allowed', receiver: '' });
   const d2 = DL.newDay('2026-11-26', 'Calvin');
   DL.recordDone(d2, { nowIso: new Date(T0).toISOString(), stopId: 'C', actions: [{ jobId: 'J2', kind: 'deliver', item: '' }], places, proof: noPh });
   ok(DL.toCSV(DL.summarise(d2, [jobs[1]], places)).trim().split('\r\n')[1].endsWith(',,no photo: Photos not allowed'), 'no-photo proof: "no photo: <reason>"');
-  eq(Proof.csvCell({ photos: 1 }), '1 photo', 'one photo, singular');
+  eq(Proof.csvCell({ photos: 1, itemPhotos: 1, doPhotos: 0 }), '1 item, 0 DO photos', 'one photo: the same pattern');
 }
 
 console.log('\n' + passes + ' passed, ' + failures + ' failed');

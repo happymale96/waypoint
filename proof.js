@@ -1,6 +1,7 @@
 /* L-Tech Waypoint — proof.js: proof of delivery.
- * Pure (node + browser): isProofStop, caption, stampLines, expired, fileName, slug, klDate helpers.
- * Browser only: the IndexedDB store "waypoint-proof" (v1; stores "proofs" and "photos"), compose (the stamped JPEG),
+ * Pure (node + browser): isProofStop, caption, stampLines, expired, fileName, slug, kindOf, shareList, countKinds, klDate helpers.
+ * Two kinds of photo: "item" (stamped with the band) and "do" (the delivery order: no band); a photo with no kind is an item photo.
+ * Browser only: the IndexedDB store "waypoint-proof" (v1; stores "proofs" and "photos"), compose (the stamped item JPEG), composeDo,
  * persistOnce (navigator.storage.persist, asked once), runRetention (proofs older than 730 days, once per app load).
  * Photo blobs never go into localStorage or into storage.js collections.
  */
@@ -92,23 +93,52 @@
       .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
     return s || 'place';
   }
-  // "<yyyy-mm-dd>_<place name slug>_<n>.jpg" (the date of the proof, Malaysia time)
-  function fileName(proof, n) {
+  // A photo's kind: "item" (the goods, stamped with the band) or "do" (the delivery order, no band). Photos saved before the two
+  // kinds existed have none: they are item photos.
+  const kindOf = (ph) => (ph && ph.kind === 'do' ? 'do' : 'item');
+  // "<yyyy-mm-dd>_<place name slug>_item_<n>.jpg" / "..._DO_<n>.jpg" (the date of the proof, Malaysia time; n counts per kind from 1)
+  function fileName(proof, n, kind) {
     const p = proof || {};
     const t = toMs(p.doneAt);
     const day = t != null && isFinite(t) ? klDay(t) : (p.dayKey || 'undated');
-    return day + '_' + slug(p.placeName) + '_' + n + '.jpg';
+    return day + '_' + slug(p.placeName) + (kind === 'do' ? '_DO_' : '_item_') + n + '.jpg';
+  }
+  // capture order: takenAt, then the order in proof.photoIds
+  function byCapture(photos, order) {
+    const ids = order || [];
+    return (photos || []).map((ph, i) => ({ ph, i })).sort((a, b) => ((a.ph.takenAt || 0) - (b.ph.takenAt || 0))
+      || (ids.indexOf(a.ph.id) - ids.indexOf(b.ph.id)) || (a.i - b.i)).map((x) => x.ph);
+  }
+  // The share list: item photos first in capture order, then DO photos in capture order -> [{photo, kind, n, name}]
+  function shareList(proof, photos) {
+    const all = byCapture(photos, proof && proof.photoIds);
+    const out = [];
+    ['item', 'do'].forEach((k) => all.filter((ph) => kindOf(ph) === k).forEach((ph, j) => out.push({ photo: ph, kind: k, n: j + 1, name: fileName(proof, j + 1, k) })));
+    return out;
+  }
+  // {item, do}: how many photos of each kind
+  function countKinds(photos) {
+    const c = { item: 0, do: 0 };
+    (photos || []).forEach((ph) => { c[kindOf(ph)]++; });
+    return c;
   }
 
-  // The CSV "proof" cell for a proof summary {photos, noPhotoReason} ('' when there is none)
+  // The CSV "proof" cell for a proof summary {photos, itemPhotos, doPhotos, noPhotoReason} ('' when there is none):
+  // "<a> item, <b> DO photos" or "no photo: <reason>". A summary from before the two kinds counts every photo as item.
   function csvCell(info) {
     if (!info) return '';
-    if (info.photos > 0) return info.photos + (info.photos === 1 ? ' photo' : ' photos');
+    if (info.photos > 0) {
+      const dos = info.doPhotos > 0 ? info.doPhotos : 0;
+      const items = info.itemPhotos != null ? info.itemPhotos : info.photos - dos;
+      return items + ' item, ' + dos + ' DO photos';
+    }
     return 'no photo: ' + cleanText(info.noPhotoReason);
   }
-  // The small summary kept on the day log / job record (the proof itself lives in IndexedDB)
+  // The small summary kept on the day log / job record (the proof itself lives in IndexedDB). proof.counts = {item, do}, set at save.
   function summaryOf(proof) {
-    return { id: proof.id, photos: (proof.photoIds || []).length, noPhotoReason: proof.noPhotoReason || '', receiver: cleanText(proof.receiver) };
+    const n = (proof.photoIds || []).length;
+    const c = proof.counts || { item: n, do: 0 };
+    return { id: proof.id, photos: n, itemPhotos: c.item || 0, doPhotos: c.do || 0, noPhotoReason: proof.noPhotoReason || '', receiver: cleanText(proof.receiver) };
   }
 
   // ---------- IndexedDB (browser) ----------
@@ -263,11 +293,26 @@
     if (blob.size > MAX_BYTES) blob = await toBlob(c, Q2);
     return blob;
   }
+  // composeDo(rawBitmapOrBlob) -> JPEG Blob of a DO photo: no band, no logo, no text; EXIF orientation honoured, long side at most
+  // 2000 px, quality 0.85, 0.75 when over 600 KB.
+  const DO_LONG = 2000, DO_Q1 = 0.85, DO_Q2 = 0.75, DO_MAX_BYTES = 600 * 1024;
+  async function composeDo(input) {
+    const bmp = await bitmapOf(input);
+    const k = Math.min(1, DO_LONG / Math.max(bmp.width, bmp.height));
+    const W = Math.max(1, Math.round(bmp.width * k)), H = Math.max(1, Math.round(bmp.height * k));
+    const c = root.document.createElement('canvas');
+    c.width = W; c.height = H;
+    c.getContext('2d').drawImage(bmp, 0, 0, W, H);
+    if (bmp.close && bmp !== input) bmp.close();
+    let blob = await toBlob(c, DO_Q1);
+    if (blob.size > DO_MAX_BYTES) blob = await toBlob(c, DO_Q2);
+    return blob;
+  }
 
   return {
-    REASONS, MAX_PHOTOS, RECEIVER_MAX, KEEP_DAYS, GPS_MAX_AGE_MS,
-    isProofStop, proofDeliveries, caption, stampLines, expired, fileName, slug, csvCell, summaryOf, klDay, klDate,
+    REASONS, MAX_PHOTOS, MAX_PER_KIND: MAX_PHOTOS, RECEIVER_MAX, KEEP_DAYS, GPS_MAX_AGE_MS, DO_LONG,
+    isProofStop, proofDeliveries, caption, stampLines, expired, fileName, slug, kindOf, byCapture, shareList, countKinds, csvCell, summaryOf, klDay, klDate,
     open, putProof, getProof, listProofs, putPhoto, getPhoto, photosOf, deletePhoto, deleteProof, saveStamped, usage, runRetention, persistOnce, persisted,
-    compose, loadLogo,
+    compose, composeDo, loadLogo,
   };
 });

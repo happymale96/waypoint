@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '8a5e223d'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '73921921'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -2451,8 +2451,9 @@
   }
 
   // ---------- PROOF OF DELIVERY (proof.js) ----------
-  // PROOF on a reached proof stop opens a full-screen sheet: photos (camera, one shot per tap, at most 6, each saved to IndexedDB
-  // under a draft the moment it comes back), "Received by", Save & done (stamps every photo, then markDone with the proof), No photo
+  // PROOF on a reached proof stop opens a full-screen sheet: Item photo / DO photo (the in-app camera, camera.js; at most 6 of each,
+  // each saved to IndexedDB under a draft the moment it is taken; a DO shot goes through the corner screen, scan.js, first),
+  // "Received by", Save & done (item photos stamped, DO photos re-encoded without a band, then markDone with the proof), No photo
   // (a reason chip, then markDone), Cancel (deletes the draft). A done card with an unsent proof shows SEND TO GROUP.
   const PF = { meta: new Map(), files: new Map(), sheet: null }; // meta: proofId -> record (no blobs); files: proofId -> [File] (today's unsent)
   const WA_GLYPH = 'whatsapp-glyph.svg'; // copied byte-for-byte from the brand pack (README); never drawn by the app
@@ -2471,12 +2472,12 @@
     return h('button', { class: 'small send-group' + (sent ? ' sent' : ''), type: 'button', 'data-act': 'send', 'data-proof': m.id, 'aria-label': sent ? 'Sent to group, send again' : 'Send to group', onclick: () => sendTap(m.id) },
       sent ? null : h('img', { class: 'wa-glyph', src: WA_GLYPH, alt: '', 'aria-hidden': 'true' }), sent ? 'SENT ✓' : 'SEND TO GROUP');
   }
-  const fileOf = (proof, ph, n) => new File([ph.blob], Proof.fileName(proof, n), { type: 'image/jpeg', lastModified: ph.takenAt || Date.now() });
+  // the shared files: item photos first in capture order, then DO photos (Proof.shareList: names and numbering per kind)
+  const filesOf = (proof, phs) => Proof.shareList(proof, phs).map((x) => new File([x.photo.blob], x.name, { type: 'image/jpeg', lastModified: x.photo.takenAt || Date.now() }));
   async function proofFiles(proof) {
     if (PF.files.has(proof.id)) return PF.files.get(proof.id);
-    const phs = await Proof.photosOf(proof.id), order = proof.photoIds || [];
-    phs.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
-    const files = phs.map((ph, k) => fileOf(proof, ph, k + 1));
+    const phs = await Proof.photosOf(proof.id);
+    const files = filesOf(proof, phs);
     if (!proof.sentAt && proof.dayKey === proofDayKey()) PF.files.set(proof.id, files);
     return files;
   }
@@ -2533,12 +2534,22 @@
     if (draft) { try { photos = (await Proof.photosOf(draft.id)).sort((a, b) => (a.takenAt || 0) - (b.takenAt || 0)); } catch (e) { photos = []; } }
     const urls = [];
     let busy = false;
-    const sh = openSheet(proof.placeName || dName((placeOfStop(stop) || {}).name || ''), () => { urls.forEach((u) => URL.revokeObjectURL(u)); PF.sheet = null; });
+    const sh = openSheet(proof.placeName || dName((placeOfStop(stop) || {}).name || ''), () => {
+      Camera.close(); Scan.closeCornerScreen(); // closing the sheet stops every camera track
+      urls.forEach((u) => URL.revokeObjectURL(u)); PF.sheet = null;
+    });
     PF.sheet = sh;
     sh.sheet.id = 'proofSheet'; sh.sheet.classList.add('proof-sheet'); sh.back.classList.add('proof-back'); // full screen: Cancel / Save / No photo close it
     const close = () => sh.close();
+    const MAXK = Proof.MAX_PER_KIND;
+    const nOf = (k) => photos.filter((p) => Proof.kindOf(p) === k).length;
+    // the phone's own camera app (the in-app camera's fallback when it cannot open): one shot per pick
     const fileIn = h('input', { type: 'file', id: 'proofFile', accept: 'image/*', capture: 'environment', hidden: true });
-    const takeBtn = h('button', { class: 'primary', id: 'proofTake', type: 'button', onclick: () => { fileIn.value = ''; fileIn.click(); } }, 'Take photo');
+    let fileKind = 'item';
+    const pickFile = (k) => { fileKind = k; fileIn.value = ''; fileIn.click(); };
+    // two capture buttons side by side: each opens the in-app camera (camera.js) for that kind
+    const itemBtn = h('button', { class: 'primary', id: 'proofItemBtn', type: 'button', 'data-kind': 'item', onclick: () => openCamera('item') }, 'Item photo');
+    const doBtn = h('button', { class: 'primary', id: 'proofDoBtn', type: 'button', 'data-kind': 'do', onclick: () => openCamera('do') }, 'DO photo');
     const thumbs = h('div', { class: 'proof-thumbs', id: 'proofThumbs' });
     const rcv = h('input', { id: 'proofReceiver', maxlength: String(Proof.RECEIVER_MAX), autocomplete: 'off', value: proof.receiver || '', placeholder: 'Name (optional)' });
     const saveBtn = h('button', { class: 'ok', id: 'proofSave', type: 'button' }, 'Save & done');
@@ -2550,14 +2561,46 @@
     const cancelBtn = h('button', { id: 'proofCancel', type: 'button', onclick: async () => { if (busy) return; close(); try { if (draft || photos.length) await Proof.deleteProof(proof.id); } catch (e) { /* ignore */ } } }, 'Cancel');
     function paint() {
       urls.splice(0).forEach((u) => URL.revokeObjectURL(u));
-      thumbs.replaceChildren(...photos.map((ph) => {
+      const thumb = (ph) => {
         const u = URL.createObjectURL(ph.blob); urls.push(u);
-        return h('div', { class: 'proof-thumb' }, h('img', { src: u, alt: 'Photo ' + fmt(ph.takenAt) }),
+        return h('div', { class: 'proof-thumb', 'data-kind': Proof.kindOf(ph) }, h('img', { src: u, alt: (Proof.kindOf(ph) === 'do' ? 'DO photo ' : 'Item photo ') + fmt(ph.takenAt) }),
           h('button', { class: 'proof-del', type: 'button', 'aria-label': 'Remove photo', onclick: () => removePhoto(ph.id) }, '×'));
-      }));
-      takeBtn.disabled = busy || photos.length >= Proof.MAX_PHOTOS;
-      takeBtn.textContent = photos.length >= Proof.MAX_PHOTOS ? 'Take photo (6 max)' : 'Take photo';
+      };
+      const group = (k, title) => {
+        const list = photos.filter((p) => Proof.kindOf(p) === k);
+        return list.length ? h('div', { class: 'proof-group', 'data-kind': k }, h('div', { class: 'proof-group-h' }, title), h('div', { class: 'proof-grid' }, list.map(thumb))) : null;
+      };
+      thumbs.replaceChildren(...[group('item', 'Item'), group('do', 'DO')].filter(Boolean));
+      [[itemBtn, 'item', 'Item photo'], [doBtn, 'do', 'DO photo']].forEach(([b, k, t]) => {
+        b.disabled = busy || nOf(k) >= MAXK;
+        b.textContent = nOf(k) >= MAXK ? t + ' (' + MAXK + ' max)' : t;
+      });
       saveBtn.disabled = busy || !photos.length;
+    }
+    // a photo of kind k into the draft (IndexedDB) the moment it is taken; at = the capture time
+    async function addPhoto(blob, k, at) {
+      if (!blob || nOf(k) >= MAXK || !PF.sheet) return;
+      const ph = { id: uid('ph'), proofId: proof.id, kind: k, blob, bytes: blob.size, takenAt: at, gps: proofFix(at) };
+      if (ph.gps) proof.gps = ph.gps;
+      photos.push(ph);
+      paint();
+      try { await Proof.putPhoto(ph); await saveDraft(); status.textContent = ''; } catch (e) { status.textContent = 'Could not save the photo on this phone'; }
+    }
+    // a DO shot: the corner screen first (Use = straightened, Keep as shot, Retake = discarded) -> true when a photo was kept
+    async function doShot(blob, at, parent) {
+      const r = await Scan.cornerScreen(blob, { parent, maxLong: Proof.DO_LONG });
+      if (r.action === 'retake' || !r.blob) return false;
+      await addPhoto(r.blob, 'do', at);
+      return true;
+    }
+    function openCamera(k) {
+      if (busy || nOf(k) >= MAXK) return;
+      Camera.open(k, {
+        label: k === 'do' ? 'DO photo' : 'Item photo', max: MAXK, count: nOf,
+        onShot: async (blob, kk) => { const at = Date.now(); if (kk === 'do') await doShot(blob, at, Camera.view()); else await addPhoto(blob, 'item', at); },
+        onFallback: (kk) => pickFile(kk), // inside the tap: the file input opens the phone's camera app
+        onClose: () => { if (PF.sheet === sh) paint(); },
+      });
     }
     async function saveDraft() {
       proof.photoIds = photos.map((p) => p.id);
@@ -2573,13 +2616,14 @@
     }
     fileIn.addEventListener('change', async () => {
       const f = fileIn.files && fileIn.files[0];
-      if (!f || photos.length >= Proof.MAX_PHOTOS) return;
+      const k = fileKind;
+      fileKind = 'item';
+      if (!f || nOf(k) >= MAXK) return;
       const at = Date.now();
-      const ph = { id: uid('ph'), proofId: proof.id, blob: f, bytes: f.size, takenAt: at, gps: proofFix(at) };
-      if (ph.gps) proof.gps = ph.gps;
-      photos.push(ph);
-      paint();
-      try { await Proof.putPhoto(ph); await saveDraft(); status.textContent = ''; } catch (e) { status.textContent = 'Could not save the photo on this phone'; }
+      if (k !== 'do') { await addPhoto(f, 'item', at); return; }
+      // a DO photo from the phone's camera app still goes through the corner screen; Retake opens the phone camera again
+      const kept = await doShot(f, at, null);
+      if (!kept && PF.sheet === sh) pickFile('do');
     });
     rcv.addEventListener('change', () => { if (draft) saveDraft().catch(() => {}); });
     saveBtn.onclick = () => finish(null);
@@ -2598,9 +2642,11 @@
         let stamped = [];
         if (reason == null) {
           for (const ph of photos) {
+            const k = Proof.kindOf(ph);
             let blob;
-            try { blob = await Proof.compose(ph.blob, proof, { takenAt: ph.takenAt, gps: ph.gps || null }); } catch (e) { blob = ph.blob; } // undecodable: kept as taken
-            stamped.push({ id: ph.id, proofId: proof.id, blob, bytes: blob.size, takenAt: ph.takenAt, gps: ph.gps || null });
+            // item: the band, logo and stamp lines (1600 px); DO: no band, no text (2000 px)
+            try { blob = k === 'do' ? await Proof.composeDo(ph.blob) : await Proof.compose(ph.blob, proof, { takenAt: ph.takenAt, gps: ph.gps || null }); } catch (e) { blob = ph.blob; } // undecodable: kept as taken
+            stamped.push({ id: ph.id, proofId: proof.id, kind: k, blob, bytes: blob.size, takenAt: ph.takenAt, gps: ph.gps || null });
           }
           proof.noPhotoReason = '';
         } else {
@@ -2608,11 +2654,12 @@
           proof.noPhotoReason = reason;
         }
         proof.photoIds = stamped.map((p) => p.id);
+        proof.counts = Proof.countKinds(stamped); // {item, do}: the CSV "proof" text
         proof.state = 'done'; proof.sentAt = null; proof.driveAt = null;
         await Proof.saveStamped(proof, stamped);
         Proof.persistOnce(); // asked once, on the first saved proof; never awaited
         PF.meta.set(proof.id, Object.assign({}, proof));
-        PF.files.set(proof.id, stamped.map((ph, k) => fileOf(proof, ph, k + 1)));
+        PF.files.set(proof.id, filesOf(proof, stamped));
       } catch (e) {
         busy = false; paint();
         status.textContent = 'Could not save the proof on this phone - try again';
@@ -2623,7 +2670,7 @@
     }
     sh.body.replaceChildren(
       h('div', { class: 'proof-items', id: 'proofItems' }, proof.items.map((t) => h('div', { class: 'act deliver' }, t))),
-      takeBtn, fileIn, thumbs,
+      h('div', { class: 'proof-take' }, itemBtn, doBtn), fileIn, thumbs,
       h('label', { class: 'field', for: 'proofReceiver' }, 'Received by'), rcv,
       status, reasons,
       h('div', { class: 'proof-foot' }, noPhoto),

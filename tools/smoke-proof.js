@@ -5,12 +5,19 @@
  * viewport, with TomTom, geolocation, the clipboard, navigator.canShare / navigator.share and the clock mocked inside the page.
  * The clock is PINNED: 26 Nov 2026 14:00 Malaysia time, moved only by the smoke (kept across reloads in sessionStorage).
  * World: S (supplier, collect a Gasket for C), C (customer, deliver it), D (customer, an in-hand Fuse), O (office errand).
- * Walk: PROOF only on the delivery stops (S and O keep ✓ DONE); a generated 3000 x 2000 JPEG fed to the file input is saved at
- * once under a draft; a reload reopens the sheet with it; Save & done completes the stop and writes a stamped photo no larger than
- * 1600 px with the band; the card is no taller than while pending; Undo voids the proof (photos kept); a new PROOF makes a new one;
+ * The browser runs with --use-fake-device-for-media-stream / --use-fake-ui-for-media-stream: the in-app camera (camera.js) gets the
+ * fake device (no facing mode, so exact "environment" fails and the chain goes on to a stream); getUserMedia is wrapped to record
+ * every ask and stream.
+ * Walk: PROOF only on the delivery stops (S and O keep ✓ DONE); Item photo / DO photo side by side; 2 item shots through the camera
+ * view are saved at once under a draft; Done stops every track; a reload reopens the sheet with them; a DO shot opens the corner
+ * screen (four handles, one dragged with the magnifier, Use), a second DO shot Keep as shot, a third Retake; Save & done completes
+ * the stop: item photos <= 1600 px with the #00243c band, DO photos <= 2000 px without it; SEND TO GROUP passes item files before
+ * DO files; the card is no taller than while pending; Undo voids the proof (photos kept); a new PROOF makes a new one;
  * SEND TO GROUP passes the right files + caption, the caption is copied, the button reads SENT ✓; a rejected share and canShare
  * "no" change nothing; on D: Cancel deletes the draft, No photo saves a reason and shares the text only; the CSV columns; retention
- * deletes a 731-day-old proof (and its photo) on the next load and keeps a 729-day-old one; the Settings line. Exit 1 on failure.
+ * deletes a 731-day-old proof (and its photo) on the next load and keeps a 729-day-old one; the Settings line. A second world
+ * (fresh storage, getUserMedia rejecting NotAllowedError): the camera view says so, "Use phone camera" falls back to the file input,
+ * an item and a DO photo (through the corner screen) complete the stop. Exit 1 on failure.
  * Needs Node 22+ (global WebSocket / fetch) and Chrome or Edge (set CHROME=<path> to choose one).
  */
 'use strict';
@@ -50,6 +57,7 @@ const SEED = {
 // runs in the page before anything else: the pinned clock, mocks, the seed
 const INIT = `(() => {
   const RealDate = Date, PIN = ${PIN};
+  if (location.protocol !== 'http:') return; // about:blank between the two worlds
   const st = sessionStorage.getItem('__off');
   window.__off = st != null ? Number(st) : 0;
   window.__advance = (ms) => { window.__off += ms; sessionStorage.setItem('__off', String(window.__off)); return true; };
@@ -92,7 +100,28 @@ const INIT = `(() => {
     if (url.includes('api.tomtom.com') || url.includes('googleapis.com')) return new Response('{}', { status: 500 });
     return realFetch(url, init);
   };
-  // a generated JPEG (w x h, yellow) fed to the proof sheet's file input, as the camera would
+  // the camera: every getUserMedia ask recorded (constraints, outcome) and every stream kept; "?deny=1" refuses permission
+  window.__gum = []; window.__streams = []; window.__fileClicks = [];
+  const md = navigator.mediaDevices;
+  if (md && md.getUserMedia) {
+    const realGum = md.getUserMedia.bind(md);
+    md.getUserMedia = async (c) => {
+      const rec = { c: JSON.parse(JSON.stringify(c)), ok: false, err: null }; window.__gum.push(rec);
+      if (/deny=1/.test(location.search)) { rec.err = 'NotAllowedError'; throw new DOMException('Permission denied', 'NotAllowedError'); }
+      try { const s = await realGum(c); rec.ok = true; window.__streams.push(s); return s; } catch (e) { rec.err = e.name; throw e; }
+    };
+  }
+  const realInputClick = HTMLInputElement.prototype.click;
+  HTMLInputElement.prototype.click = function () { if (this.type === 'file') window.__fileClicks.push(this.id); return realInputClick.call(this); };
+  window.__liveTracks = () => window.__streams.reduce((n, s) => n + s.getTracks().filter((t) => t.readyState === 'live').length, 0);
+  // the average colour of the bottom 4 rows of a photo blob, and its size
+  window.__bottom = async (blob) => {
+    const b = await createImageBitmap(blob); const c = document.createElement('canvas'); c.width = b.width; c.height = b.height;
+    const g = c.getContext('2d'); g.drawImage(b, 0, 0); const d = g.getImageData(0, b.height - 5, b.width, 4).data; const s = [0, 0, 0];
+    for (let i = 0; i < d.length; i += 4) { s[0] += d[i]; s[1] += d[i + 1]; s[2] += d[i + 2]; }
+    const n = d.length / 4; return { w: b.width, h: b.height, avg: s.map((v) => Math.round(v / n)), bytes: blob.size, type: blob.type };
+  };
+  // a generated JPEG (w x h, yellow) fed to the proof sheet's file input, as the phone's camera app would
   window.__feedPhoto = async (w, h) => {
     const c = document.createElement('canvas'); c.width = w; c.height = h;
     const g = c.getContext('2d'); g.fillStyle = 'rgb(255, 220, 0)'; g.fillRect(0, 0, w, h); g.fillStyle = 'rgb(200, 60, 40)'; g.fillRect(w / 4, h / 4, w / 2, h / 4);
@@ -146,6 +175,7 @@ async function main() {
   const dbgPort = await freePort();
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'wp-smoke-'));
   const proc = spawn(exe, ['--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--window-size=360,860',
+    '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
     '--remote-debugging-port=' + dbgPort, '--remote-allow-origins=*', '--user-data-dir=' + profile, 'about:blank'], { stdio: 'ignore' });
   let page = null;
   const cleanup = async () => {
@@ -212,19 +242,92 @@ async function main() {
     await ev('window.__watchFire({ lat: 3.125 + 20 / 111190, lng: 101.705, accuracy: 12 })'); // a fresh fix at capture
     check(await tapPrimary('Beta Customer') === '📷 PROOF', 'tap PROOF');
     await waitFor('document.getElementById("proofSheet")', 'the proof sheet');
-    const sheet = await ev('(() => { const s = document.getElementById("proofSheet"), r = s.getBoundingClientRect(), f = document.getElementById("proofFile"); return { title: s.querySelector("h3").textContent, items: [...s.querySelectorAll("#proofItems .act")].map((x) => x.textContent), full: r.width >= document.documentElement.clientWidth && r.height >= innerHeight, rw: r.width, rh: r.height, vh: innerHeight, accept: f.accept, capture: f.getAttribute("capture"), type: f.type, save: document.getElementById("proofSave").disabled, rcvMax: document.getElementById("proofReceiver").maxLength, noPhoto: !!document.getElementById("proofNoPhoto"), cancel: !!document.getElementById("proofCancel") }; })()');
+    const sheet = await ev('(() => { const s = document.getElementById("proofSheet"), r = s.getBoundingClientRect(), f = document.getElementById("proofFile"); return { title: s.querySelector("h3").textContent, items: [...s.querySelectorAll("#proofItems .act")].map((x) => x.textContent), full: r.width >= document.documentElement.clientWidth && r.height >= innerHeight, rw: r.width, rh: r.height, vh: innerHeight, accept: f.accept, capture: f.getAttribute("capture"), type: f.type, save: document.getElementById("proofSave").disabled, rcvMax: document.getElementById("proofReceiver").maxLength, noPhoto: !!document.getElementById("proofNoPhoto"), cancel: !!document.getElementById("proofCancel"), take: !!document.getElementById("proofTake") }; })()');
     check(sheet.title === 'Beta Customer' && sheet.items.join() === 'Gasket' && sheet.full, 'full-screen sheet: the place name and the item delivered', sheet);
-    check(sheet.type === 'file' && sheet.accept === 'image/*' && sheet.capture === 'environment' && sheet.save === true && sheet.rcvMax === 40 && sheet.noPhoto && sheet.cancel, 'camera input, Save & done off with no photo, Received by max 40, No photo, Cancel', sheet);
-    await ev('window.__feedPhoto(3000, 2000)');
-    await waitFor('document.querySelectorAll("#proofThumbs .proof-thumb").length === 1', 'one thumbnail');
-    await waitFor('Proof.listProofs().then((a) => a.some((p) => p.state === "draft" && p.photoIds.length === 1))', 'the draft in IndexedDB');
+    check(sheet.type === 'file' && sheet.accept === 'image/*' && sheet.capture === 'environment' && sheet.save === true && sheet.rcvMax === 40 && sheet.noPhoto && sheet.cancel && !sheet.take, 'fallback camera input kept, no single Take photo, Save & done off with no photo, Received by max 40, No photo, Cancel', sheet);
+    const btns = await ev('(() => { const a = document.getElementById("proofItemBtn").getBoundingClientRect(), b = document.getElementById("proofDoBtn").getBoundingClientRect(), s = document.getElementById("proofSheet"); return { a: document.getElementById("proofItemBtn").textContent, b: document.getElementById("proofDoBtn").textContent, sameRow: Math.abs(a.top - b.top) < 1, aw: Math.round(a.width), bw: Math.round(b.width), right: Math.round(b.right), vw: document.documentElement.clientWidth, h: Math.round(a.height), overflow: s.scrollWidth > s.clientWidth }; })()');
+    check(btns.a === 'Item photo' && btns.b === 'DO photo' && btns.sameRow && btns.right <= btns.vw && Math.abs(btns.aw - btns.bw) <= 1 && btns.h >= 44 && !btns.overflow, 'Item photo and DO photo side by side at 360 px (no overflow)', btns);
+
+    console.log('2a. the in-app camera: 2 item shots');
+    await click('#proofItemBtn');
+    await waitFor('document.getElementById("camView") && !document.getElementById("camShutter").disabled', 'the camera view with a live stream', 15000);
+    const cam = await ev('(() => { const v = document.getElementById("camVideo"), r = document.getElementById("camView").getBoundingClientRect(); return { count: document.getElementById("camCount").textContent, full: r.width >= document.documentElement.clientWidth && r.height >= innerHeight, vw: v.videoWidth, vh: v.videoHeight, done: !!document.getElementById("camDone"), sw: document.getElementById("camSwitch").hidden, gum: window.__gum }; })()');
+    check(cam.full && cam.count === '0 of 6' && cam.done && cam.vw > 0, 'full-screen live preview, counter "0 of 6", Done', cam);
+    check(cam.gum.length >= 2 && cam.gum[0].c.video.facingMode && cam.gum[0].c.video.facingMode.exact === 'environment' && cam.gum[0].c.video.width.ideal === 4000 && !cam.gum[0].ok && cam.gum[cam.gum.length - 1].ok,
+      'the chain: exact "environment" first (refused by the fake device), then a later step gives the stream', cam.gum.map((g) => ({ v: g.c.video, ok: g.ok, err: g.err })));
+    check(cam.gum.every((g) => !/"user"/.test(JSON.stringify(g.c))) && cam.gum.every((g) => g.c.audio === false), 'the front camera is never asked for; no audio', cam.gum.map((g) => g.c));
+    check(cam.sw === true, 'Switch lens hidden: the fake device is not more than one back camera');
+    await ev('window.__watchFire({ lat: 3.125 + 20 / 111190, lng: 101.705, accuracy: 12 })'); // a fresh fix at capture
+    await click('#camShutter');
+    await waitFor('document.getElementById("camCount").textContent === "1 of 6"', 'shot 1', 15000);
+    check(await ev('document.getElementById("camFlash").classList.contains("on")'), 'a flash shows the shot was taken');
+    await advance(2000);
+    await click('#camShutter');
+    await waitFor('document.getElementById("camCount").textContent === "2 of 6"', 'shot 2', 15000);
+    await waitFor('Proof.listProofs().then((a) => a.some((p) => p.state === "draft" && p.photoIds.length === 2))', 'the draft in IndexedDB');
     const d1 = (await proofs()).find((p) => p.state === 'draft');
-    check(d1 && d1.stopKey === 'pC' && d1.gps && Math.abs(d1.gps.lat - 3.12518) < 0.0001 && d1.gps.acc === 12, 'draft saved the moment the photo came back, with the GPS fix', d1);
-    check(await ev('Object.keys(localStorage).every((k) => (localStorage.getItem(k) || "").indexOf("data:image") < 0)'), 'no photo data in localStorage');
-    check(await ev('!document.getElementById("proofSave").disabled'), 'Save & done is enabled with one photo');
+    const d1ph = await ev('Proof.photosOf(' + JSON.stringify(d1 && d1.id) + ').then((a) => a.map((p) => ({ kind: p.kind, takenAt: p.takenAt, gps: !!p.gps, bytes: p.bytes })))');
+    check(d1 && d1.stopKey === 'pC' && d1.gps && Math.abs(d1.gps.lat - 3.12518) < 0.0001 && d1.gps.acc === 12, 'draft saved the moment each shot was taken, with the GPS fix', d1);
+    check(d1ph.length === 2 && d1ph.every((p) => p.kind === 'item' && p.gps && p.bytes > 0) && d1ph[1].takenAt - d1ph[0].takenAt === 2000, 'two item photos, each with its capture time and fix', d1ph);
+    check(await ev('!!document.getElementById("camView")'), 'the camera view stays open for the next item shot');
+    await click('#camDone');
+    await waitFor('!document.getElementById("camView")', 'the camera view closed');
+    await waitFor('window.__liveTracks() === 0', 'every track stopped');
+    check(await ev('window.__streams.length >= 1 && window.__streams.every((s) => s.getTracks().every((t) => t.readyState === "ended"))'), 'Done: every track of every stream stopped');
+    const th = await ev('(() => [...document.querySelectorAll("#proofThumbs .proof-group")].map((g) => ({ k: g.dataset.kind, h: g.querySelector(".proof-group-h").textContent, n: g.querySelectorAll(".proof-thumb").length })))()');
+    check(th.length === 1 && th[0].k === 'item' && th[0].h === 'Item' && th[0].n === 2, 'thumbnails under the "Item" heading', th);
+    check(await ev('Object.keys(localStorage).every((k) => (localStorage.getItem(k) || "").indexOf("data:image") < 0)') && (await ev('(localStorage.getItem(Camera.LENS_KEY) || "").length')) < 300, 'no photo data in localStorage (only the lens id)');
+    check(await ev('!document.getElementById("proofSave").disabled'), 'Save & done is enabled with a photo');
     await send('Page.navigate', { url: appUrl });
-    await waitFor('document.getElementById("proofSheet") && document.querySelectorAll("#proofThumbs .proof-thumb").length === 1', 'the sheet reopened with the draft photo after the reload');
-    check(true, 'reload with a draft for a pending stop: the sheet reopens with its photo');
+    await waitFor('document.getElementById("proofSheet") && document.querySelectorAll("#proofThumbs .proof-thumb").length === 2', 'the sheet reopened with the draft photos after the reload');
+    check(true, 'reload with a draft for a pending stop: the sheet reopens with its photos');
+
+    console.log('2b. DO shots: the corner screen (drag, Use), Keep as shot, Retake');
+    await click('#proofDoBtn');
+    await waitFor('document.getElementById("camView") && !document.getElementById("camShutter").disabled', 'the camera view (DO)', 15000);
+    check(await ev('document.getElementById("camCount").textContent') === '0 of 6', 'DO counter "0 of 6" (counted per kind)');
+    await click('#camShutter');
+    await waitFor('document.getElementById("scanScreen") && document.querySelectorAll("#scanScreen .scan-handle").length === 4 && document.getElementById("scanImg").width > 0', 'the corner screen', 15000);
+    const hs = await ev('(() => { const im = document.getElementById("scanImg").getBoundingClientRect(); return { img: { l: im.left, t: im.top, r: im.right, b: im.bottom }, hs: [...document.querySelectorAll("#scanScreen .scan-handle")].map((x) => { const r = x.getBoundingClientRect(); return { cx: r.left + r.width / 2, cy: r.top + r.height / 2, w: r.width, h: r.height }; }), lines: !!document.querySelector("#scanScreen .scan-lines polygon[points]"), btns: [...document.querySelectorAll("#scanScreen .scan-actions button")].map((b) => b.textContent) }; })()');
+    const inImg = (p, im) => p.cx >= im.l - 0.5 && p.cx <= im.r + 0.5 && p.cy >= im.t - 0.5 && p.cy <= im.b + 0.5;
+    check(hs.hs.length === 4 && hs.hs.every((x) => x.w >= 44 && x.h >= 44 && inImg(x, hs.img)) && hs.lines, 'four round handles (>= 44 px targets) on the image, joined by lines', hs);
+    check(hs.btns.join('|') === 'Retake|Keep as shot|Use', 'buttons Retake, Keep as shot, Use', hs.btns);
+    const mouse = (type, x, y) => send('Input.dispatchMouseEvent', { type, x, y, button: 'left', buttons: type === 'mouseReleased' ? 0 : 1, clickCount: 1 });
+    const h0 = hs.hs[0];
+    await mouse('mousePressed', h0.cx, h0.cy);
+    for (let k = 1; k <= 5; k++) await mouse('mouseMoved', h0.cx + 4 * k, h0.cy + 3 * k);
+    const mag = await ev('(() => { const m = document.getElementById("scanMag"), r = m.getBoundingClientRect(); return { shown: !m.hidden && r.width > 0, l: r.left, t: r.top, r: r.right, b: r.bottom }; })()');
+    const fx = h0.cx + 20, fy = h0.cy + 15;
+    check(mag.shown && !(fx >= mag.l && fx <= mag.r && fy >= mag.t && fy <= mag.b), 'while dragging: a magnifier, away from the finger', { mag, finger: [fx, fy] });
+    await mouse('mouseReleased', fx, fy);
+    const moved = await ev('(() => { const r = document.querySelector("#scanScreen .scan-handle").getBoundingClientRect(); return { cx: r.left + r.width / 2, cy: r.top + r.height / 2, mag: document.getElementById("scanMag").hidden }; })()');
+    check(Math.abs(moved.cx - fx) < 1.5 && Math.abs(moved.cy - fy) < 1.5 && moved.mag, 'the handle followed the drag; the magnifier hides on release', { moved, fx, fy });
+    const h2 = hs.hs[2];
+    await mouse('mousePressed', h2.cx, h2.cy);
+    await mouse('mouseMoved', h2.cx + 400, h2.cy + 900);
+    await mouse('mouseReleased', h2.cx + 400, h2.cy + 900);
+    const h2b = await ev('(() => { const r = document.querySelectorAll("#scanScreen .scan-handle")[2].getBoundingClientRect(); return { cx: r.left + r.width / 2, cy: r.top + r.height / 2 }; })()');
+    check(inImg(h2b, hs.img), 'a handle cannot leave the image', { h2b, img: hs.img });
+    await click('#scanUse');
+    await waitFor('!document.getElementById("scanScreen") && document.getElementById("camCount").textContent === "1 of 6"', 'Use: back to the camera, DO 1 of 6', 20000);
+    const doRec = await ev('Proof.listProofs().then((a) => a.find((p) => p.state === "draft")).then((p) => Proof.photosOf(p.id)).then((a) => a.filter((x) => x.kind === "do")).then(async (a) => ({ n: a.length, size: a.length ? await window.__bottom(a[0].blob) : null }))');
+    check(doRec.n === 1 && doRec.size && Math.max(doRec.size.w, doRec.size.h) <= 2000, 'Use: the straightened page saved as the DO photo (long side <= 2000 px), the original not kept', doRec);
+    await advance(3000);
+    await click('#camShutter');
+    await waitFor('document.getElementById("scanScreen")', 'the corner screen (2)', 15000);
+    await click('#scanKeep');
+    await waitFor('!document.getElementById("scanScreen") && document.getElementById("camCount").textContent === "2 of 6"', 'Keep as shot: DO 2 of 6', 15000);
+    await click('#camShutter');
+    await waitFor('document.getElementById("scanScreen")', 'the corner screen (3)', 15000);
+    await click('#scanRetake');
+    await waitFor('!document.getElementById("scanScreen") && !!document.getElementById("camView")', 'Retake: back to the camera', 15000);
+    await sleep(300);
+    check(await ev('document.getElementById("camCount").textContent') === '2 of 6', 'Retake: the shot discarded (still 2 of 6)');
+    await click('#camDone');
+    await waitFor('!document.getElementById("camView") && window.__liveTracks() === 0', 'the camera closed, every track stopped');
+    const th2 = await ev('(() => [...document.querySelectorAll("#proofThumbs .proof-group")].map((g) => ({ k: g.dataset.kind, h: g.querySelector(".proof-group-h").textContent, n: g.querySelectorAll(".proof-thumb").length })))()');
+    check(th2.map((g) => g.h + ':' + g.n).join() === 'Item:2,DO:2', 'thumbnails grouped: Item (2), DO (2)', th2);
+    check(await ev('document.querySelector("#proofThumbs .proof-group[data-kind=do] .proof-del") && document.querySelector("#proofThumbs .proof-group[data-kind=do] .proof-del").getBoundingClientRect().width >= 32'), 'each thumbnail removable');
 
     console.log('3. Save & done: stamped, the stop completed by markDone');
     await ev('(() => { const r = document.getElementById("proofReceiver"); r.value = "Encik Ali"; r.dispatchEvent(new Event("change")); return true; })()');
@@ -232,30 +335,45 @@ async function main() {
     await click('#proofSave');
     await waitFor(planStop('pC') + '.status === "done" && !document.getElementById("proofSheet")', 'DONE at C through the sheet', 20000);
     const p1 = (await proofs()).find((p) => p.state === 'done');
-    check(p1 && p1.receiver === 'Encik Ali' && p1.photoIds.length === 1 && p1.sentAt == null && p1.driveAt === null && p1.items.join() === 'Gasket', 'proof done: receiver, 1 photo, sentAt / driveAt null', p1);
-    const img = await ev(`(async () => { const p = (await Proof.listProofs()).find((x) => x.state === 'done'); const ph = await Proof.getPhoto(p.photoIds[0]); const b = await createImageBitmap(ph.blob);
-      const c = document.createElement('canvas'); c.width = b.width; c.height = b.height; const g = c.getContext('2d'); g.drawImage(b, 0, 0);
-      const px = (x, y) => Array.from(g.getImageData(x, y, 1, 1).data.slice(0, 3)); const band = g.getImageData(0, Math.round(b.height * 0.75), b.width, Math.round(b.height * 0.25) - 1).data; let white = 0;
-      for (let i = 0; i < band.length; i += 4) if (band[i] > 220 && band[i + 1] > 220 && band[i + 2] > 220) white++;
-      return { w: b.width, h: b.height, type: ph.blob.type, bytes: ph.blob.size, rec: ph.bytes, top: px(5, 5), bottom: px(3, b.height - 3), white }; })()`);
-    check(img.w <= 1600 && img.h <= 1600 && img.w === 1600 && img.h === 1067, 'stamped photo scaled to a 1600 px long side', img);
-    check(img.type === 'image/jpeg' && img.bytes <= 400 * 1024 && img.rec === img.bytes, 'JPEG, at most 400 KB, bytes recorded', img);
-    check(img.top[0] > 200 && img.bottom[0] < 70 && img.bottom[1] < 90 && img.bottom[2] < 100 && img.bottom[2] > 20, 'the dark-blue band along the bottom (photo stays yellow at the top)', img);
-    check(img.white > 500, 'white logo / text in the band', img.white);
+    check(p1 && p1.receiver === 'Encik Ali' && p1.photoIds.length === 4 && p1.sentAt == null && p1.driveAt === null && p1.items.join() === 'Gasket', 'proof done: receiver, 4 photos, sentAt / driveAt null', p1);
+    const imgs = await ev(`(async () => { const p = (await Proof.listProofs()).find((x) => x.state === 'done'); const out = [];
+      for (const id of p.photoIds) { const ph = await Proof.getPhoto(id); const b = await createImageBitmap(ph.blob);
+        const c = document.createElement('canvas'); c.width = b.width; c.height = b.height; const g = c.getContext('2d'); g.drawImage(b, 0, 0);
+        const band = g.getImageData(0, Math.round(b.height * 0.75), b.width, Math.round(b.height * 0.25) - 1).data; let white = 0;
+        for (let i = 0; i < band.length; i += 4) if (band[i] > 220 && band[i + 1] > 220 && band[i + 2] > 220) white++;
+        const bt = await window.__bottom(ph.blob);
+        out.push({ kind: ph.kind, w: b.width, h: b.height, type: ph.blob.type, bytes: ph.blob.size, rec: ph.bytes, bottom: bt.avg, white }); }
+      return { counts: p.counts, out }; })()`);
+    // the band is #00243c at 85% over the photo: each channel within 0.15 x 255 (+ JPEG slack) above (0, 31, 51)
+    const isBand = (c) => c[0] <= 46 && c[1] >= 23 && c[1] <= 77 && c[2] >= 43 && c[2] <= 97 && c[2] > c[0] + 20;
+    const items = imgs.out.filter((x) => x.kind === 'item'), dos = imgs.out.filter((x) => x.kind === 'do');
+    check(items.length === 2 && dos.length === 2 && JSON.stringify(imgs.counts) === '{"item":2,"do":2}', 'saved: 2 item and 2 DO photos, counts on the proof', imgs.counts);
+    check(items.every((x) => Math.max(x.w, x.h) <= 1600 && x.type === 'image/jpeg' && x.bytes <= 400 * 1024 && x.rec === x.bytes), 'item photos: long side <= 1600 px, JPEG <= 400 KB, bytes recorded', items);
+    check(items.every((x) => isBand(x.bottom)) && items.every((x) => x.white > 500), 'item photos: the bottom strip is the #00243c band, with white logo / text', items.map((x) => ({ bottom: x.bottom, white: x.white })));
+    check(dos.every((x) => Math.max(x.w, x.h) <= 2000 && x.type === 'image/jpeg' && x.rec === x.bytes), 'DO photos: long side <= 2000 px, JPEG', dos);
+    check(dos.every((x) => !isBand(x.bottom)), 'DO photos: the bottom strip is not the band (no band, no logo, no text)', dos.map((x) => x.bottom));
     const job1 = await ev('(() => { const j = WaypointDebug.S.jobs.find((x) => x.id === "j1"); const d = WaypointDebug.S.days[Object.keys(WaypointDebug.S.days).sort().pop()]; const e = d.events.filter((x) => x.type === "done" && x.kind === "deliver" && x.jobId === "j1").pop(); return { status: j.status, proofId: j.proofId, ev: e && e.proofId, sum: e && e.proof }; })()');
-    check(job1.status === 'done' && job1.proofId === p1.id && job1.ev === p1.id && job1.sum.photos === 1 && job1.sum.receiver === 'Encik Ali', 'the proof id is on the job record and the done event', job1);
+    check(job1.status === 'done' && job1.proofId === p1.id && job1.ev === p1.id && job1.sum.photos === 4 && job1.sum.itemPhotos === 2 && job1.sum.doPhotos === 2 && job1.sum.receiver === 'Encik Ali', 'the proof id is on the job record and the done event (2 item, 2 DO)', job1);
     const hDone = await cardH('Beta Customer');
     check(hDone <= hPending && hDone <= hReached, 'the done card is no taller than while pending (' + hDone + ' <= ' + hPending + ' / ' + hReached + ' px)', { hDone, hPending, hReached });
     const sendBtn = '(' + cardOf('Beta Customer') + ').querySelector("button.send-group")';
     const sb = await ev('(() => { const b = ' + sendBtn + '; if (!b) return null; const cs = getComputedStyle(b), i = b.querySelector("img"); return { text: b.textContent, bg: cs.backgroundColor, fg: cs.color, img: i && i.getAttribute("src"), imgH: i && Math.round(i.getBoundingClientRect().height), loaded: i && i.complete && i.naturalWidth > 0 }; })()');
     check(sb && sb.text === 'SEND TO GROUP' && sb.bg === 'rgb(37, 211, 102)' && sb.fg === 'rgb(13, 20, 27)', 'SEND TO GROUP: green with dark text', sb);
     check(sb && sb.img === 'whatsapp-glyph.svg' && sb.imgH === 18 && sb.loaded, 'the pack glyph, 18 px high, left of the label', sb);
+    await click('.card.stop.done button.send-group');
+    await waitFor('window.__shares.length === 1', 'the share of the mixed proof');
+    const sh0 = await ev('window.__shares[0]');
+    check(sh0.files && sh0.files.map((f) => f.name).join() === ['item_1', 'item_2', 'DO_1', 'DO_2'].map((s) => '2026-11-26_beta-customer_' + s + '.jpg').join() && sh0.files.every((f) => f.isFile && f.type === 'image/jpeg'),
+      'share(): item files first (item_1, item_2), then DO files (DO_1, DO_2)', sh0.files);
+    check(/^DELIVERED - Beta Customer\nGasket\nReceived by: Encik Ali\n26 Nov 2026, \d+:\d\d (am|pm)$/.test(sh0.text), 'the caption text is unchanged', sh0.text);
+    await waitFor('(' + sendBtn + ' || {}).textContent === "SENT ✓"', 'SENT ✓ after the mixed share');
+    await ev('window.__shares = []; true');
 
     console.log('4. Undo voids the proof (photos kept); a later PROOF makes a new one');
     await click('.card.stop.done button.undo');
     await waitFor('!' + planStop('pC') + '.status', 'C pending again');
     await waitFor('Proof.getProof(' + JSON.stringify(p1.id) + ').then((p) => p && p.state === "void")', 'the proof voided');
-    check(await ev('Proof.photosOf(' + JSON.stringify(p1.id) + ').then((a) => a.length)') === 1, 'its photo is kept');
+    check(await ev('Proof.photosOf(' + JSON.stringify(p1.id) + ').then((a) => a.length)') === 4, 'its photos are kept (all 4)');
     check(await ev('!WaypointDebug.S.jobs.find((x) => x.id === "j1").proofId') && await primary('Beta Customer') === '📷 PROOF' && !(await ev('!!document.querySelector("button.send-group")')), 'job unlinked, PROOF again, no SEND button');
     await advance(60000);
     await tapPrimary('Beta Customer');
@@ -283,7 +401,7 @@ async function main() {
     await waitFor('window.__shares.length === 1', 'navigator.share called');
     const sh1 = await ev('window.__shares[0]');
     check(sh1.text === cap, 'share text = caption(proof)', sh1.text);
-    check(sh1.files && sh1.files.length === 1 && sh1.files[0].isFile && sh1.files[0].type === 'image/jpeg' && sh1.files[0].name === '2026-11-26_beta-customer_1.jpg', 'share files: the stamped JPEG named by fileName() (the shown name, Sdn Bhd dropped)', sh1.files);
+    check(sh1.files && sh1.files.length === 1 && sh1.files[0].isFile && sh1.files[0].type === 'image/jpeg' && sh1.files[0].name === '2026-11-26_beta-customer_item_1.jpg', 'share files: the stamped JPEG named by fileName() (the shown name, Sdn Bhd dropped)', sh1.files);
     check(await ev('window.__canShareCalls.length') >= 1 && await ev('window.__copied[window.__copied.length - 1]') === cap, 'canShare asked; the caption was copied to the clipboard');
     await waitFor('(' + sendBtn + ' || {}).textContent === "SENT ✓"', 'the button to read SENT ✓');
     check(/^Caption copied - paste it if WhatsApp shows none$/.test(await ev('document.getElementById("toast").textContent')), 'notice: Caption copied - paste it if WhatsApp shows none');
@@ -330,7 +448,7 @@ async function main() {
     console.log('7. CSV columns, Settings line, Export');
     const csv = await ev('(() => { const S = WaypointDebug.S, d = S.days[Object.keys(S.days).sort().pop()]; return DayLog.toCSV(DayLog.summarise(d, S.jobs, S.places)).trim().split("\\r\\n"); })()');
     check(csv[0].endsWith(',late,receiver,proof'), 'CSV header ends with receiver, proof', csv[0]);
-    check(csv.some((l) => /,delivery,Gasket,.*,Encik Ali,1 photo$/.test(l)) && csv.some((l) => /,in-hand,Fuse,.*,,no photo: Left at guard house$/.test(l)) && csv.some((l) => /,errand,.*,,$/.test(l)), 'CSV rows: "1 photo" + receiver, "no photo: <reason>", empty for the errand', csv);
+    check(csv.some((l) => /,delivery,Gasket,.*,Encik Ali,"1 item, 0 DO photos"$/.test(l)) && csv.some((l) => /,in-hand,Fuse,.*,,no photo: Left at guard house$/.test(l)) && csv.some((l) => /,errand,.*,,$/.test(l)), 'CSV rows: "1 item, 0 DO photos" + receiver, "no photo: <reason>", empty for the errand', csv);
     await click('#tabs button[data-tab="settings"]');
     await waitFor('/deliveries/.test((document.getElementById("proofLine") || {}).textContent || "")', 'the Settings line');
     const line = await ev('document.getElementById("proofLine").textContent');
@@ -354,6 +472,42 @@ async function main() {
       URL.createObjectURL = realCreate; const j = JSON.parse(await blob.text()); return { n: (j.proofs || []).length, photo: JSON.stringify(j.proofs).indexOf('blob') >= 0 || JSON.stringify(j.proofs).indexOf('data:image') >= 0, keys: Object.keys(j.proofs[0] || {}).sort().join() }; })()`);
     check(exp.n === 4 && !exp.photo, 'Export JSON carries the proof records (no photos)', exp);
     check(!page.logs.some((l) => /EXCEPTION/.test(l)), 'no page exceptions', page.logs);
+
+    console.log('9. a second world: camera permission refused -> "Use phone camera" (the file input)');
+    await send('Page.navigate', { url: 'about:blank' });
+    await sleep(300);
+    await send('Storage.clearDataForOrigin', { origin: new URL(appUrl).origin, storageTypes: 'all' });
+    await send('Page.navigate', { url: appUrl + '?deny=1' });
+    await waitFor('document.querySelector("#planBtn") && window.Proof', 'the Plan tab (fresh storage)');
+    check(await ev('Proof.listProofs().then((a) => a.length)') === 0, 'fresh storage: no proofs');
+    await click('#planBtn');
+    await waitFor('window.WaypointDebug && WaypointDebug.S.plan && WaypointDebug.S.tab === "route" && document.querySelectorAll(".timeline .card.stop").length >= 4', 'the planned route (2nd world)');
+    await reach('Delta Works');
+    await tapPrimary('Delta Works');
+    await waitFor('document.getElementById("proofSheet")', 'the sheet at D (2nd world)');
+    await click('#proofItemBtn');
+    await waitFor('document.getElementById("camView") && !document.getElementById("camMsg").hidden', 'the refused-camera message');
+    const deny = await ev('(() => ({ text: document.querySelector("#camMsg p").textContent, btn: (document.getElementById("camFallback") || {}).textContent, gum: window.__gum.length, err: window.__gum.map((g) => g.err), shutter: document.getElementById("camShutter").disabled }))()');
+    check(/permission/i.test(deny.text) && deny.text.split(/[.!?](\s|$)/).filter((s) => s && s.trim()).length === 1 && deny.btn === 'Use phone camera' && deny.shutter, 'one plain sentence and "Use phone camera"; no shutter', deny);
+    check(deny.gum === 1 && deny.err[0] === 'NotAllowedError', 'NotAllowedError stops the chain at once (1 ask)', deny);
+    await click('#camFallback');
+    await waitFor('!document.getElementById("camView")', 'the camera view closed (fallback)');
+    check(await ev('window.__fileClicks[window.__fileClicks.length - 1]') === 'proofFile', '"Use phone camera" opens the file input (capture=environment)');
+    await ev('window.__feedPhoto(1600, 1200)');
+    await waitFor('document.querySelectorAll("#proofThumbs .proof-group[data-kind=item] .proof-thumb").length === 1', 'the item photo from the phone camera');
+    await click('#proofDoBtn');
+    await waitFor('document.getElementById("camFallback")', 'the refused-camera message (DO)');
+    await click('#camFallback');
+    await waitFor('!document.getElementById("camView")', 'the camera view closed (DO fallback)');
+    await ev('window.__feedPhoto(2400, 1800)');
+    await waitFor('document.getElementById("scanScreen") && document.querySelectorAll("#scanScreen .scan-handle").length === 4', 'a phone-camera DO photo goes through the corner screen');
+    await click('#scanUse');
+    await waitFor('!document.getElementById("scanScreen") && document.querySelectorAll("#proofThumbs .proof-group[data-kind=do] .proof-thumb").length === 1', 'the DO photo from the phone camera');
+    await click('#proofSave');
+    await waitFor('WaypointDebug.S.plan.result.plans[0].stops.find((s) => s.placeId === "pD").status === "done"', 'DONE at D through the file-input fallback', 20000);
+    const p9 = await ev('Proof.listProofs().then((a) => a.find((p) => p.state === "done")).then(async (p) => ({ counts: p.counts, n: p.photoIds.length, kinds: (await Proof.photosOf(p.id)).map((x) => x.kind).sort().join(), dims: await Promise.all((await Proof.photosOf(p.id)).map(async (x) => { const b = await window.__bottom(x.blob); return x.kind + ":" + b.w + "x" + b.h; })) }))');
+    check(p9.n === 2 && p9.kinds === 'do,item' && JSON.stringify(p9.counts) === '{"item":1,"do":1}', 'completed through the file input: 1 item + 1 DO photo', p9);
+    check(!page.logs.some((l) => /EXCEPTION/.test(l)), 'no page exceptions (2nd world)', page.logs);
   } catch (e) {
     fails++;
     console.log('  FAIL ' + e.message);

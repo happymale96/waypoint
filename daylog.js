@@ -189,7 +189,7 @@
   function recordBreakStart(day, info) { day.breakStartedAt = info.nowIso; day.breakEndedAt = null; day.timeSplitV = TIME_SPLIT_V; }
   function recordBreakEnd(day, info) { if (day.breakStartedAt) day.breakEndedAt = info.nowIso; }
   // A pickup's event also carries collectedAt (the time the item was collected: the CSV "collected time"); older records have none.
-  // A delivery completed with a proof of delivery carries proofId + the proof's summary {id, photos, noPhotoReason, receiver}
+  // A delivery completed with a proof of delivery carries proofId + the proof's summary {id, photos, itemPhotos, doPhotos, noPhotoReason, receiver}
   // (info.proof; info.proofJobIds = the deliveries it covers, all of them when absent). The photos stay in IndexedDB (proof.js).
   function recordDone(day, info) { // info: {nowIso, stopId, actions:[{jobId,kind,item}], places{}, reachedAt?, reachedSource?, dwellMin?, proof?, proofJobIds?}
     snapPlace(day, info.places, info.stopId);
@@ -198,10 +198,14 @@
     return info.actions.map((a) => appendEvent(day, Object.assign({ t: info.nowIso, type: 'done', jobId: a.jobId || null, stopId: info.stopId, kind: a.kind, item: a.item || '' },
       a.kind === 'pickup' ? { collectedAt: info.nowIso } : {}, proofOf(a), reachedFields(info))));
   }
-  // the CSV "proof" cell: "<n> photos" / "no photo: <reason>" ('' without a proof)
+  // the CSV "proof" cell: "<a> item, <b> DO photos" / "no photo: <reason>" ('' without a proof). A summary from before the two
+  // photo kinds ({photos} only) counts every photo as item. Same text as Proof.csvCell.
   function proofCell(p) {
     if (!p) return '';
-    if (p.photos > 0) return p.photos + (p.photos === 1 ? ' photo' : ' photos');
+    if (p.photos > 0) {
+      const dos = p.doPhotos > 0 ? p.doPhotos : 0;
+      return (p.itemPhotos != null ? p.itemPhotos : p.photos - dos) + ' item, ' + dos + ' DO photos';
+    }
     return 'no photo: ' + String(p.noPhotoReason || '').trim();
   }
   // The fuel stop: recorded as a stop with its done time (kind 'fuel', no job). It is never a job: job counts ignore it and
