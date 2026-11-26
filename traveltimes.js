@@ -421,6 +421,79 @@
     return stops.map((s) => (s.status ? s : byId.get(order[n++])));
   }
 
+  // ---------- a manual move on the Route tab (▲ / ▼) ----------
+  // stops = the plan's stops in order (done / skipped stay where they are; a pending fuel stop has fuel: true). i = the index
+  // of a pending ordinary stop (no status, not fuel), dir = -1 (up) | +1 (down). It swaps with the nearest pending ordinary
+  // stop in that direction. Refused when the stop that would now come first holds a delivery whose item is collected (a
+  // pickup not done) at the stop it would now pass. First stop / After / urgent rules never block it: the driver's order wins.
+  // A pending fuel stop stays between the two stops it sat between when they are still next to each other (either order);
+  // otherwise it goes right after the stop it followed (or first, when nothing came before it).
+  // jobs = {jobId: job}; baseId(key) -> the saved place of a stop key ('<place>#2' -> place).
+  // -> null (no neighbour that way) | {refused: {item, deliverId, pickupId}} | {stops, a, b} (a = the moved stop's key, b = the other's)
+  function moveStop(stops, i, dir, jobs, baseId) {
+    const bid = baseId || ((k) => String(k).split('#')[0]);
+    const ord = (s) => !!s && !s.status && !s.fuel;
+    if (!Array.isArray(stops) || !ord(stops[i])) return null;
+    const fi = stops.findIndex((s) => s && s.fuel && !s.status);
+    const rest = stops.filter((s, k) => k !== fi);
+    const at = rest.indexOf(stops[i]);
+    const pos = rest.map((s, k) => (ord(s) ? k : -1)).filter((k) => k >= 0);
+    const p = pos.indexOf(at), q = p + (dir < 0 ? -1 : 1);
+    if (p < 0 || q < 0 || q >= pos.length) return null;
+    const j = pos[q], up = Math.min(at, j), down = Math.max(at, j);
+    const first = rest[down], second = rest[up]; // after the swap `first` comes before `second`
+    const block = blockOf(first, second, jobs || {}, bid);
+    if (block) return { refused: block };
+    const out = rest.slice();
+    out[up] = first; out[down] = second;
+    if (fi >= 0) {
+      const F = stops[fi], X = fi > 0 ? stops[fi - 1] : null, Y = fi < stops.length - 1 ? stops[fi + 1] : null;
+      const ix = X ? out.indexOf(X) : -1, iy = Y ? out.indexOf(Y) : -1;
+      let ins;
+      if (ix >= 0 && iy >= 0 && Math.abs(ix - iy) === 1) ins = Math.max(ix, iy); // still neighbours: between them
+      else if (ix >= 0) ins = ix + 1; // right after the stop it followed
+      else ins = 0;
+      out.splice(ins, 0, F);
+    }
+    return { stops: out, a: stops[i].placeId, b: rest[j].placeId };
+  }
+  // `first` would come before `second`: a delivery at `first` whose job still has a pickup (not done) at `second`?
+  function blockOf(first, second, jobs, bid) {
+    const sp = bid(second.placeId);
+    for (const a of first.actions || []) {
+      if (a.kind !== 'deliver') continue;
+      const j = jobs[a.jobId];
+      const pickHere = (second.actions || []).find((x) => x.kind === 'pickup' && x.jobId === a.jobId);
+      const pendingThere = j ? (j.pickups || []).some((pk) => pk.placeId === sp && !pk.done) : !!pickHere;
+      if (pickHere && pendingThere) return { item: pickHere.item || a.item || 'the item', deliverId: first.placeId, pickupId: second.placeId };
+    }
+    return null;
+  }
+  // The model legs the re-time (Solver.retime) walks for `plan` from stop index `from` (-1 = the start): [{i, j}] in model
+  // indices (0 start, 1..k stops, k+1 end) whose cell is missing (null / not finite / negative) or estimated (est mask) in any
+  // slice. Legs into or out of a fuel stop come from model.fuelT (not listed); a reached stop has no leg into it.
+  function missingOrderLegs(plan, from) {
+    const m = plan && plan.model;
+    if (!m || !m.matrices || !m.matrices.length) return [];
+    const k = m.stopIds.length, FUEL = -1;
+    const pidx = (id) => { const x = m.stopIds.indexOf(id); return x < 0 ? null : x + 1; };
+    let pos = 0;
+    const fs = from >= 0 ? plan.stops[from] : null;
+    if (fs) pos = fs.fuel ? FUEL : (pidx(fs.placeId) || 0);
+    const out = [], seen = new Set();
+    const bad = (i, j) => m.matrices.some((x) => { const v = x.m[i] && x.m[i][j]; return v == null || !isFinite(v) || v < 0 || !!(x.est && x.est[i] && x.est[i][j]); });
+    const need = (i, j) => { if (i === j || i === FUEL || j === FUEL) return; const key = i + '>' + j; if (!seen.has(key) && bad(i, j)) { seen.add(key); out.push({ i, j }); } };
+    plan.stops.forEach((s) => {
+      if (s.status) return;
+      const pi = s.fuel ? FUEL : pidx(s.placeId);
+      if (pi == null) return;
+      if (s.reachedAt == null) need(pos, pi);
+      pos = pi;
+    });
+    need(pos, k + 1);
+    return out;
+  }
+
   // The solver behind lookAhead / twoStep for a set of keys: points = [origin, stops (Solver.buildStops order), end].
   // base = {start, end, jobs, places, departAtISO, noDetour, respectClosedWindows}; post(plan) -> plan (e.g. the lunch break).
   function solverAdapter(Solver, base, post) {
@@ -501,6 +574,6 @@
     bucketOf, bucketDepart, planBucket, minOfDay,
     emptyMemory, memKey, medianSample, addSample, learned, pairCount, normaliseMemory, sampleOf, remember, learnedLine,
     planSession, tally, sessionFetch, bannerText, LEARNED_CLEAR_FLAG, clearSamples, runLearnedClearOnce,
-    snap, neededPairs, runFetches, buildTable, checkLegs, twoStep, planRoute, agreement, nextCandidates, lookAhead, decide, reorderText, reorderStops, solverAdapter,
+    snap, neededPairs, runFetches, buildTable, checkLegs, twoStep, planRoute, agreement, nextCandidates, lookAhead, decide, reorderText, reorderStops, moveStop, missingOrderLegs, solverAdapter,
   };
 });

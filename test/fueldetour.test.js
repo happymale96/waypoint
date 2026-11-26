@@ -142,6 +142,26 @@ const routeNoFuel = { origin: O, stops: [{ id: 'office', name: F.name, lat: F.la
     ok(merged.length === 1 && merged[0].placeId === 'cp', 'a new listing of a remembered station (15 m away) does not add a second entry');
   }
 
+  console.log('B2b. stricter merge: within 40 m, or within 150 m with the same name');
+  {
+    // Seremban R&R: a Caltex on each side of the highway, ~120 m apart (0.00108 deg of latitude)
+    const nb = { placeId: 'nb', name: 'Caltex R&R Seremban (Northbound)', brand: 'Caltex', lat: 2.70000, lng: 101.90000 };
+    const sb = { placeId: 'sb', name: 'Caltex R&R Seremban (Southbound)', brand: 'Caltex', lat: 2.70108, lng: 101.90000 };
+    const d = Fuel.haversineKm(nb, sb) * 1000;
+    ok(d > 110 && d < 130, 'the two R&R stations are ~120 m apart (' + Math.round(d) + ' m)');
+    ok(Fuel.cleanStations([nb, sb], 'Caltex').length === 2, 'Northbound and Southbound 120 m apart: both stay');
+    const viaMerge = Fuel.cleanStations(Fuel.mergeStations([nb], [sb], '2026-11-26T03:14:00.000Z'), 'Caltex');
+    ok(viaMerge.length === 2, 'the after-search de-dup keeps both too');
+    const a = { placeId: 'a', name: 'Caltex Nilai', brand: 'Caltex', lat: 2.80000, lng: 101.80000 };
+    const b = { placeId: 'b', name: 'Caltex Station Bandar Baru Nilai', brand: 'Caltex', lat: 2.80018, lng: 101.80000 }; // ~20 m
+    ok(Math.round(Fuel.haversineKm(a, b) * 1000) === 20, '20 m apart');
+    ok(Fuel.cleanStations([a, b], 'Caltex').map((s) => s.placeId).join() === 'a', 'different names 20 m apart: merged (one stays)');
+    const c = { placeId: 'c', name: 'Caltex  Mantin', brand: 'Caltex', lat: 2.90000, lng: 101.70000 };
+    const e = { placeId: 'e', name: 'caltex mantin.', brand: 'Caltex', lat: 2.90090, lng: 101.70000 }; // ~100 m
+    ok(Math.round(Fuel.haversineKm(c, e) * 1000) === 100, '100 m apart');
+    ok(Fuel.cleanStations([c, e], 'Caltex').map((s) => s.placeId).join() === 'c', 'the same name (case, spaces, punctuation) 100 m apart: merged');
+  }
+
   console.log('B3. the one-time clean-up of the remembered stations (a fixture modelled on the phone: 69 remembered)');
   {
     const base = { lat: 2.70, lng: 101.55 };

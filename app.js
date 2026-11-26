@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = 'ee362ecf'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '8d548b72'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -163,7 +163,7 @@
     await WPStore.set('meta', 'migrations', rec);
   }
   // One-time (2026-11-26, flag meta/migrations.fuelStationsClean2026_11_26): the station memory (the app's own cache, never the
-  // Places tab) loses the shops saved as stations ("ZUS Coffee - Caltex Pajam") and keeps one of two entries within 150 m
+  // Places tab) loses the shops saved as stations ("ZUS Coffee - Caltex Pajam") and keeps one of two duplicate entries (40 m, or 150 m with the same name)
   // (Fuel.cleanStations). Only meta/fuelStations is written: a fuel stop in today's route (plan ctx.places) and the day history are untouched.
   async function runFuelStationsClean() {
     const r = await Fuel.cleanStationsOnce(WPStore, fuelBrand());
@@ -346,12 +346,27 @@
   const estMark = (on) => (on ? ' est.' : '');
 
   // ---------- place picker (single autocomplete box) ----------
-  async function savePlaceFromSearch(r) {
-    const dup = Object.values(S.places).find((p) => Math.abs(p.lat - r.lat) < 1e-4 && Math.abs(p.lng - r.lng) < 1e-4);
+  const searchDup = (r) => Object.values(S.places).find((p) => Math.abs(p.lat - r.lat) < 1e-4 && Math.abs(p.lng - r.lng) < 1e-4);
+  // A NEW place from Google search is saved with the type the driver taps (askPlaceType); its stop time is that type's
+  // default (newPlace), and MSG follows the type as everywhere. A place already saved is returned as it is.
+  async function savePlaceFromSearch(r, type) {
+    const dup = searchDup(r);
     if (dup) return dup;
-    const p = newPlace({ name: r.name, address: r.address, lat: r.lat, lng: r.lng, type: 'other' });
+    const p = newPlace({ name: r.name, address: r.address, lat: r.lat, lng: r.lng, type });
     await savePlace(p);
     return p;
+  }
+  // One sheet titled with the place name, one button per place type of the place form (TYPES, Messages.typeLabel), nothing
+  // preselected. A tap -> onType(type); dismissing (backdrop / Cancel) calls nothing, so nothing is saved.
+  const capFirst = (s) => String(s).charAt(0).toUpperCase() + String(s).slice(1);
+  function askPlaceType(name, onType) {
+    let picked = false;
+    const sh = openSheet(name || 'New place');
+    sh.sheet.id = 'placeTypeSheet';
+    sh.body.append(h('div', { class: 'muted' }, 'What kind of place is this?'),
+      h('div', { class: 'type-btns' }, TYPES.map((t) => h('button', { type: 'button', class: 'type-btn', 'data-type': t,
+        onclick: () => { if (picked) return; picked = true; sh.close(); onType(t); } }, capFirst(Messages.typeLabel(t))))),
+      h('button', { type: 'button', class: 'type-cancel', style: 'margin-top:8px', onclick: sh.close }, 'Cancel'));
   }
 
   function openPlacePicker(onPick, title, extras) {
@@ -395,10 +410,16 @@
         .concat(localMatches(q0).map((p) => row(p.name, Messages.typeLabel(p.type) + (p.address ? ' · ' + p.address : ''), () => choose(p), !!p.pinned)));
       if (g.state === 'done' && g.results.length) {
         kids.push(h('div', { class: 'divider' }, 'Google'));
-        g.results.forEach((r) => kids.push(row(r.name, r.address, async () => {
+        g.results.forEach((r) => kids.push(row(r.name, r.address, () => {
           if (busy) return;
-          busy = true;
-          try { choose(await savePlaceFromSearch(r)); } finally { busy = false; }
+          const dup = searchDup(r);
+          if (dup) { choose(dup); return; } // already saved: not asked again, not changed
+          sh.close(); // then ask the type; dismissing saves nothing and onPick is never called (the field stays empty)
+          askPlaceType(r.name, async (t) => {
+            if (busy) return;
+            busy = true;
+            try { onPick(await savePlaceFromSearch(r, t)); } finally { busy = false; }
+          });
         })));
       }
       list.replaceChildren(...kids);
@@ -1321,7 +1342,7 @@
     const P = S.plan, plan = curPlan();
     if (!P || !plan) return null;
     return {
-      v: 1, savedAt: new Date().toISOString(), tab: S.tab, jobsChanged: !!P.jobsChanged, noDetour: P.noDetour, provider: P.provider || null, ctx: P.ctx, afterConflicts: P.afterConflicts || [],
+      v: 1, savedAt: new Date().toISOString(), tab: S.tab, jobsChanged: !!P.jobsChanged, manualOrder: !!P.manualOrder, noDetour: P.noDetour, provider: P.provider || null, ctx: P.ctx, afterConflicts: P.afterConflicts || [],
       plan: Object.assign({}, plan, { model: Object.assign({}, plan.model, { matrices: null }) }), // matrices are stored once, in ctx
     };
   }
@@ -1340,7 +1361,7 @@
       delete snap.plan.endNavStartedAt; // the end point's navigation tap belongs to that day too
     }
     S.plan = {
-      ctx: snap.ctx, noDetour: !!snap.noDetour, jobsChanged: !!snap.jobsChanged, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: snap.provider || null, afterConflicts: Array.isArray(snap.afterConflicts) ? snap.afterConflicts : [],
+      ctx: snap.ctx, noDetour: !!snap.noDetour, jobsChanged: !!snap.jobsChanged, manualOrder: !!snap.manualOrder, idx: 0, prompt: null, shiftMs: 0, alt: null, provider: snap.provider || null, afterConflicts: Array.isArray(snap.afterConflicts) ? snap.afterConflicts : [],
       result: { plans: [snap.plan], error: null, stats: null, stopIds: snap.plan.model.stopIds },
     };
     if (['plan', 'route', 'places', 'settings'].includes(snap.tab)) S.tab = snap.tab;
@@ -1811,6 +1832,7 @@
         h('div', { class: 'muted', id: 'departedAt', style: 'margin-top:8px' }, (departMs > now ? 'Departs ' : 'Departed ') + fmt(departMs)),
         P.shiftMs > 60000 ? h('div', { class: 'chip detour' }, 'Running ' + Math.round(P.shiftMs / 60000) + ' min behind plan') : null,
         lunchSkippedLine()),
+      manualOrderNote() || '',
       h('label', { class: 'toggle card' }, h('input', { type: 'checkbox', checked: P.noDetour, onchange: (e) => { P.noDetour = e.target.checked; reSolveFromCache(); } }), 'No detour (urgent deliveries first, nothing else in between)'));
 
     if (plan.violations.length) v.append(h('div', { class: 'violations' }, h('b', null, 'No plan meets every time window:'), plan.violations.map((t) => h('div', null, '• ' + t))));
@@ -1990,6 +2012,13 @@
       ofKind('pickup').map((a) => line('collect', (a.item || 'items') + ' → ' + dName(customerOf(a)))),
       ofKind('deliver').map((a) => line('deliver', deliverItem(a) || '—')),
       ofKind('errand').map((a) => line('errand', a.item || 'Errand')));
+    // the place's contact name: small muted text at the end of the card's second line (the first job line), " · " before it,
+    // cut with an ellipsis rather than wrapping (no new line)
+    const contactName = String(((S.places[baseId(stop.placeId)] || place || {}).contactName) || '').trim();
+    if (contactName && lines.length) {
+      const l0 = lines[0];
+      lines[0] = h('div', { class: l0.className + ' has-contact' }, h('span', { class: 'act-t' }, l0.textContent), h('span', { class: 'muted contact-tail' }, ' · ' + contactName));
+    }
     const pills = [];
     if (stop.detour) pills.push(h('span', { class: 'pill detour' }, 'DETOUR'));
     if (stop.closedWarning) pills.push(h('span', { class: 'pill closed' }, 'CLOSED'));
@@ -2009,7 +2038,8 @@
       h('span', { class: 'num' }, (i + 1) + '.'),
       h('span', { class: 'nm' }, dName(place.name)),
       pills,
-      h('span', { class: 'times' }, fmt(stop.arriveAt) + estMark(curEst.stops.has(stop.placeId))));
+      h('span', { class: 'times' }, fmt(stop.arriveAt) + estMark(curEst.stops.has(stop.placeId))),
+      moveButtons(stop, i)); // ▲ ▼ at the right end of the title row (no extra line)
     const toggle = () => {
       const on = more.hidden; more.hidden = !on;
       head.setAttribute('aria-expanded', String(on));
@@ -2029,8 +2059,91 @@
       h('div', { class: 'stop-btns' }, btns));
   }
 
+  // ---------- ▲ / ▼: the driver's own order (TravelTimes.moveStop) ----------
+  // On every pending ordinary stop card (not done / skipped / fuel / end point). ▲ is off on the first pending stop, ▼ on the
+  // last one before the end point. A tap swaps with the pending neighbour that way (a fuel stop keeps its place by moveStop's
+  // rule), refuses a delivery before its own pickup (the notice names the item), re-times through the one timing path (learned
+  // times, then only the missing legs fetched through the shared limiter; no re-solve) and turns the automatic re-order after
+  // DONE / SKIP off until the next PLAN (P.manualOrder).
+  function moveButtons(stop, i) {
+    const cur = curPlan();
+    if (!cur) return null;
+    const pos = cur.stops.map((s, k) => (!s.status && !s.fuel ? k : -1)).filter((k) => k >= 0);
+    const stopKey = (e) => { e.stopPropagation(); };
+    const b = (dir, glyph, label, off) => h('button', { type: 'button', class: 'move-btn', 'data-move': dir < 0 ? 'up' : 'down', 'aria-label': label, disabled: off,
+      onclick: (e) => { e.stopPropagation(); moveTap(stop, i, dir); }, onkeydown: stopKey }, glyph);
+    return h('span', { class: 'move-btns' }, b(-1, '▲', 'Move up', i === pos[0]), b(1, '▼', 'Move down', i === pos[pos.length - 1]));
+  }
+  const moveRefusedText = (r) => "Can't move: " + r.item + ' is collected at ' + dName(pName(r.pickupId)) + ', so ' + dName(pName(r.deliverId)) + ' must come after it';
+  const MANUAL_ORDER_TEXT = 'Manual order — tap PLAN to let the app reorder';
+  const manualOrderNote = () => (S.plan && S.plan.manualOrder ? h('div', { class: 'muted manual-order', id: 'manualOrderNote', role: 'status' }, MANUAL_ORDER_TEXT) : null);
+  async function moveTap(stop0, i0, dir) {
+    stopTapped();
+    const P = S.plan, cur = curPlan();
+    const ls = liveStop(stop0, i0);
+    if (!P || !cur || !ls) return;
+    const jobs = {};
+    ((P.ctx && P.ctx.jobs) || []).forEach((j) => { jobs[j.id] = j; });
+    S.jobs.forEach((j) => { jobs[j.id] = j; });
+    const r = TT.moveStop(cur.stops, ls.i, dir, jobs, baseId);
+    if (!r) return;
+    if (r.refused) { banner(moveRefusedText(r.refused), 'info'); return; }
+    banner(null);
+    P.result.plans = [Object.assign({}, cur, { stops: r.stops, order: r.stops.filter((s) => !s.fuel).map((s) => s.placeId) })]; P.idx = 0;
+    P.alt = null; P.reorder = null; P.manualOrder = true;
+    const toFetch = fillMoveLegs(P); // learned now; estimates for the rest until TomTom answers
+    retimeNow();
+    await savePlan();
+    render();
+    if (!toFetch.length) return;
+    const now = Date.now();
+    for (const f of toFetch) {
+      if (S.plan !== P || !S.settings.tomtomKey || navigator.onLine === false || ttOut()) break;
+      try {
+        const res = await ttLeg(f.a, f.b, null); // through the shared limiter (one request start every 300 ms)
+        if (res && res.seconds != null) { setLeg(curPlan().model, f.i, f.j, res.seconds, false); TT.remember(S.mem, f.a, f.b, now, res, now); }
+      } catch (e) { /* that leg keeps its estimate */ }
+    }
+    saveMemory();
+    if (S.plan !== P) return;
+    retimeNow();
+    await savePlan();
+    if (S.tab === 'route') render();
+  }
+  function setLeg(m, i, j, sec, est) { // into every slice where that cell is missing / estimated
+    m.matrices.forEach((x) => {
+      const v = x.m[i] && x.m[i][j], bad = v == null || !isFinite(v) || v < 0 || !!(x.est && x.est[i] && x.est[i][j]);
+      if (!bad || !x.m[i]) return;
+      x.m[i][j] = sec;
+      if (est && !x.est) x.est = x.m.map((row) => row.map(() => false));
+      if (x.est && x.est[i]) x.est[i][j] = !!est;
+    });
+  }
+  // The legs the new order needs that the plan's table lacks: a learned time (this part of the day) goes in at once; the rest
+  // get the straight-line estimate now and are returned to be fetched. -> [{i, j, a, b}]
+  function fillMoveLegs(P) {
+    const plan = curPlan(), m = plan.model, k = m.stopIds.length;
+    const miss = TT.missingOrderLegs(plan, lastDoneIdx(plan));
+    const nodeAt = (x) => {
+      if (x === 0) return nodeOf('start', m.start, P.ctx.start && P.ctx.start.id);
+      if (x === k + 1) return nodeOf('end', m.end, P.ctx.end && P.ctx.end.id);
+      const key = m.stopIds[x - 1], pl = S.places[baseId(key)] || P.ctx.places[key];
+      return pl ? nodeOf(key, pl, baseId(key)) : null;
+    };
+    const bucket = TT.bucketOf(Date.now()), out = [];
+    miss.forEach(({ i, j }) => {
+      const a = nodeAt(i), b = nodeAt(j);
+      if (!a || !b) return;
+      const l = a.pid != null && b.pid != null ? TT.learned(S.mem, a.pid, b.pid, bucket) : null;
+      if (l) { setLeg(m, i, j, l.s, false); return; }
+      setLeg(m, i, j, Budget.estSec(a, b), true);
+      out.push({ i, j, a, b });
+    });
+    return out;
+  }
+
   // ---------- REACHED before DONE ----------
-  const primaryBtn = (stop, i) => h('button', { class: 'small ok', 'data-act': Reached.isReached(stop) ? 'done' : 'reached', onclick: () => primaryTap(stop, i) }, Reached.buttonLabel(stop));
+  const primaryBtn =(stop, i) => h('button', { class: 'small ok', 'data-act': Reached.isReached(stop) ? 'done' : 'reached', onclick: () => primaryTap(stop, i) }, Reached.buttonLabel(stop));
   function reachedInline(stop, i) { // text + a small Undo, or null while the stop is not reached
     return Reached.isReached(stop)
       ? [Reached.reachedText(stop, fmt), ' ', h('button', { class: 'link-undo', type: 'button', 'aria-label': 'Undo reached', onclick: () => undoReachedTap(stop, i) }, 'Undo')]
@@ -2047,6 +2160,7 @@
   function reachStop(stop, source) { // stamps the live stop; false when it cannot be reached (done, skipped, already reached)
     if (!stop || stop.status || Reached.isReached(stop)) return false;
     Object.assign(stop, Reached.stampReached(stop, Date.now(), source));
+    delete stop.noAutoReach; // a REACHED (tap or auto) lifts an earlier Undo's hold (stampReached has none; assign keeps old keys)
     return true;
   }
   async function markReached(stop0, i0) { // REACHED: nothing but the stamp, the re-time and the repaint (no message, no day-log entry)
@@ -2054,7 +2168,7 @@
     if (!ls || !reachStop(ls.stop, 'tap')) return;
     await afterReachChange();
   }
-  async function undoReachedTap(stop0, i0) { // back to REACHED; this stop is never auto-reached again in this plan
+  async function undoReachedTap(stop0, i0) { // back to REACHED; no auto-Reached here until he has been more than the distance away (or taps REACHED)
     const ls = liveStop(stop0, i0);
     if (!ls || ls.stop.status || !Reached.isReached(ls.stop)) return;
     Object.assign(ls.stop, Reached.undoReached(ls.stop));
@@ -2090,6 +2204,12 @@
       // within the Auto-Reached distance AND stopped (speed <= 2 m/s, or no speed and inside for 20 s): Reached.autoReachStep
       const step = Reached.autoReachStep(S.arTrack, fix, stops, { enabled: S.settings.autoReach !== false, visible: document.visibilityState === 'visible', now: Date.now(), jobs, radiusM: Reached.radiusOf(S.settings.autoReachM) });
       S.arTrack = step.track;
+      // an Undo of Reached holds auto-Reached off for that stop until a fix puts the driver more than the distance away
+      if (step.rearm && step.rearm.length) {
+        let lifted = false;
+        plan.stops.forEach((s) => { if (s.noAutoReach && !s.status && step.rearm.indexOf(s.placeId) >= 0) { delete s.noAutoReach; lifted = true; } });
+        if (lifted) savePlan();
+      }
       const id = step.id;
       if (!id) return false;
       const idx = plan.stops.findIndex((s) => s.placeId === id && !s.status), live = plan.stops[idx];
@@ -2436,7 +2556,8 @@
     if (P.reorder && P.reorder.kind === 'card') P.reorder = null; // an unanswered suggestion belongs to the previous stop
     P.noSwitch = false; // an Undo holds switches only until the next DONE / SKIP
     const pend = pendingStops(plan);
-    const mode = Budget.afterStopMode({ setting: S.settings.afterStop || 'auto', pending: pend.length, guard: ttGuard(), down: ttOut(), service: ttService() });
+    // manual: the driver moved a stop himself (▲ / ▼): no automatic re-order until the next PLAN
+    const mode = Budget.afterStopMode({ setting: S.settings.afterStop || 'auto', pending: pend.length, guard: ttGuard(), down: ttOut(), service: ttService(), manual: !!P.manualOrder });
     if (mode !== 'lookahead' || !S.settings.tomtomKey || navigator.onLine === false || pend.some((s) => s.reachedAt != null)) return refreshFromLocation({ trigger });
     S.tt.lastLiveAt = Date.now();
     try { await lookAheadNow(P); } catch (e) { /* never break DONE: the plan keeps its times */ }
@@ -2745,7 +2866,7 @@
           if (run.errors.length >= targets.length) { rememberedOnly = true; failNote = 'Google search failed (' + (run.errors[0].message || 'error') + ')'; }
           else fuelRun = { key: rkey, at: Date.now(), searched: targets.length };
           searched = targets.length;
-          S.fuelStations = Fuel.cleanStations(Fuel.mergeStations(S.fuelStations, found), brand); // two entries within 150 m: one stays
+          S.fuelStations = Fuel.cleanStations(Fuel.mergeStations(S.fuelStations, found), brand); // duplicates (within 40 m, or 150 m with the same name): one stays
           await saveStations();
         }
       }

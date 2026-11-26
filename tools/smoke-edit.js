@@ -14,6 +14,12 @@
  * DONE at every stop -> the Klang item is in the With you bar; no "job j_" text anywhere. World s2 (the two-visit day): two
  * Office cards, FIRST on the first only, the second holds only the Carrier delivery and comes after Carrier; DONE on the first
  * leaves that delivery open; First stop turned on for another job -> the "First stop moved from Office to Carrier" toast.
+ * 4b (Places search mocked): a Google result not yet saved opens the type sheet (titled with its name, one button per place type,
+ * none preselected); dismissing saves nothing and leaves the field; Supplier saves it (10 min) and the job form continues; a saved
+ * place is not asked again. World s4 (at 360 px): the contact name at the end of a Route card's job line, cut with an ellipsis;
+ * ▲ / ▼ (first / last disabled), Eastern above its pickup Carrier refused with the item named, ▼ on Asian swaps and re-times
+ * (0 requests), a leg removed from the table and the memory = exactly 1 request, DONE after the move keeps the manual order (no
+ * look-ahead), the note survives a reload, PLAN re-solves and clears it.
  * The server and the browser are always shut down. Exit 1 on failure.
  * Needs Node 22+ (global WebSocket / fetch) and Chrome or Edge (set CHROME=<path> to choose one).
  */
@@ -56,6 +62,8 @@ const MINS = { 'H-O': 32, 'H-K': 46, 'H-A': 40, 'H-C': 42, 'H-E': 50, 'O-K': 68,
 const LL = { H: HOME, O: { lat: 3.15, lng: 101.72 }, K: { lat: 3.0, lng: 101.45 }, A: { lat: 3.14, lng: 101.76 }, C: { lat: 3.17, lng: 101.74 }, E: { lat: 3.02, lng: 101.5 }, S: { lat: 3.25, lng: 101.62 } };
 // the After world (s3, the T2 data of test/after.test.js): its own minute table; S = HeveaPac
 const MINS3 = { 'O-S': 30, 'O-A': 22, 'O-C': 25, 'O-E': 50, 'A-C': 11, 'A-S': 45, 'A-E': 62, 'C-S': 46, 'C-E': 61, 'S-E': 73, 'H-A': 40, 'H-C': 42, 'H-S': 60, 'H-E': 50, 'H-O': 32 };
+// the ▲ / ▼ world (s4): a chain Home -> Asian -> Carrier -> Eastern -> Klang -> Home of 10-minute legs, every other pair 50 min
+const MINS4 = { 'H-A': 10, 'A-C': 10, 'C-E': 10, 'E-K': 10, 'H-K': 10, 'H-C': 50, 'H-E': 50, 'A-E': 50, 'A-K': 50, 'C-K': 50, 'H-O': 50, 'O-A': 50, 'O-C': 50, 'O-E': 50, 'O-K': 50 };
 const wplace = (id, name, L, type) => Object.assign({ id, name, address: name + ' Rd', type: type || 'other', dwellMin: 0, closedWindows: [] }, LL[L]);
 const WORLD = {
   'waypoint:settings:main': SEED['waypoint:settings:main'],
@@ -89,6 +97,18 @@ const SEEDS = {
     'waypoint:jobs:jC': job('jC', { inHandItem: 'Sensor', deliveryPlaceId: 'carrier', createdAt: '2026-11-25T00:03:00.000Z' }),
     'waypoint:jobs:jE': job('jE', { inHandItem: 'Gasket', deliveryPlaceId: 'eastern', createdAt: '2026-11-25T00:04:00.000Z' }),
   },
+  s4: { // Part 6: Brackets to Asian, the Compressor collected at Carrier for Eastern Press, a Gasket to Klang; lunch break off
+    'waypoint:settings:main': Object.assign({}, SEED['waypoint:settings:main'], { lunchBreakOn: false }),
+    'waypoint:places:home': Object.assign({}, SEED['waypoint:places:home']),
+    'waypoint:places:office': wplace('office', 'Office', 'O', 'office'),
+    'waypoint:places:asian': Object.assign(wplace('asian', 'Asian Automotive', 'A'), { contactName: 'Encik Ali bin Abu Bakar (purchasing)' }),
+    'waypoint:places:carrier': wplace('carrier', 'Carrier', 'C'),
+    'waypoint:places:eastern': wplace('eastern', 'Eastern Press', 'E'),
+    'waypoint:places:klang': wplace('klang', 'Pacific Klang Oil Seals', 'K'),
+    'waypoint:jobs:jA': job('jA', { inHandItem: 'Brackets 4 pcs, stainless', deliveryPlaceId: 'asian', createdAt: '2026-11-26T00:01:00.000Z' }),
+    'waypoint:jobs:jCE': job('jCE', { pickups: [{ placeId: 'carrier', item: 'Compressor', done: false }], deliveryPlaceId: 'eastern', createdAt: '2026-11-26T00:02:00.000Z' }),
+    'waypoint:jobs:jK': job('jK', { inHandItem: 'Gasket', deliveryPlaceId: 'klang', createdAt: '2026-11-26T00:03:00.000Z' }),
+  },
 };
 
 // runs in the page before anything else: mocks + seed. The clock starts at 11:00 local and its offset survives a reload.
@@ -116,7 +136,7 @@ const INIT = `(() => {
   const km = (a, b) => { const r = Math.PI / 180, dl = (b.lat - a.lat) * r, dg = (b.lng - a.lng) * r;
     const x = Math.sin(dl / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dg / 2) ** 2; return 12742 * Math.asin(Math.sqrt(x)); };
   const WORLD_ID = new URLSearchParams(location.search).get('world') || 'base';
-  const LL = ${JSON.stringify(LL)}, MINS = WORLD_ID === 's3' ? ${JSON.stringify(MINS3)} : ${JSON.stringify(MINS)};
+  const LL = ${JSON.stringify(LL)}, MINS = WORLD_ID === 's3' ? ${JSON.stringify(MINS3)} : WORLD_ID === 's4' ? ${JSON.stringify(MINS4)} : ${JSON.stringify(MINS)};
   const letterOf = (p) => { let b = null, bd = Infinity; Object.keys(LL).forEach((x) => { const d = km(p, LL[x]); if (d < bd) { bd = d; b = x; } }); return bd < 0.3 ? b : null; };
   const tableSec = (a, b) => { // the First stop worlds only: travel times from the fixed minute table
     if (WORLD_ID === 'base') return null;
@@ -129,8 +149,13 @@ const INIT = `(() => {
   window.__legs = [];
   const realFetch = window.fetch.bind(window);
   const json = (o) => new Response(JSON.stringify(o), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  window.__places = 0;
   window.fetch = async (url, init) => {
     url = String(url);
+    if (url.includes('places.googleapis.com')) { // one result for any text: a factory not yet saved
+      window.__places++;
+      return json({ places: [{ id: 'g-bukit', displayName: { text: 'Bukit Raja Plastics' }, formattedAddress: 'Jalan Bukit Raja, Klang', location: { latitude: 3.08, longitude: 101.47 } }] });
+    }
     if (url.includes('api.tomtom.com')) {
       if (url.includes('/calculateRoute/')) { // the Routing API: one leg per request, coordinates in the path
         window.__legs.push(url.split('/calculateRoute/')[1].split('/')[0]);
@@ -306,6 +331,44 @@ async function main() {
     const c2 = await card();
     check(JSON.stringify(c2) === JSON.stringify(c1), 'Cancel changes nothing', c2);
 
+    console.log('4b. a place from Google search: the type sheet');
+    const searchInPicker = async (q) => {
+      await waitFor('document.querySelector(".picker-body input")', 'the picker');
+      await ev('(() => { const i = document.querySelector(".picker-body input"); i.value = ' + JSON.stringify(q) + '; i.dispatchEvent(new Event("input", { bubbles: true })); i.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); return true; })()');
+      await waitFor('[...document.querySelectorAll(".picker-list .pick-row")].some((r) => /Bukit Raja/.test(r.textContent))', 'the Google result');
+      await ev('[...document.querySelectorAll(".picker-list .pick-row")].find((r) => /Bukit Raja/.test(r.textContent)).click()');
+      await waitFor('document.querySelector("#placeTypeSheet")', 'the type sheet');
+    };
+    const placeCount = () => S('places ? Object.keys(WaypointDebug.S.places).length : 0');
+    const nPlaces0 = await placeCount();
+    await click('.card.job .edit-btn');
+    await waitFor('document.querySelector(".sheet #jobDest")', 'the edit form');
+    await click('#jobDest');
+    await searchInPicker('bukit raja');
+    const ts = await ev('(() => { const s = document.querySelector("#placeTypeSheet"); return { title: s.querySelector("h3").textContent, btns: [...s.querySelectorAll(".type-btn")].map((b) => b.textContent), on: s.querySelectorAll(".type-btn.on, .type-btn[aria-pressed=true]").length, picker: !!document.querySelector(".picker-body") }; })()');
+    check(ts.title === 'Bukit Raja Plastics', 'the sheet is titled with the place name', ts.title);
+    check(JSON.stringify(ts.btns) === JSON.stringify(['Customer factory', 'Supplier', 'Office', 'Home', 'Other']), 'one button per place type of the place form', ts.btns);
+    check(ts.on === 0 && !ts.picker, 'nothing preselected; the picker is closed', ts);
+    await ev('(() => { const s = document.querySelector("#placeTypeSheet"); s.parentNode.click(); return true; })()'); // tap outside = dismiss
+    await waitFor('!document.querySelector("#placeTypeSheet")', 'the type sheet dismissed');
+    check(await placeCount() === nPlaces0 && /Office/.test(await text('#jobDest')), 'dismissed: nothing saved, the field unchanged', [await placeCount(), await text('#jobDest')]);
+    await click('#jobDest');
+    await searchInPicker('bukit raja');
+    await clickText('#placeTypeSheet .type-btn', 'Supplier');
+    await waitFor('/Bukit Raja/.test(document.querySelector("#jobDest").textContent)', 'the new place in the field');
+    const np = await S('places && Object.values(WaypointDebug.S.places).find((p) => p.name === "Bukit Raja Plastics")');
+    check(np && np.type === 'supplier' && np.dwellMin === 10 && await placeCount() === nPlaces0 + 1, 'one tap: saved as Supplier with its 10 min stop time, the job form continues with it', np);
+    await click('#jobDest');
+    await waitFor('document.querySelector(".picker-body input")', 'the picker');
+    await ev('(() => { const i = document.querySelector(".picker-body input"); i.value = "zzz"; i.dispatchEvent(new Event("input", { bubbles: true })); i.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); return true; })()');
+    await waitFor('[...document.querySelectorAll(".picker-list .pick-row")].some((r) => /Jalan Bukit Raja/.test(r.textContent))', 'the Google result again');
+    await ev('[...document.querySelectorAll(".picker-list .pick-row")].find((r) => /Jalan Bukit Raja/.test(r.textContent)).click()');
+    await sleep(200);
+    check(await ev('!document.querySelector("#placeTypeSheet")') && (await S('places && Object.values(WaypointDebug.S.places).find((p) => p.name === "Bukit Raja Plastics").type')) === 'supplier', 'a place already saved is not asked again and not changed');
+    await sheetBtn('Cancel');
+    await waitFor('!document.querySelector(".sheet")', 'the form closes');
+    check(JSON.stringify(await card()) === JSON.stringify(c1), 'Cancel on the job form: the job is unchanged');
+
     console.log('5. after PLAN, an edit shows the note and does not change the route');
     await planNow(2);
     const before = await stopNames();
@@ -475,6 +538,80 @@ async function main() {
     check(await ev('!document.querySelector("#afterBanner")'), 'no red After banner');
     await tab('plan');
     check(await afterLineOf() === 'after Asian Automotive, Carrier', 'the Plan card still shows the after line after PLAN', await afterLineOf());
+
+    console.log('11. the contact name on Route cards (Part 4) and ▲ / ▼ (Part 6), world s4');
+    await fresh('s4');
+    await planNow(4, 30000);
+    const order = () => ev('WaypointDebug.S.plan.result.plans[0].stops.filter((s) => !s.status).map((s) => s.placeId).join()');
+    check(await order() === 'asian,carrier,eastern,klang', 'PLAN: Asian, Carrier, Eastern Press, Klang (the 10-minute chain)', await order());
+    // Part 4 (at 360 px, a narrow phone)
+    await send('Emulation.setDeviceMetricsOverride', { width: 360, height: 800, deviceScaleFactor: 1, mobile: false });
+    await sleep(300);
+    const actLine = (pid) => ev('(() => { const i = WaypointDebug.S.plan.result.plans[0].stops.findIndex((s) => s.placeId === ' + JSON.stringify(pid) + '); const c = document.querySelectorAll(".timeline .card.stop")[i]; const a = c.querySelector(".act"); const t = a.querySelector(".contact-tail"); const lh = parseFloat(getComputedStyle(a).lineHeight); return { text: a.textContent, tail: t ? t.textContent : null, cut: t ? t.scrollWidth > t.clientWidth : null, w: [a.clientWidth, t ? t.clientWidth : 0, t ? t.scrollWidth : 0, window.innerWidth], oneLine: a.getBoundingClientRect().height < lh * 1.5, lines: c.querySelectorAll(".act").length }; })()');
+    const ca = await actLine('asian');
+    check(ca.tail === ' · Encik Ali bin Abu Bakar (purchasing)' && /^Brackets 4 pcs, stainless · Encik Ali/.test(ca.text), 'Asian: " · Encik Ali bin Abu Bakar…" at the end of its job line', ca);
+    check(ca.oneLine && ca.cut === true && ca.lines === 1, 'still one line: the long name is cut with an ellipsis (no new line)', ca);
+    const ck = await actLine('klang');
+    check(ck.tail === null && !/·/.test(ck.text), 'Klang has no contact name: nothing added', ck);
+    // Part 6
+    const arrows = () => ev('[...document.querySelectorAll(".timeline .card.stop")].map((c) => { const u = c.querySelector(".move-btn[data-move=up]"), d = c.querySelector(".move-btn[data-move=down]"); return u && d ? (u.disabled ? "-" : "U") + (d.disabled ? "-" : "D") : "none"; }).join(" ")');
+    check(await arrows() === '-D UD UD U-', '▲ off on the first stop, ▼ off on the last before the end point', await arrows());
+    check(await ev('!document.querySelector("#endCard .move-btn")'), 'no arrows on the end-point card');
+    const headH = await ev('Math.max(...[...document.querySelectorAll(".timeline .card.stop .stop-head")].map((x) => Math.round(x.getBoundingClientRect().height)))');
+    check(headH <= 34, 'the title row stays one row with the arrows (' + headH + ' px)', headH);
+    const moveBtn = (pid, dir) => ev('(() => { const i = WaypointDebug.S.plan.result.plans[0].stops.findIndex((s) => s.placeId === ' + JSON.stringify(pid) + '); document.querySelectorAll(".timeline .card.stop")[i].querySelector(".move-btn[data-move=' + dir + ']").click(); return true; })()');
+    const legsNow = () => ev('window.__legs.length');
+    const arrivals = () => ev('WaypointDebug.S.plan.result.plans[0].stops.filter((s) => !s.status).map((s) => s.arriveAt)');
+    const gaps = (a) => a.slice(1).map((t, k) => Math.round((t - a[k]) / 60000));
+    await sleep(500);
+    const L0 = await legsNow();
+    // 6c: Eastern Press above Carrier = the Compressor delivered before it is collected
+    await moveBtn('eastern', 'up');
+    await sleep(300);
+    const bnr = (await text('#banner')).replace(/OK$/, '');
+    check(bnr === "Can't move: Compressor is collected at Carrier, so Eastern Press must come after it", 'refused: the notice names the item', bnr);
+    check(await order() === 'asian,carrier,eastern,klang' && await ev('!document.querySelector("#manualOrderNote")') && await legsNow() === L0, 'refused: order unchanged, no note, no request');
+    // 6a/6b/6d: ▼ on Asian -> Carrier, Asian, Eastern, Klang, re-timed
+    check(JSON.stringify(gaps(await arrivals())) === '[10,10,10]', 'before: 10 min between the stops', gaps(await arrivals()));
+    await moveBtn('asian', 'down');
+    await waitFor('WaypointDebug.S.plan.result.plans[0].stops[0].placeId === "carrier"', 'the swap');
+    await sleep(500);
+    check(await order() === 'carrier,asian,eastern,klang', '▼ on Asian: Carrier, Asian, Eastern Press, Klang', await order());
+    check(JSON.stringify(gaps(await arrivals())) === '[10,50,10]', 're-timed from the table: Carrier -> Asian 10, Asian -> Eastern 50, Eastern -> Klang 10', gaps(await arrivals()));
+    const names4 = await ev('[...document.querySelectorAll(".timeline .card.stop .nm")].map((x) => x.textContent.trim()).join("|")');
+    check(/^Carrier\|Asian Automotive\|Eastern Press\|Pacific Klang/.test(names4), 'the Route cards follow', names4);
+    const reqMove1 = (await legsNow()) - L0;
+    check(reqMove1 === 0, 'the move used ' + reqMove1 + ' TomTom requests (every leg already in the table)', reqMove1);
+    console.log('       TomTom requests for the ▼ on Asian: ' + reqMove1);
+    check(await text('#manualOrderNote') === 'Manual order — tap PLAN to let the app reorder', 'the note under the Route header', await text('#manualOrderNote'));
+    check(await arrows() === '-D UD UD U-', 'the arrows follow the new first / last', await arrows());
+    // a leg neither in the table nor learned: fetched (one request, through the limiter), nothing else
+    await ev('(() => { const m = WaypointDebug.S.plan.result.plans[0].model, i = m.stopIds.indexOf("asian") + 1, j = m.stopIds.indexOf("klang") + 1; m.matrices.forEach((x) => { x.m[i][j] = null; }); WaypointDebug.S.mem.pairs = {}; return true; })()');
+    const L1 = await legsNow();
+    await moveBtn('eastern', 'down');
+    await waitFor('WaypointDebug.S.plan.result.plans[0].stops.map((s) => s.placeId).join() === "carrier,asian,klang,eastern"', 'the second swap');
+    await waitFor('window.__legs.length > ' + L1, 'the missing leg fetched');
+    await sleep(800);
+    const reqMove2 = (await legsNow()) - L1;
+    check(reqMove2 === 1, '▼ on Eastern Press with Asian -> Klang unknown: exactly 1 TomTom request', reqMove2);
+    console.log('       TomTom requests for the ▼ on Eastern Press (one leg removed from the table and the memory): ' + reqMove2);
+    check(await ev('(() => { const m = WaypointDebug.S.plan.result.plans[0].model, i = m.stopIds.indexOf("asian") + 1, j = m.stopIds.indexOf("klang") + 1; return m.matrices[0].m[i][j] === 3000 && !(m.matrices[0].est && m.matrices[0].est[i][j]); })()'), 'the fetched leg (50 min) is in the table');
+    check(JSON.stringify(gaps(await arrivals())) === '[10,50,10]', 're-timed: Carrier -> Asian 10, Asian -> Klang 50, Klang -> Eastern 10', gaps(await arrivals()));
+    // 6e: DONE after a manual move leaves the order alone (the look-ahead would switch to Asian, Eastern, Klang: 40 min sooner)
+    const L2 = await legsNow();
+    await reachDone('carrier', 'Carrier');
+    await sleep(800);
+    check(await order() === 'asian,klang,eastern', 'DONE at Carrier: the manual order stays (Asian, Klang, Eastern Press)', await order());
+    check(await legsNow() === L2 && await ev('!document.querySelector("#reorderNotice") && !document.querySelector("#reorderCard")'), 'no look-ahead requests, no "Order updated" notice');
+    check(await text('#manualOrderNote') === 'Manual order — tap PLAN to let the app reorder', 'the note stays until PLAN');
+    await send('Page.reload');
+    await waitFor('window.WaypointDebug && document.querySelector("#manualOrderNote")', 'the note after a reload');
+    check(true, 'the manual order survives a reload');
+    // PLAN re-solves as usual and clears the note
+    await tab('plan');
+    await planNow(4, 30000);
+    check(await order() === 'asian,eastern,klang', 'PLAN re-solves: Asian, Eastern Press, Klang', await order());
+    check(await ev('!document.querySelector("#manualOrderNote")'), 'PLAN clears the note');
 
     check(page.logs.length === 0, 'no page errors', page.logs);
   } finally {

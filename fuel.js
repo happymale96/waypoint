@@ -235,14 +235,26 @@
     return low.split(/[^a-z0-9]+/).some((w) => STATION_WORDS.has(w));
   }
   const DUP_M = 150;
+  const DUP_NEAR_M = 40;
+  // Names compared for the de-dup: lower-cased, trimmed, every run of spaces / punctuation collapsed to one space.
+  const dupName = (n) => String(n || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  // Two remembered entries are the same station when within 40 m, or within 150 m with equal names (dupName). Highway R&R
+  // stations on each side of the road (Northbound / Southbound) are within 150 m but keep their own entries.
+  function isDupStation(a, b) {
+    if (!a || !b || !isFinite(a.lat) || !isFinite(b.lat)) return false;
+    const m = haversineKm(a, b) * 1000;
+    if (m <= DUP_NEAR_M) return true;
+    return m <= DUP_M && dupName(a.name) !== '' && dupName(a.name) === dupName(b.name);
+  }
   // The station memory cleaned: entries that are not stations (isStationName with their own brand, else `brand`) go; of two
-  // entries within 150 m one stays: the one whose name starts with the brand, else the one remembered first. Inputs untouched.
+  // duplicate entries (isDupStation) one stays: the one whose name starts with the brand, else the one remembered first.
+  // Inputs untouched.
   function cleanStations(list, brand) {
     const startsBrand = (s) => { const b = String(s.brand || brand || '').trim().toLowerCase(); return !!b && String(s.name || '').trim().toLowerCase().startsWith(b); };
     const out = [];
     (list || []).forEach((s) => {
       if (!s || !isStationName(s.name, s.brand || brand)) return;
-      const j = out.findIndex((k) => isFinite(k.lat) && isFinite(s.lat) && haversineKm(k, s) * 1000 <= DUP_M);
+      const j = out.findIndex((k) => isDupStation(k, s));
       if (j < 0) { out.push(Object.assign({}, s)); return; }
       if (!startsBrand(out[j]) && startsBrand(s)) out[j] = Object.assign({}, s);
     });

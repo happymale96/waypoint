@@ -242,6 +242,16 @@ async function main() {
     await ev('window.__watchFire(' + JSON.stringify(near1) + ')');
     await sleep(300);
     check(await ev(planStop(ids[0]) + '.reachedAt == null'), 'a watch update near stop 1 does NOT re-stamp it either');
+    // Part 5: once he has been more than the Auto-Reached distance (80 m) away, it can fire again
+    const far1 = await ev('(() => { const p = WaypointDebug.S.places[' + JSON.stringify(ids[0]) + ']; return { lat: p.lat + 200 / 111190, lng: p.lng, accuracy: 20, speed: 0 }; })()');
+    await ev('window.__watchFire(' + JSON.stringify(far1) + ')');
+    await waitFor('!(' + planStop(ids[0]) + ').noAutoReach', 'the hold lifted 200 m away');
+    check(await ev(planStop(ids[0]) + '.reachedAt == null'), '200 m away: the hold is lifted, nothing stamped');
+    await ev('window.__watchFire(' + JSON.stringify(near1) + ')');
+    await waitFor(planStop(ids[0]) + '.reachedAt != null', 'auto-Reached again after coming back');
+    check(await ev(planStop(ids[0]) + '.reachedSource') === 'auto', 'back within 60 m and stopped: auto-Reached again');
+    await click('.timeline .card.stop .reached-line .link-undo'); // and undo it again: the state the next steps expect
+    await waitFor(planStop(ids[0]) + '.reachedAt == null && ' + planStop(ids[0]) + '.noAutoReach === true', 'undone again');
 
     console.log('3b. page hidden -> clearWatch; visible -> one fresh fix and exactly one watch');
     const clr0 = await ev('window.__clearCalls');

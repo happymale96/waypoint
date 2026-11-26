@@ -306,7 +306,16 @@ console.log('export');
   ok(lines[1].startsWith('20 Nov 2026,Calvin,delivery,"Sensor, 2 pcs",Acme Supplies,Beta Customer,09:20,10:30,done,,yes,'), 'CSV: comma in item name is quoted; dd Mmm yyyy; 24-hour time; collected 09:20', lines[1]);
   ok(csv.includes('"Gasket, ""big"" 10mm"'), 'CSV: embedded quotes doubled, field quoted');
   ok(lines[2].includes('not done - dropped') && lines[2].includes('Item not ready'), 'CSV: dropped job shows status and reason', lines[2]);
-  ok(DL.csvCell('a\nb') === '"a\nb"' && DL.csvCell('plain') === 'plain' && DL.csvCell(null) === '', 'csvCell escaping rules');
+  ok(DL.REASONS[0] === 'Place closed' && DL.REASONS.indexOf('Closed') < 0, 'the first reason chip reads "Place closed"', DL.REASONS);
+  {
+    const d2 = mkDay(jobs); d2.decisions.j2 = { reason: DL.REASONS[0], carry: false };
+    const l2 = DL.toCSV(DL.summarise(d2, jobs, places)).trim().split('\r\n');
+    ok(/not done - dropped,Place closed,/.test(l2[2]), 'a new tap stores and exports "Place closed"', l2[2]);
+    const d3 = mkDay(jobs); d3.decisions.j2 = { reason: 'Closed', carry: false };
+    const l3 = DL.toCSV(DL.summarise(d3, jobs, places)).trim().split('\r\n');
+    ok(/not done - dropped,Closed,/.test(l3[2]), 'an old record keeps its stored "Closed"', l3[2]);
+  }
+  ok(DL.csvCell('a\nb') === '"a\nb"' &&DL.csvCell('plain') === 'plain' && DL.csvCell(null) === '', 'csvCell escaping rules');
   const wa = DL.toWhatsApp(s);
   ok(wa.indexOf('*Totals*') < wa.indexOf('*Collected*') && wa.indexOf('*Collected*') < wa.indexOf('*Delivered*') && /^\*Waypoint day summary - 20 Nov 2026\*/.test(wa), 'WhatsApp text: bold headings, totals first');
   ok(wa.includes('- 10:30 Sensor, 2 pcs - Beta Customer [URGENT]') && wa.includes('Est. km (road route between stops, not odometer): unavailable'), 'WhatsApp text: one line per job, urgent flag, km label');

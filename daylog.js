@@ -32,7 +32,7 @@
   const REPAIR_VERSION = 3; // one-time history repair (see repairHistory / repair25Nov / runRepairOnce)
   const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   // The reason chips of a not-done job. A reason is only ever what the driver tapped (day.decisions[jobId].reason): nothing infers one.
-  const REASONS = ['Closed', 'Item not ready', 'Ran out of time', 'Customer postponed', 'Other'];
+  const REASONS = ['Place closed', 'Item not ready', 'Ran out of time', 'Customer postponed', 'Other'];
   const CANCELLED = 'cancelled'; // the CSV status of a job cancelled that day (Route: SKIP -> Cancel job; deleted on Plan while the day runs)
   const CSV_HEADER = ['date', 'driver', 'type', 'item', 'from', 'to', 'collected time', 'done time', 'status', 'reason', 'urgent', 'late'];
   const SUFFIX_RE = /[\s,]+(?:sdn\.?\s*bhd\.?|s\/b\.?|bhd\.?)\s*$/i; // same display rule as the app's dName()

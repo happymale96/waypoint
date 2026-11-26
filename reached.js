@@ -4,7 +4,7 @@
  * (autoReachTarget), the day's driving / on-site split (daySplit) and carry-forward.
  *
  * A stop (plan stop) carries reachedAt (ms timestamp | null), reachedSource ('tap' | 'auto' | null) and, after an Undo of
- * Reached, noAutoReach (true) for the rest of the plan. doneAt is an ISO string (as stored on the plan stop) or ms.
+ * Reached, noAutoReach (true) until a fix more than the Auto-Reached distance away (or a REACHED tap) lifts it. doneAt is an ISO string (as stored on the plan stop) or ms.
  * Exports via module.exports (node) or window.Reached.
  */
 (function (root, factory) {
@@ -35,10 +35,15 @@
   // A tap on the primary button within 500 ms of the stop becoming reached is ignored (accidental double-tap).
   const tapIgnored = (stop, nowMs) => isReached(stop) && nowMs - stop.reachedAt >= 0 && nowMs - stop.reachedAt < TAP_GUARD_MS;
   // New stop objects (the inputs are never changed).
+  // A REACHED tap (or an auto-Reached) also lifts a "no auto-reach" hold left by an earlier Undo.
   function stampReached(stop, nowMs, source) {
-    return Object.assign({}, stop, { reachedAt: nowMs, reachedSource: source === 'auto' ? 'auto' : 'tap' });
+    const out = Object.assign({}, stop, { reachedAt: nowMs, reachedSource: source === 'auto' ? 'auto' : 'tap' });
+    delete out.noAutoReach;
+    return out;
   }
-  // Undo of Reached: back to REACHED, and no auto-reach on this stop for the rest of the plan.
+  // Undo of Reached (manual or auto): back to REACHED, the reached time cleared. Nothing was written to the day log by Reached
+  // (it rides on the DONE / SKIP event), so the timeline never sees it. noAutoReach holds auto-Reached off for this stop until a
+  // fix puts the driver more than the Auto-Reached distance away from it (autoReachStep's `rearm`) or he taps REACHED himself.
   function undoReached(stop) {
     return Object.assign({}, stop, { reachedAt: null, reachedSource: null, noAutoReach: true });
   }
@@ -139,15 +144,19 @@
   // above) AND (a) it reports a speed of at most 2 m/s, or (b) it reports no speed and a fix at least 20 s older was inside the
   // distance of the same stop with no fix outside in between. Inside at more than 2 m/s never fires and resets (b). A fix that is
   // not usable (stale, poor accuracy, page hidden, setting off) changes nothing. -> {id | null, track}
+  // rearm = the ids of stops held off by an Undo of Reached (noAutoReach) that this usable fix puts MORE than the distance away:
+  // the caller lifts their hold (they can fire again on a later fix, never on this one: they are outside).
   function autoReachStep(track, fix, stops, opts) {
     opts = opts || {};
-    if (!usableFix(fix, opts)) return { id: null, track: track || null };
+    if (!usableFix(fix, opts)) return { id: null, track: track || null, rearm: [] };
+    const r = radiusOf(opts.radiusM);
+    const rearm = (stops || []).filter((s) => s.noAutoReach && isPending(s) && s.lat != null && s.lng != null && Solver.distanceM(fix, s) > r).map((s) => s.id);
     const id = autoReachTarget(fix, stops, opts);
-    if (!id) return { id: null, track: null };
+    if (!id) return { id: null, track: null, rearm };
     const speed = fix.speed == null || !isFinite(fix.speed) ? null : Number(fix.speed);
-    if (speed != null) return speed <= STOPPED_MPS ? { id, track: null } : { id: null, track: null };
-    if (track && track.stopId === id && track.since != null && fix.at - track.since >= STILL_MS) return { id, track: null };
-    return { id: null, track: track && track.stopId === id && track.since != null ? track : { stopId: id, since: fix.at } };
+    if (speed != null) return speed <= STOPPED_MPS ? { id, track: null, rearm } : { id: null, track: null, rearm };
+    if (track && track.stopId === id && track.since != null && fix.at - track.since >= STILL_MS) return { id, track: null, rearm };
+    return { id: null, track: track && track.stopId === id && track.since != null ? track : { stopId: id, since: fix.at }, rearm };
   }
 
   // ---------- driving / on site / between stops / lunch ----------

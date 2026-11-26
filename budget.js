@@ -112,9 +112,10 @@
   // the live origin {usedAt} keeps counting down until the next re-time (longer than the 10-minute period)
   const originKept = (o, nowMs) => !!o && nowMs - (o.usedAt || 0) <= ORIGIN_KEEP_MS;
   // After DONE / SKIP: the look-ahead (Part F) or the single next-stop re-time.
-  // o = {setting: 'auto'|'ask'|'off', pending (stops left, not counting the end point), guard, down, service}
+  // o = {setting: 'auto'|'ask'|'off', pending (stops left, not counting the end point), guard, down, service, manual}
+  // manual = the driver moved a stop with ▲ / ▼ since the last PLAN: his order stays (no look-ahead re-order).
   function afterStopMode(o) {
-    if (!o || o.setting === 'off' || o.guard || o.down || o.service === 'matrix') return 'single';
+    if (!o || o.manual || o.setting === 'off' || o.guard || o.down || o.service === 'matrix') return 'single';
     return o.pending >= 2 ? 'lookahead' : 'single';
   }
 
