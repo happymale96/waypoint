@@ -91,6 +91,20 @@ const err = (name) => { const e = new Error(name); e.name = name; return e; };
     ok(md.calls.every((v) => !(v.facingMode && (v.facingMode.exact === 'user' || v.facingMode.ideal === 'user'))), 'the front camera is never asked for', md.calls);
   }
   ok((await Camera.acquire(null, null)).error === 'nocamera', 'no mediaDevices: "nocamera"');
+
+  console.log('photoSize / useFrame (the still)');
+  {
+    const s = Camera.photoSize({ imageWidth: { min: 160, max: 4000, step: 16 }, imageHeight: { min: 120, max: 3000, step: 16 } });
+    ok(s && s.imageWidth === 4000 - ((4000 - 160) % 16) && s.imageHeight === 3000 - ((3000 - 120) % 16), 'the largest size offered (on its step)', s);
+    const big = Camera.photoSize({ imageWidth: { min: 1, max: 8160, step: 1 }, imageHeight: { min: 1, max: 6120, step: 1 } });
+    ok(big && big.imageWidth === 4096 && Math.abs(big.imageHeight - 3072) <= 1, 'a 50 MP sensor: long side capped at 4096, aspect kept', big);
+    ok(Camera.photoSize({}) === null && Camera.photoSize(null) === null && Camera.photoSize({ imageWidth: { max: 0 }, imageHeight: { max: 0 } }) === null, 'no size in the capabilities: null (takePhoto() asked with no size)');
+    ok(Camera.useFrame(null, { w: 1920, h: 1080 }) === true, 'takePhoto() failed: the video frame');
+    ok(Camera.useFrame({ w: 1280, h: 960 }, { w: 1920, h: 1440 }) === true, 'a 1280 px still while the video is 1920 px: the video frame');
+    ok(Camera.useFrame({ w: 1280, h: 960 }, { w: 1280, h: 720 }) === false, 'a 1280 px still and a smaller video: the still');
+    ok(Camera.useFrame({ w: 4000, h: 3000 }, { w: 1920, h: 1080 }) === false, 'a 4000 x 3000 still: the still');
+    ok(Camera.useFrame({ w: 1600, h: 1200 }, { w: 1920, h: 1080 }) === false, 'a still of exactly 1600 px: the still');
+  }
   console.log('\n' + passes + ' passed, ' + failures + ' failed');
   process.exit(failures ? 1 : 0);
 })();

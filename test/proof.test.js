@@ -113,6 +113,63 @@ console.log('two kinds: share order, old photos, counts');
   eq(Proof.caption(Object.assign({}, base, { photoIds: ['i1', 'd1'], counts: { item: 1, do: 1 } })), Proof.caption(base), 'the caption text is unchanged by the kinds');
 }
 
+console.log('shared files: share order, "01_" names, increasing lastModified');
+{
+  // 2 item photos + 1 DO photo, taken DO first (the case that put WhatsApp's caption on the second photo)
+  const ph = (id, kind, s) => ({ id, kind, takenAt: T0 + s * 1000 });
+  const phs = [ph('d1', 'do', 1), ph('i1', 'item', 7), ph('i2', 'item', 9)];
+  const p = Object.assign({}, base, { photoIds: ['d1', 'i1', 'i2'] });
+  const fs = Proof.shareFiles(p, phs.slice().reverse());
+  eq(fs.map((x) => x.photo.id), ['i1', 'i2', 'd1'], 'share order: item photos in capture order, then DO photos');
+  eq(fs.map((x) => x.name), ['01_2026-11-26_beta-customer_item_1.jpg', '02_2026-11-26_beta-customer_item_2.jpg', '03_2026-11-26_beta-customer_DO_1.jpg'], 'names prefixed 01_, 02_, 03_ ahead of the existing name');
+  eq(fs.map((x) => x.name).slice().sort(), fs.map((x) => x.name), 'the names sort in share order');
+  ok(fs.every((x, i) => i === 0 || x.lastModified - fs[i - 1].lastModified === 1000), 'lastModified strictly increasing, 1000 ms apart', fs.map((x) => x.lastModified));
+  ok(fs[0].lastModified === T0 + 1000, 'the first file is the earliest (the earliest capture time)', fs[0].lastModified);
+  eq(Proof.shareFiles(base, []), [], 'no photos: no files');
+  const nt = Proof.shareFiles(Object.assign({}, base, { doneAt: new Date(T0).toISOString() }), [{ id: 'x', kind: 'item' }, { id: 'y', kind: 'do' }]);
+  ok(nt[0].lastModified === T0 && nt[1].lastModified === T0 + 1000, 'photos with no capture time: from doneAt', nt.map((x) => x.lastModified));
+  eq(Proof.shareList(p, phs).map((x) => x.name), fs.map((x) => x.name.slice(3)), 'shareList names unchanged (the prefix is only on the shared files)');
+}
+
+console.log('SEND TO GROUP in two steps (Settings: Send caption with first photo)');
+{
+  // a small model of the button: the state machine as app.js drives it
+  const run = (n, two) => {
+    const st = { step: 0, sentAt: null, shares: [], copies: 0 };
+    st.tap = (resolved) => {
+      const s = Proof.sendStep(n, two, st.step);
+      if (s.copy) st.copies++;
+      const files = [...Array(n)].map((_, i) => 'f' + (i + 1)).slice(s.from, s.to);
+      st.shares.push({ files, text: s.text ? 'CAPTION' : null });
+      const nx = Proof.afterShare(n, two, st.step, resolved);
+      st.step = nx.step;
+      if (nx.sent) st.sentAt = 'now';
+      return Proof.sendLabel(n, two, st.step, st.sentAt);
+    };
+    return st;
+  };
+  const a = run(3, true);
+  eq(Proof.sendLabel(3, true, 0, null), 'SEND TO GROUP', 'before tap 1: SEND TO GROUP');
+  const l1 = a.tap(true);
+  eq(a.shares[0], { files: ['f1'], text: 'CAPTION' }, 'tap 1: only the first file, with the caption');
+  ok(l1 === 'SEND REST (2)' && a.sentAt === null && a.copies === 1, 'after tap 1: "SEND REST (2)", sentAt not set, caption copied once', { l1, a });
+  const lb = a.tap(false);
+  ok(lb === 'SEND REST (2)' && a.sentAt === null && a.step === 1, 'tap 2 backed out: still on step 2 ("SEND REST (2)"), nothing sent', { lb, step: a.step });
+  const l2 = a.tap(true);
+  eq(a.shares[2], { files: ['f2', 'f3'], text: null }, 'tap 2: the remaining files, no text');
+  ok(l2 === 'SENT ✓' && a.sentAt === 'now' && a.copies === 1, 'after tap 2: SENT ✓, sentAt set; the caption copied on tap 1 only', { l2, copies: a.copies });
+  const b = run(3, true);
+  ok(b.tap(false) === 'SEND TO GROUP' && b.step === 0 && b.sentAt === null, 'tap 1 backed out: still on step 1');
+  const c = run(1, true);
+  ok(c.tap(true) === 'SENT ✓' && JSON.stringify(c.shares[0]) === JSON.stringify({ files: ['f1'], text: 'CAPTION' }), 'one photo: one tap, as before');
+  const d = run(0, true);
+  ok(d.tap(true) === 'SENT ✓' && d.shares[0].files.length === 0 && d.shares[0].text === 'CAPTION', 'no-photo proof: the text only, one tap');
+  const e = run(3, false);
+  ok(e.tap(true) === 'SENT ✓' && e.shares[0].files.length === 3 && e.shares[0].text === 'CAPTION', 'the toggle off (default): every file with the caption in one tap');
+  const f = run(3, true); f.tap(true); f.tap(true);
+  ok(f.tap(true) === 'SEND REST (2)' && f.sentAt === 'now' && f.shares[2].files.join() === 'f1', 'SENT ✓ tapped again: two steps again from the first file');
+}
+
 console.log('CSV proof text');
 eq(Proof.csvCell(Proof.summaryOf({ id: 'a', photoIds: ['1', '2', '3', '4', '5'], counts: { item: 3, do: 2 }, noPhotoReason: '', receiver: '' })), '3 item, 2 DO photos', '"3 item, 2 DO photos"');
 eq(Proof.csvCell(Proof.summaryOf({ id: 'a', photoIds: ['1'], counts: { item: 0, do: 1 } })), '0 item, 1 DO photos', 'DO only');

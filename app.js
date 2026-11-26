@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '73921921'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '528bab74'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -56,6 +56,7 @@
       autoReach: true, // mark Reached automatically within autoReachM metres and stopped (app open); stored on the device, in Export / Import
       autoReachM: Reached.RADIUS_M, // Settings -> Auto-Reached distance (m), whole number 30..300, default 80
       keepScreenOn: true, // Settings -> Keep screen on while a day is running (Screen Wake Lock; wakelock.js)
+      proofCaptionFirst: false, // Settings -> Proof of delivery -> Send caption with first photo (2 steps): SEND TO GROUP in two shares
       // the driver's lunch break (Settings -> Lunch break; device-stored, in Export / Import)
       lunchBreakOn: LunchBreak.DEFAULTS.lunchBreakOn, lunchBreakFrom: LunchBreak.DEFAULTS.lunchBreakFrom, lunchBreakMin: LunchBreak.DEFAULTS.lunchBreakMin,
     };
@@ -2468,12 +2469,14 @@
   function sendButton(stop) {
     const m = stop.proofId && PF.meta.get(stop.proofId);
     if (!m || m.state !== 'done') return null;
-    const sent = !!m.sentAt;
-    return h('button', { class: 'small send-group' + (sent ? ' sent' : ''), type: 'button', 'data-act': 'send', 'data-proof': m.id, 'aria-label': sent ? 'Sent to group, send again' : 'Send to group', onclick: () => sendTap(m.id) },
-      sent ? null : h('img', { class: 'wa-glyph', src: WA_GLYPH, alt: '', 'aria-hidden': 'true' }), sent ? 'SENT ✓' : 'SEND TO GROUP');
+    const label = Proof.sendLabel((m.photoIds || []).length, !!S.settings.proofCaptionFirst, m.sendStep === 1 ? 1 : 0, m.sentAt);
+    const sent = label === 'SENT ✓', rest = /^SEND REST/.test(label);
+    return h('button', { class: 'small send-group' + (sent ? ' sent' : ''), type: 'button', 'data-act': 'send', 'data-proof': m.id, 'aria-label': sent ? 'Sent to group, send again' : rest ? 'Send the rest of the photos to the group' : 'Send to group', onclick: () => sendTap(m.id) },
+      sent ? null : h('img', { class: 'wa-glyph', src: WA_GLYPH, alt: '', 'aria-hidden': 'true' }), label);
   }
-  // the shared files: item photos first in capture order, then DO photos (Proof.shareList: names and numbering per kind)
-  const filesOf = (proof, phs) => Proof.shareList(proof, phs).map((x) => new File([x.photo.blob], x.name, { type: 'image/jpeg', lastModified: x.photo.takenAt || Date.now() }));
+  // the shared files, in the exact share order (item photos in capture order, then DO photos): Proof.shareFiles names them
+  // "01_<name>", "02_<name>", ... and gives the first the earliest lastModified, each next one 1000 ms later
+  const filesOf = (proof, phs) => Proof.shareFiles(proof, phs).map((x) => new File([x.photo.blob], x.name, { type: 'image/jpeg', lastModified: x.lastModified }));
   async function proofFiles(proof) {
     if (PF.files.has(proof.id)) return PF.files.get(proof.id);
     const phs = await Proof.photosOf(proof.id);
@@ -2483,23 +2486,31 @@
   }
   // SEND TO GROUP: the caption to the clipboard, then navigator.share({files, text}) once canShare says yes. Resolved: sentAt set,
   // the button reads SENT ✓ (tap = send again). Rejected (backed out): nothing changes. canShare no: a notice, nothing changes.
+  // Settings "Send caption with first photo (2 steps)" and 2+ photos (Proof.sendStep): tap 1 shares the first file with the caption
+  // (the clipboard copy and its notice on this tap only) and the button reads SEND REST (<n>); tap 2 shares the rest with no text,
+  // then SENT ✓ and sentAt. Backing out of either keeps the button on that step (proof.sendStep, stored with the proof).
   function sendTap(id) {
     const m = PF.meta.get(id);
     if (!m) return;
     const text = Proof.caption(m);
     const cached = PF.files.get(id);
+    const two = !!S.settings.proofCaptionFirst;
+    const step = m.sendStep === 1 ? 1 : 0;
     const go = (files) => {
-      copyText(text).then((ok) => { if (ok) toast('Caption copied - paste it if WhatsApp shows none'); });
-      const data = files.length ? { files, text } : { text };
-      if (!navigator.share || (navigator.canShare && !navigator.canShare(data)) || (files.length && !navigator.canShare)) { banner('This browser cannot share photos', 'info'); return; }
+      const st = Proof.sendStep(files.length, two, step);
+      if (st.copy) copyText(text).then((ok) => { if (ok) toast('Caption copied - paste it if WhatsApp shows none'); });
+      const part = files.slice(st.from, st.to);
+      const data = part.length ? (st.text ? { files: part, text } : { files: part }) : { text };
+      if (!navigator.share || (navigator.canShare && !navigator.canShare(data)) || (part.length && !navigator.canShare)) { banner('This browser cannot share photos', 'info'); return; }
       navigator.share(data).then(async () => {
+        const nx = Proof.afterShare(files.length, two, step, true);
         const p = (await Proof.getProof(id).catch(() => null)) || m;
-        p.sentAt = new Date().toISOString();
-        m.sentAt = p.sentAt;
+        p.sendStep = nx.step; m.sendStep = nx.step;
+        if (nx.sent) { p.sentAt = new Date().toISOString(); m.sentAt = p.sentAt; PF.files.delete(id); }
+        else PF.files.set(id, files); // tap 2 shares from memory, inside the tap
         await Proof.putProof(p).catch(() => {});
-        PF.files.delete(id);
         if (S.tab === 'route') render();
-      }).catch(() => { /* backed out: nothing changes */ });
+      }).catch(() => { /* backed out: nothing changes (the same step) */ });
     };
     if (cached || !(m.photoIds || []).length) { go(cached || []); return; } // inside the tap: share() runs before any await
     proofFiles(m).then(go).catch(() => banner('Could not read the photos on this phone', 'error'));
@@ -2545,6 +2556,9 @@
     const nOf = (k) => photos.filter((p) => Proof.kindOf(p) === k).length;
     // the phone's own camera app (the in-app camera's fallback when it cannot open): one shot per pick
     const fileIn = h('input', { type: 'file', id: 'proofFile', accept: 'image/*', capture: 'environment', hidden: true });
+    // "From gallery" in the DO camera view: already-scanned pages (no capture attribute; several at once, up to the DO limit).
+    // They skip the corner screen and the clean-up; only orientation and the 2000 px cap apply (Proof.composeDo at Save & done).
+    const galleryIn = h('input', { type: 'file', id: 'proofGallery', accept: 'image/*', multiple: true, hidden: true });
     let fileKind = 'item';
     const pickFile = (k) => { fileKind = k; fileIn.value = ''; fileIn.click(); };
     // two capture buttons side by side: each opens the in-app camera (camera.js) for that kind
@@ -2577,10 +2591,11 @@
       });
       saveBtn.disabled = busy || !photos.length;
     }
-    // a photo of kind k into the draft (IndexedDB) the moment it is taken; at = the capture time
-    async function addPhoto(blob, k, at) {
+    // a photo of kind k into the draft (IndexedDB) the moment it is taken; at = the capture time; src = {srcW, srcH}: the pixel
+    // size of the still the camera (or the picked file) gave
+    async function addPhoto(blob, k, at, src) {
       if (!blob || nOf(k) >= MAXK || !PF.sheet) return;
-      const ph = { id: uid('ph'), proofId: proof.id, kind: k, blob, bytes: blob.size, takenAt: at, gps: proofFix(at) };
+      const ph = { id: uid('ph'), proofId: proof.id, kind: k, blob, bytes: blob.size, takenAt: at, gps: proofFix(at), srcW: (src && src.srcW) || null, srcH: (src && src.srcH) || null };
       if (ph.gps) proof.gps = ph.gps;
       photos.push(ph);
       paint();
@@ -2590,18 +2605,32 @@
     async function doShot(blob, at, parent) {
       const r = await Scan.cornerScreen(blob, { parent, maxLong: Proof.DO_LONG });
       if (r.action === 'retake' || !r.blob) return false;
-      await addPhoto(r.blob, 'do', at);
+      await addPhoto(r.blob, 'do', at, { srcW: r.srcW, srcH: r.srcH });
       return true;
     }
     function openCamera(k) {
       if (busy || nOf(k) >= MAXK) return;
       Camera.open(k, {
         label: k === 'do' ? 'DO photo' : 'Item photo', max: MAXK, count: nOf,
-        onShot: async (blob, kk) => { const at = Date.now(); if (kk === 'do') await doShot(blob, at, Camera.view()); else await addPhoto(blob, 'item', at); },
+        onShot: async (blob, kk, src) => { const at = Date.now(); if (kk === 'do') await doShot(blob, at, Camera.view()); else await addPhoto(blob, 'item', at, src); },
         onFallback: (kk) => pickFile(kk), // inside the tap: the file input opens the phone's camera app
+        onGallery: k === 'do' ? () => { galleryIn.value = ''; galleryIn.click(); } : null, // inside the tap
         onClose: () => { if (PF.sheet === sh) paint(); },
       });
     }
+    galleryIn.addEventListener('change', async () => {
+      const fs = [...(galleryIn.files || [])];
+      galleryIn.value = '';
+      const at = Date.now();
+      let added = 0;
+      for (let i = 0; i < fs.length && nOf('do') < MAXK && PF.sheet === sh; i++) {
+        const size = await Scan.sizeOf(fs[i]);
+        await addPhoto(fs[i], 'do', at + i, size ? { srcW: size.w, srcH: size.h } : null); // picked order = capture order
+        added++;
+        Camera.refresh();
+      }
+      if (added < fs.length) status.textContent = 'DO photos: ' + MAXK + ' max - ' + (fs.length - added) + ' not added';
+    });
     async function saveDraft() {
       proof.photoIds = photos.map((p) => p.id);
       proof.receiver = rcv.value.trim().slice(0, Proof.RECEIVER_MAX);
@@ -2620,7 +2649,7 @@
       fileKind = 'item';
       if (!f || nOf(k) >= MAXK) return;
       const at = Date.now();
-      if (k !== 'do') { await addPhoto(f, 'item', at); return; }
+      if (k !== 'do') { const size = await Scan.sizeOf(f); await addPhoto(f, 'item', at, size ? { srcW: size.w, srcH: size.h } : null); return; }
       // a DO photo from the phone's camera app still goes through the corner screen; Retake opens the phone camera again
       const kept = await doShot(f, at, null);
       if (!kept && PF.sheet === sh) pickFile('do');
@@ -2646,7 +2675,7 @@
             let blob;
             // item: the band, logo and stamp lines (1600 px); DO: no band, no text (2000 px)
             try { blob = k === 'do' ? await Proof.composeDo(ph.blob) : await Proof.compose(ph.blob, proof, { takenAt: ph.takenAt, gps: ph.gps || null }); } catch (e) { blob = ph.blob; } // undecodable: kept as taken
-            stamped.push({ id: ph.id, proofId: proof.id, kind: k, blob, bytes: blob.size, takenAt: ph.takenAt, gps: ph.gps || null });
+            stamped.push({ id: ph.id, proofId: proof.id, kind: k, blob, bytes: blob.size, takenAt: ph.takenAt, gps: ph.gps || null, srcW: ph.srcW || null, srcH: ph.srcH || null });
           }
           proof.noPhotoReason = '';
         } else {
@@ -2670,7 +2699,7 @@
     }
     sh.body.replaceChildren(
       h('div', { class: 'proof-items', id: 'proofItems' }, proof.items.map((t) => h('div', { class: 'act deliver' }, t))),
-      h('div', { class: 'proof-take' }, itemBtn, doBtn), fileIn, thumbs,
+      h('div', { class: 'proof-take' }, itemBtn, doBtn), fileIn, galleryIn, thumbs,
       h('label', { class: 'field', for: 'proofReceiver' }, 'Received by'), rcv,
       status, reasons,
       h('div', { class: 'proof-foot' }, noPhoto),
@@ -2695,12 +2724,15 @@
     } catch (e) { /* no IndexedDB: proof capture still opens; nothing to restore */ }
     try { await Proof.runRetention(Date.now()); } catch (e) { /* ignore */ }
   }
-  function proofSettingsCard() {
+  function proofSettingsCard(s) {
     const line = h('div', { class: 'muted', id: 'proofLine' }, 'Checking…');
     Promise.all([Proof.usage().catch(() => ({ count: 0, bytes: 0 })), Proof.persisted()]).then(([u, prot]) => {
       line.textContent = u.count + (u.count === 1 ? ' delivery' : ' deliveries') + ' · ' + (u.bytes / 1048576).toFixed(1) + ' MB on this phone · kept 2 years · storage: ' + (prot ? 'protected' : 'not protected');
     });
-    return h('div', { class: 'card', id: 'proofCard' }, h('h2', { style: 'margin-top:0' }, 'Proof of delivery'), line);
+    return h('div', { class: 'card', id: 'proofCard' }, h('h2', { style: 'margin-top:0' }, 'Proof of delivery'), line,
+      h('label', { class: 'check-row' },
+        h('input', { type: 'checkbox', id: 'proofCaptionFirst', checked: !!s.proofCaptionFirst, style: 'width:auto;min-height:0', onchange: (e) => { s.proofCaptionFirst = e.target.checked; saveSettings(); } }),
+        ' Send caption with first photo (2 steps)'));
   }
 
   // ---------- SKIP: "Skip for today" or "Cancel job" ----------
@@ -3422,7 +3454,7 @@
         h('div', { class: 'muted', id: 'wakeState' }, wakeText())),
       lunchSettingsCard(s, field),
       fuelSettingsCard(s, field),
-      proofSettingsCard(),
+      proofSettingsCard(s),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Data'),
         h('div', { class: 'row' }, h('button', { class: 'grow', onclick: exportJson }, 'Export JSON'), h('button', { class: 'grow', onclick: () => fileIn.click() }, 'Import JSON'), fileIn)),
       h('div', { class: 'muted', id: 'lastPlan', style: 'text-align:center;font-size:12px' }, lastPlanText()),

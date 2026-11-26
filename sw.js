@@ -7,7 +7,7 @@
  * - Icons / fonts / images: CACHE-FIRST.
  * - Cross-origin requests (TomTom, Google APIs, anything else) are never intercepted or cached.
  */
-const BUILD = '73921921';
+const BUILD = '528bab74';
 const CACHE = 'waypoint-' + BUILD;
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'solver.js', 'reached.js', 'lunchbreak.js', 'budget.js', 'traveltimes.js', 'providers.js', 'storage.js', 'messages.js', 'daylog.js', 'geo.js', 'fuel.js', 'onboard.js', 'jobedit.js', 'wakelock.js', 'proof.js', 'camera.js', 'scan.js', 'manifest.json', 'icon-192.png', 'icon-512.png', 'maskable-192.png', 'icon-512-maskable.png', 'apple-touch-icon-180.png', 'favicon-48.png', 'favicon-32.png', 'favicon.svg', 'symbol-on-light.svg', 'symbol-on-dark.svg', 'symbol-header-onlight.svg', 'logo-horizontal-on-dark.svg', 'whatsapp-glyph.svg'];
 const NEVER_CACHE = /(^|\.)(tomtom\.com|googleapis\.com)$/i; // belt and braces: these are cross-origin anyway

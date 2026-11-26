@@ -1,5 +1,6 @@
 /* L-Tech Waypoint — proof.js: proof of delivery.
- * Pure (node + browser): isProofStop, caption, stampLines, expired, fileName, slug, kindOf, shareList, countKinds, klDate helpers.
+ * Pure (node + browser): isProofStop, caption, stampLines, expired, fileName, slug, kindOf, shareList, shareFiles ("01_" names and
+ * increasing lastModified in share order), sendStep / afterShare / sendLabel (SEND TO GROUP in one or two taps), countKinds, klDate helpers.
  * Two kinds of photo: "item" (stamped with the band) and "do" (the delivery order: no band); a photo with no kind is an item photo.
  * Browser only: the IndexedDB store "waypoint-proof" (v1; stores "proofs" and "photos"), compose (the stamped item JPEG), composeDo,
  * persistOnce (navigator.storage.persist, asked once), runRetention (proofs older than 730 days, once per app load).
@@ -115,6 +116,37 @@
     const out = [];
     ['item', 'do'].forEach((k) => all.filter((ph) => kindOf(ph) === k).forEach((ph, j) => out.push({ photo: ph, kind: k, n: j + 1, name: fileName(proof, j + 1, k) })));
     return out;
+  }
+  // The shared files, in the exact share order (shareList: item photos in capture order, then DO photos in capture order):
+  // [{photo, kind, n, name, lastModified}] - name "01_<fileName>", "02_...", so the names sort in share order; lastModified the
+  // earliest capture time for the first file and 1000 ms more for each next one (strictly increasing in share order).
+  function shareFiles(proof, photos) {
+    const list = shareList(proof, photos);
+    const times = list.map((x) => toMs(x.photo && x.photo.takenAt)).filter((t) => t != null && isFinite(t));
+    const done = toMs(proof && proof.doneAt);
+    const base = times.length ? Math.min(...times) : (done != null && isFinite(done) ? done : Date.now());
+    return list.map((x, i) => Object.assign({}, x, { name: pad2(i + 1) + '_' + x.name, lastModified: base + i * 1000 }));
+  }
+  // SEND TO GROUP in one or two taps. twoStep (Settings "Send caption with first photo (2 steps)") and n >= 2 files: tap 1 shares the
+  // first file with the caption (and copies the caption), tap 2 the rest with no text; otherwise one tap shares everything with
+  // the caption, as before. step: 0 (fresh, or after SENT) | 1 (the first file went, the rest is due).
+  // sendStep(n, twoStep, step) -> {from, to, text, copy, last}: files.slice(from, to) for this tap
+  function sendStep(n, twoStep, step) {
+    const two = !!twoStep && n >= 2;
+    if (two && step === 1) return { from: 1, to: n, text: false, copy: false, last: true };
+    return { from: 0, to: two ? 1 : n, text: true, copy: true, last: !two };
+  }
+  // afterShare(n, twoStep, step, resolved) -> {step, sent}: the share resolved -> the next step (sent = the last one went: sentAt
+  // is set); backed out -> the same step, nothing sent
+  function afterShare(n, twoStep, step, resolved) {
+    const s = step === 1 && !!twoStep && n >= 2 ? 1 : 0;
+    if (!resolved) return { step: s, sent: false };
+    return sendStep(n, twoStep, s).last ? { step: 0, sent: true } : { step: 1, sent: false };
+  }
+  // the button text: "SEND REST (<n - 1>)" while step 1 is due, else SENT ✓ once sent, else SEND TO GROUP
+  function sendLabel(n, twoStep, step, sentAt) {
+    if (step === 1 && !!twoStep && n >= 2) return 'SEND REST (' + (n - 1) + ')';
+    return sentAt ? 'SENT ✓' : 'SEND TO GROUP';
   }
   // {item, do}: how many photos of each kind
   function countKinds(photos) {
@@ -311,7 +343,7 @@
 
   return {
     REASONS, MAX_PHOTOS, MAX_PER_KIND: MAX_PHOTOS, RECEIVER_MAX, KEEP_DAYS, GPS_MAX_AGE_MS, DO_LONG,
-    isProofStop, proofDeliveries, caption, stampLines, expired, fileName, slug, kindOf, byCapture, shareList, countKinds, csvCell, summaryOf, klDay, klDate,
+    isProofStop, proofDeliveries, caption, stampLines, expired, fileName, slug, kindOf, byCapture, shareList, shareFiles, sendStep, afterShare, sendLabel, countKinds, csvCell, summaryOf, klDay, klDate,
     open, putProof, getProof, listProofs, putPhoto, getPhoto, photosOf, deletePhoto, deleteProof, saveStamped, usage, runRetention, persistOnce, persisted,
     compose, composeDo, loadLogo,
   };

@@ -17,7 +17,11 @@
  * "no" change nothing; on D: Cancel deletes the draft, No photo saves a reason and shares the text only; the CSV columns; retention
  * deletes a 731-day-old proof (and its photo) on the next load and keeps a 729-day-old one; the Settings line. A second world
  * (fresh storage, getUserMedia rejecting NotAllowedError): the camera view says so, "Use phone camera" falls back to the file input,
- * an item and a DO photo (through the corner screen) complete the stop. Exit 1 on failure.
+ * an item photo, a generated 4000 x 3000 JPEG of a skewed, unevenly lit page as a DO photo (devicePixelRatio 3 in this world: the
+ * corner screen's canvas backing store >= CSS size x DPR, "4000 x 3000" at the bottom, Use -> long side 1800..2000, evenly light),
+ * "From gallery" adding two DO photos without the corner screen; then the Settings toggle "Send caption with first photo (2 steps)":
+ * tap 1 shares one file + the caption ("SEND REST (2)"), backing out keeps it, tap 2 the other two with no text, then SENT ✓.
+ * Share names carry "01_", "02_", ... and lastModified 1000 ms apart in share order. Exit 1 on failure.
  * Needs Node 22+ (global WebSocket / fetch) and Chrome or Edge (set CHROME=<path> to choose one).
  */
 'use strict';
@@ -83,7 +87,7 @@ const INIT = `(() => {
   window.__canShare = true; window.__shareReject = false; window.__shares = []; window.__canShareCalls = [];
   Object.defineProperty(navigator, 'canShare', { configurable: true, value: (d) => { window.__canShareCalls.push({ files: d && d.files ? d.files.length : 0 }); return window.__canShare; } });
   Object.defineProperty(navigator, 'share', { configurable: true, value: (d) => {
-    window.__shares.push({ text: d.text, files: d.files ? d.files.map((f) => ({ name: f.name, type: f.type, size: f.size, isFile: f instanceof File })) : null });
+    window.__shares.push({ text: d.text, files: d.files ? d.files.map((f) => ({ name: f.name, type: f.type, size: f.size, isFile: f instanceof File, lm: f.lastModified })) : null });
     return window.__shareReject ? Promise.reject(new DOMException('Share canceled', 'AbortError')) : Promise.resolve();
   } });
   const km = (a, b) => { const r = Math.PI / 180, dl = (b.lat - a.lat) * r, dg = (b.lng - a.lng) * r;
@@ -130,6 +134,38 @@ const INIT = `(() => {
     const dt = new DataTransfer(); dt.items.add(new File([blob], 'IMG_0001.jpg', { type: 'image/jpeg' }));
     inp.files = dt.files; inp.dispatchEvent(new Event('change'));
     return blob.size;
+  };
+  // a generated w x h JPEG of a skewed page (lit unevenly: 150 on the left -> 215 on the right, a few dark text bars) on a dark
+  // table, fed to the file input as the phone's camera app would
+  window.__pagePhoto = async (w, h) => {
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const g = c.getContext('2d'); g.fillStyle = 'rgb(38, 40, 46)'; g.fillRect(0, 0, w, h);
+    const q = [[0.275, 0.083], [0.7375, 0.127], [0.7625, 0.933], [0.2375, 0.9]].map(([x, y]) => [x * w, y * h]);
+    const gr = g.createLinearGradient(q[0][0], 0, q[1][0], 0); gr.addColorStop(0, 'rgb(150, 150, 148)'); gr.addColorStop(1, 'rgb(215, 215, 212)');
+    g.fillStyle = gr; g.beginPath(); q.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath(); g.fill();
+    g.fillStyle = 'rgb(45, 45, 50)';
+    for (let k = 0; k < 6; k++) g.fillRect(0.34 * w, (0.2 + k * 0.05) * h, 0.3 * w, 0.012 * h);
+    window.__pageQuad = q;
+    return new Promise((r) => c.toBlob(r, 'image/jpeg', 0.9));
+  };
+  window.__feedPage = async (w, h) => {
+    const blob = await window.__pagePhoto(w, h);
+    const inp = document.getElementById('proofFile');
+    const dt = new DataTransfer(); dt.items.add(new File([blob], 'IMG_0002.jpg', { type: 'image/jpeg' }));
+    inp.files = dt.files; inp.dispatchEvent(new Event('change'));
+    return blob.size;
+  };
+  // n generated JPEGs (already-scanned pages, 1200 x 1700) picked at once in the gallery input
+  window.__pickGallery = async (n) => {
+    const dt = new DataTransfer();
+    for (let i = 0; i < n; i++) {
+      const c = document.createElement('canvas'); c.width = 1200; c.height = 1700;
+      const g = c.getContext('2d'); g.fillStyle = '#f4f4f4'; g.fillRect(0, 0, 1200, 1700); g.fillStyle = '#222'; g.fillRect(100, 100 + i * 50, 800, 30);
+      dt.items.add(new File([await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.9))], 'SCAN_' + (i + 1) + '.jpg', { type: 'image/jpeg' }));
+    }
+    const inp = document.getElementById('proofGallery');
+    inp.files = dt.files; inp.dispatchEvent(new Event('change'));
+    return n;
   };
   try {
     if (!localStorage.getItem('__seeded')) {
@@ -266,9 +302,14 @@ async function main() {
     await waitFor('document.getElementById("camCount").textContent === "2 of 6"', 'shot 2', 15000);
     await waitFor('Proof.listProofs().then((a) => a.some((p) => p.state === "draft" && p.photoIds.length === 2))', 'the draft in IndexedDB');
     const d1 = (await proofs()).find((p) => p.state === 'draft');
-    const d1ph = await ev('Proof.photosOf(' + JSON.stringify(d1 && d1.id) + ').then((a) => a.map((p) => ({ kind: p.kind, takenAt: p.takenAt, gps: !!p.gps, bytes: p.bytes })))');
+    const d1ph = await ev('Proof.photosOf(' + JSON.stringify(d1 && d1.id) + ').then((a) => a.map((p) => ({ kind: p.kind, takenAt: p.takenAt, gps: !!p.gps, bytes: p.bytes, srcW: p.srcW, srcH: p.srcH })))');
     check(d1 && d1.stopKey === 'pC' && d1.gps && Math.abs(d1.gps.lat - 3.12518) < 0.0001 && d1.gps.acc === 12, 'draft saved the moment each shot was taken, with the GPS fix', d1);
     check(d1ph.length === 2 && d1ph.every((p) => p.kind === 'item' && p.gps && p.bytes > 0) && d1ph[1].takenAt - d1ph[0].takenAt === 2000, 'two item photos, each with its capture time and fix', d1ph);
+    const still1 = await ev('Camera.lastStill()');
+    // diagnostic only (the old call): takePhoto() with no size, and the video frame, on the same track
+    const old1 = await ev('(async () => { const v = document.getElementById("camVideo"), t = v.srcObject && v.srcObject.getVideoTracks()[0]; let p = null; try { const b = await new ImageCapture(t).takePhoto(); const bm = await createImageBitmap(b); p = bm.width + " x " + bm.height; } catch (e) { p = "failed: " + e.name; } return { noSize: p, frame: v.videoWidth + " x " + v.videoHeight }; })()').catch((e) => ({ err: e.message }));
+    console.log('  info fake device: takePhoto() with no size -> ' + old1.noSize + '; video frame ' + old1.frame + '; with the largest size offered -> ' + (still1 && still1.w + ' x ' + still1.h));
+    check(d1ph.every((p) => p.srcW > 0 && p.srcH > 0 && p.srcW === still1.w && p.srcH === still1.h), 'each item photo records srcW x srcH, the still the camera gave (fake device: ' + (still1 && still1.w + ' x ' + still1.h + ' from ' + still1.from) + ')', { d1ph, still1 });
     check(await ev('!!document.getElementById("camView")'), 'the camera view stays open for the next item shot');
     await click('#camDone');
     await waitFor('!document.getElementById("camView")', 'the camera view closed');
@@ -292,6 +333,9 @@ async function main() {
     const inImg = (p, im) => p.cx >= im.l - 0.5 && p.cx <= im.r + 0.5 && p.cy >= im.t - 0.5 && p.cy <= im.b + 0.5;
     check(hs.hs.length === 4 && hs.hs.every((x) => x.w >= 44 && x.h >= 44 && inImg(x, hs.img)) && hs.lines, 'four round handles (>= 44 px targets) on the image, joined by lines', hs);
     check(hs.btns.join('|') === 'Retake|Keep as shot|Use', 'buttons Retake, Keep as shot, Use', hs.btns);
+    const cs1 = await ev('(() => { const c = document.getElementById("scanClean"), s = document.getElementById("scanSrc"), r = s.getBoundingClientRect(), a = document.querySelector("#scanScreen .scan-actions").getBoundingClientRect(); return { clean: !!c && c.checked, label: c && c.closest("label").textContent.trim(), src: s.textContent, still: Camera.lastStill(), below: r.top >= a.bottom - 0.5, bottom: Math.round(r.bottom), vh: innerHeight, fs: getComputedStyle(s).fontSize }; })()');
+    check(cs1.clean && cs1.label === 'Clean up page', 'the corner screen: "Clean up page", on by default', cs1);
+    check(cs1.src === cs1.still.w + ' x ' + cs1.still.h && cs1.below && cs1.bottom <= cs1.vh && cs1.fs === '11px', 'the still\'s pixel size in small text at the bottom ("' + cs1.src + '")', cs1);
     const mouse = (type, x, y) => send('Input.dispatchMouseEvent', { type, x, y, button: 'left', buttons: type === 'mouseReleased' ? 0 : 1, clickCount: 1 });
     const h0 = hs.hs[0];
     await mouse('mousePressed', h0.cx, h0.cy);
@@ -363,8 +407,9 @@ async function main() {
     await click('.card.stop.done button.send-group');
     await waitFor('window.__shares.length === 1', 'the share of the mixed proof');
     const sh0 = await ev('window.__shares[0]');
-    check(sh0.files && sh0.files.map((f) => f.name).join() === ['item_1', 'item_2', 'DO_1', 'DO_2'].map((s) => '2026-11-26_beta-customer_' + s + '.jpg').join() && sh0.files.every((f) => f.isFile && f.type === 'image/jpeg'),
-      'share(): item files first (item_1, item_2), then DO files (DO_1, DO_2)', sh0.files);
+    check(sh0.files && sh0.files.map((f) => f.name).join() === ['01_', '02_', '03_', '04_'].map((n, i) => n + '2026-11-26_beta-customer_' + ['item_1', 'item_2', 'DO_1', 'DO_2'][i] + '.jpg').join() && sh0.files.every((f) => f.isFile && f.type === 'image/jpeg'),
+      'share(): item files first (01_ item_1, 02_ item_2), then DO files (03_ DO_1, 04_ DO_2)', sh0.files);
+    check(sh0.files.every((f, i) => i === 0 || f.lm - sh0.files[i - 1].lm === 1000), 'lastModified: the first file the earliest, each next 1000 ms later', sh0.files.map((f) => f.lm));
     check(/^DELIVERED - Beta Customer\nGasket\nReceived by: Encik Ali\n26 Nov 2026, \d+:\d\d (am|pm)$/.test(sh0.text), 'the caption text is unchanged', sh0.text);
     await waitFor('(' + sendBtn + ' || {}).textContent === "SENT ✓"', 'SENT ✓ after the mixed share');
     await ev('window.__shares = []; true');
@@ -401,7 +446,7 @@ async function main() {
     await waitFor('window.__shares.length === 1', 'navigator.share called');
     const sh1 = await ev('window.__shares[0]');
     check(sh1.text === cap, 'share text = caption(proof)', sh1.text);
-    check(sh1.files && sh1.files.length === 1 && sh1.files[0].isFile && sh1.files[0].type === 'image/jpeg' && sh1.files[0].name === '2026-11-26_beta-customer_item_1.jpg', 'share files: the stamped JPEG named by fileName() (the shown name, Sdn Bhd dropped)', sh1.files);
+    check(sh1.files && sh1.files.length === 1 && sh1.files[0].isFile && sh1.files[0].type === 'image/jpeg' && sh1.files[0].name === '01_2026-11-26_beta-customer_item_1.jpg', 'share files: the stamped JPEG named "01_" + fileName() (the shown name, Sdn Bhd dropped)', sh1.files);
     check(await ev('window.__canShareCalls.length') >= 1 && await ev('window.__copied[window.__copied.length - 1]') === cap, 'canShare asked; the caption was copied to the clipboard');
     await waitFor('(' + sendBtn + ' || {}).textContent === "SENT ✓"', 'the button to read SENT ✓');
     check(/^Caption copied - paste it if WhatsApp shows none$/.test(await ev('document.getElementById("toast").textContent')), 'notice: Caption copied - paste it if WhatsApp shows none');
@@ -477,6 +522,7 @@ async function main() {
     await send('Page.navigate', { url: 'about:blank' });
     await sleep(300);
     await send('Storage.clearDataForOrigin', { origin: new URL(appUrl).origin, storageTypes: 'all' });
+    await send('Emulation.setDeviceMetricsOverride', { width: 360, height: 800, deviceScaleFactor: 3, mobile: false }); // as a phone screen
     await send('Page.navigate', { url: appUrl + '?deny=1' });
     await waitFor('document.querySelector("#planBtn") && window.Proof', 'the Plan tab (fresh storage)');
     check(await ev('Proof.listProofs().then((a) => a.length)') === 0, 'fresh storage: no proofs');
@@ -499,14 +545,81 @@ async function main() {
     await waitFor('document.getElementById("camFallback")', 'the refused-camera message (DO)');
     await click('#camFallback');
     await waitFor('!document.getElementById("camView")', 'the camera view closed (DO fallback)');
-    await ev('window.__feedPhoto(2400, 1800)');
-    await waitFor('document.getElementById("scanScreen") && document.querySelectorAll("#scanScreen .scan-handle").length === 4', 'a phone-camera DO photo goes through the corner screen');
+    // a 4000 x 3000 camera-app JPEG of a skewed, unevenly lit page on a dark table (devicePixelRatio 3 in this world, as the S23)
+    await ev('window.__feedPage(4000, 3000)');
+    await waitFor('document.getElementById("scanScreen") && document.querySelectorAll("#scanScreen .scan-handle").length === 4 && document.getElementById("scanImg").width > 0', 'a phone-camera DO photo goes through the corner screen', 20000);
+    const cs2 = await ev('(() => { const c = document.getElementById("scanImg"), r = c.getBoundingClientRect(); return { dpr: devicePixelRatio, bw: c.width, bh: c.height, cw: r.width, ch: r.height, src: document.getElementById("scanSrc").textContent, clean: document.getElementById("scanClean").checked }; })()');
+    check(cs2.dpr === 3 && cs2.bw >= Math.ceil(cs2.cw * cs2.dpr) - 0.5 && cs2.bh >= Math.ceil(cs2.ch * cs2.dpr) - 0.5, 'corner screen: the canvas backing store is at least its CSS size x devicePixelRatio (' + cs2.bw + ' x ' + cs2.bh + ' for ' + cs2.cw + ' x ' + cs2.ch + ' CSS px at ' + cs2.dpr + 'x)', cs2);
+    check(cs2.src === '4000 x 3000' && cs2.clean, 'corner screen text "4000 x 3000"; Clean up page on', cs2);
+    const hq = await ev('(() => { const im = document.getElementById("scanImg").getBoundingClientRect(), k = im.width / 4000; return { hs: [...document.querySelectorAll("#scanScreen .scan-handle")].map((x) => { const r = x.getBoundingClientRect(); return [(r.left + r.width / 2 - im.left) / k, (r.top + r.height / 2 - im.top) / k]; }), q: window.__pageQuad }; })()');
+    const hErr = hq.hs.map((p, i) => Math.hypot(p[0] - hq.q[i][0], p[1] - hq.q[i][1]));
+    check(hErr.every((e) => e <= 40), 'the detected corners sit on the page corners (within 40 px of 4000: ' + hErr.map((e) => Math.round(e)).join(', ') + ')', hErr);
     await click('#scanUse');
-    await waitFor('!document.getElementById("scanScreen") && document.querySelectorAll("#proofThumbs .proof-group[data-kind=do] .proof-thumb").length === 1', 'the DO photo from the phone camera');
+    await waitFor('!document.getElementById("scanScreen") && document.querySelectorAll("#proofThumbs .proof-group[data-kind=do] .proof-thumb").length === 1', 'the DO photo from the phone camera', 30000);
+    const do9 = await ev(`(async () => { const p = (await Proof.listProofs()).find((x) => x.state === 'draft'); const ph = (await Proof.photosOf(p.id)).find((x) => x.kind === 'do');
+      const b = await createImageBitmap(ph.blob); const c = document.createElement('canvas'); c.width = b.width; c.height = b.height; const g = c.getContext('2d'); g.drawImage(b, 0, 0);
+      const lumAt = (fx, fy) => { const d = g.getImageData(Math.round(b.width * fx) - 20, Math.round(b.height * fy) - 20, 40, 40).data; let s = 0; for (let i = 0; i < d.length; i += 4) s += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; return s / (d.length / 4); };
+      return { w: b.width, h: b.height, srcW: ph.srcW, srcH: ph.srcH, left: Math.round(lumAt(0.12, 0.75)), right: Math.round(lumAt(0.88, 0.75)), mid: Math.round(lumAt(0.5, 0.8)) }; })()`);
+    check(Math.max(do9.w, do9.h) >= 1800 && Math.max(do9.w, do9.h) <= 2000, 'Use: the saved DO long side between 1800 and 2000 px (' + do9.w + ' x ' + do9.h + ')', do9);
+    check(do9.srcW === 4000 && do9.srcH === 3000, 'the DO photo record carries srcW x srcH = 4000 x 3000', do9);
+    check(do9.left > 225 && do9.right > 225 && Math.abs(do9.left - do9.right) <= 15, 'cleaned up: the page is evenly light (left ' + do9.left + ', right ' + do9.right + '; shot at 150 -> 215)', do9);
+    // From gallery: the DO camera view's text button opens a multi-select picker (no capture); the picks skip the corner screen
+    await click('#proofDoBtn');
+    await waitFor('document.getElementById("camView") && document.getElementById("camGallery")', 'the DO camera view with From gallery');
+    const gal = await ev('(() => { const b = document.getElementById("camGallery"), i = document.getElementById("proofGallery"), r = b.getBoundingClientRect(); return { text: b.textContent, inView: r.right <= innerWidth && r.left >= 0 && r.height >= 44, multiple: i.multiple, accept: i.accept, capture: i.hasAttribute("capture") }; })()');
+    check(gal.text === 'From gallery' && gal.inView && gal.multiple && gal.accept === 'image/*' && !gal.capture, '"From gallery": a text button in the DO camera view; <input type=file accept=image/* multiple>, no capture attribute', gal);
+    await advance(5000);
+    await click('#camGallery');
+    check(await ev('window.__fileClicks[window.__fileClicks.length - 1]') === 'proofGallery', 'From gallery opens the gallery input');
+    await ev('window.__scanSeen = false; window.__scanObs = new MutationObserver(() => { if (document.getElementById("scanScreen")) window.__scanSeen = true; }); window.__scanObs.observe(document.body, { childList: true, subtree: true }); true');
+    await ev('window.__pickGallery(2)');
+    await waitFor('document.querySelectorAll("#proofThumbs .proof-group[data-kind=do] .proof-thumb").length === 3', 'two DO photos from the gallery');
+    check(!(await ev('window.__scanSeen')) && await ev('document.getElementById("camCount").textContent') === '3 of 6', 'From gallery: two DO photos added without the corner screen; the counter reads 3 of 6');
+    await ev('window.__scanObs.disconnect(); true');
+    const galRec = await ev('Proof.listProofs().then((a) => a.find((p) => p.state === "draft")).then((p) => Proof.photosOf(p.id)).then((a) => a.filter((x) => x.kind === "do").sort((x, y) => x.takenAt - y.takenAt).slice(1).map((x) => ({ srcW: x.srcW, srcH: x.srcH, type: x.blob.type })))');
+    check(galRec.length === 2 && galRec.every((x) => x.srcW === 1200 && x.srcH === 1700), 'gallery photos record their own size (1200 x 1700)', galRec);
+    await click('#camDone');
+    await waitFor('!document.getElementById("camView")', 'the camera view closed (gallery)');
+    await ev('document.querySelector("#proofThumbs .proof-group[data-kind=do] .proof-thumb:last-child .proof-del").click()');
+    await waitFor('document.querySelectorAll("#proofThumbs .proof-group[data-kind=do] .proof-thumb").length === 2', 'one gallery photo removed (1 item + 2 DO left)');
     await click('#proofSave');
-    await waitFor('WaypointDebug.S.plan.result.plans[0].stops.find((s) => s.placeId === "pD").status === "done"', 'DONE at D through the file-input fallback', 20000);
-    const p9 = await ev('Proof.listProofs().then((a) => a.find((p) => p.state === "done")).then(async (p) => ({ counts: p.counts, n: p.photoIds.length, kinds: (await Proof.photosOf(p.id)).map((x) => x.kind).sort().join(), dims: await Promise.all((await Proof.photosOf(p.id)).map(async (x) => { const b = await window.__bottom(x.blob); return x.kind + ":" + b.w + "x" + b.h; })) }))');
-    check(p9.n === 2 && p9.kinds === 'do,item' && JSON.stringify(p9.counts) === '{"item":1,"do":1}', 'completed through the file input: 1 item + 1 DO photo', p9);
+    await waitFor('WaypointDebug.S.plan.result.plans[0].stops.find((s) => s.placeId === "pD").status === "done"', 'DONE at D through the file-input fallback', 30000);
+    const p9 = await ev('Proof.listProofs().then((a) => a.find((p) => p.state === "done")).then(async (p) => ({ counts: p.counts, n: p.photoIds.length, kinds: (await Proof.photosOf(p.id)).map((x) => x.kind).sort().join(), src: (await Proof.photosOf(p.id)).map((x) => x.srcW + "x" + x.srcH), dims: await Promise.all((await Proof.photosOf(p.id)).map(async (x) => { const b = await window.__bottom(x.blob); return x.kind + ":" + b.w + "x" + b.h; })) }))');
+    check(p9.n === 3 && p9.kinds === 'do,do,item' && JSON.stringify(p9.counts) === '{"item":1,"do":2}', 'completed: 1 item (file input) + 1 DO (corner screen) + 1 DO (gallery)', p9);
+    check(p9.src.indexOf('4000x3000') >= 0 && p9.src.indexOf('1600x1200') >= 0 && p9.src.indexOf('1200x1700') >= 0, 'srcW x srcH kept on the saved photos', p9.src);
+
+    console.log('10. SEND TO GROUP in two steps (Settings: Send caption with first photo)');
+    await click('#tabs button[data-tab="settings"]');
+    await waitFor('document.getElementById("proofCaptionFirst")', 'the Settings toggle');
+    const tg = await ev('(() => { const c = document.getElementById("proofCaptionFirst"); return { on: c.checked, label: c.closest("label").textContent.trim(), inCard: !!c.closest("#proofCard") }; })()');
+    check(!tg.on && tg.label === 'Send caption with first photo (2 steps)' && tg.inCard, 'under "Proof of delivery": "Send caption with first photo (2 steps)", off by default', tg);
+    await click('#proofCaptionFirst');
+    check(await ev('WaypointDebug.S.settings.proofCaptionFirst === true'), 'the toggle turned on and saved');
+    await click('#tabs button[data-tab="route"]');
+    const sendD = '(' + cardOf('Delta Works') + ').querySelector("button.send-group")';
+    await waitFor(sendD, 'SEND TO GROUP on D');
+    const hSend = await cardH('Delta Works');
+    await ev('window.__shares = []; window.__copied = []; true');
+    await click('.card.stop.done button.send-group');
+    await waitFor('window.__shares.length === 1', 'tap 1');
+    await waitFor('(' + sendD + ' || {}).textContent === "SEND REST (2)"', 'the button to read SEND REST (2)');
+    const t1 = await ev('window.__shares[0]');
+    check(t1.files && t1.files.length === 1 && t1.files[0].name === '01_2026-11-26_delta-works_item_1.jpg' && /^DELIVERED - Delta Works\nFuse\n26 Nov 2026, \d+:\d\d (am|pm)$/.test(t1.text), 'tap 1: exactly one file (01_ item_1) and the caption', t1);
+    check(await ev('window.__copied.length') === 1 && !(await proofs()).find((p) => p.stopKey === 'pD' && p.state === 'done').sentAt, 'tap 1: the caption copied; sentAt not set yet');
+    check(await cardH('Delta Works') <= hSend, 'SEND REST (2) does not make the card taller', { h: await cardH('Delta Works'), hSend });
+    await ev('window.__shareReject = true');
+    await click('.card.stop.done button.send-group');
+    await waitFor('window.__shares.length === 2', 'tap 2 (backed out)');
+    await sleep(300);
+    check(await ev('(' + sendD + ').textContent') === 'SEND REST (2)' && !(await proofs()).find((p) => p.stopKey === 'pD' && p.state === 'done').sentAt, 'backing out of tap 2 keeps the button on SEND REST (2)');
+    await ev('window.__shareReject = false');
+    await click('.card.stop.done button.send-group');
+    await waitFor('window.__shares.length === 3', 'tap 2');
+    const t2 = await ev('window.__shares[2]');
+    check(t2.files && t2.files.map((f) => f.name).join() === '02_2026-11-26_delta-works_DO_1.jpg,03_2026-11-26_delta-works_DO_2.jpg' && t2.text == null, 'tap 2: the other two files (02_ DO_1, 03_ DO_2) and no text', t2);
+    check(t1.files[0].lm < t2.files[0].lm && t2.files[1].lm - t2.files[0].lm === 1000, 'lastModified increasing across the two shares', [t1.files[0].lm, t2.files[0].lm, t2.files[1].lm]);
+    await waitFor('(' + sendD + ' || {}).textContent === "SENT ✓"', 'SENT ✓ after tap 2');
+    check(!!(await proofs()).find((p) => p.stopKey === 'pD' && p.state === 'done').sentAt && await ev('window.__copied.length') === 1, 'SENT ✓, sentAt set only after tap 2; the caption copied on tap 1 only');
     check(!page.logs.some((l) => /EXCEPTION/.test(l)), 'no page exceptions (2nd world)', page.logs);
   } catch (e) {
     fails++;
