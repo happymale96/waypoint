@@ -32,6 +32,8 @@ const errs = [];
 const RULES = [
   { name: 'REACHED', sel: /button\.ok\[data-act="reached"\]\s*\{([^}]*)\}/, bg: '--brand', fg: '--brand-text' },
   { name: '✓ DONE', sel: /button\.ok\[data-act="done"\]\s*\{([^}]*)\}/, bg: '--ok', fg: '--ok-text' },
+  { name: '📷 PROOF', sel: /button\.ok\[data-act="proof"\]\s*\{([^}]*)\}/, bg: '--proof', fg: '--proof-text' },
+  { name: 'SEND TO GROUP', sel: /button\.send-group\s*\{([^}]*)\}/, bg: '--send', fg: '--send-text' },
 ];
 RULES.forEach((r) => {
   const m = r.sel.exec(css);
@@ -59,4 +61,4 @@ schemes.forEach(([scheme, block, fallback]) => {
 });
 rows.forEach((r) => console.log(r.join('  ')));
 if (errs.length) { console.error('check-route-buttons FAILED:\n - ' + errs.join('\n - ')); process.exit(1); }
-console.log('check-route-buttons OK: REACHED (--brand) and ✓ DONE (--ok) labels at least ' + MIN + ':1 in both schemes');
+console.log('check-route-buttons OK: REACHED (--brand), ✓ DONE (--ok), 📷 PROOF (--proof) and SEND TO GROUP (--send) labels at least ' + MIN + ':1 in both schemes');

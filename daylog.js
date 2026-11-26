@@ -34,7 +34,8 @@
   // The reason chips of a not-done job. A reason is only ever what the driver tapped (day.decisions[jobId].reason): nothing infers one.
   const REASONS = ['Place closed', 'Item not ready', 'Ran out of time', 'Customer postponed', 'Other'];
   const CANCELLED = 'cancelled'; // the CSV status of a job cancelled that day (Route: SKIP -> Cancel job; deleted on Plan while the day runs)
-  const CSV_HEADER = ['date', 'driver', 'type', 'item', 'from', 'to', 'collected time', 'done time', 'status', 'reason', 'urgent', 'late'];
+  // "receiver" / "proof" (proof of delivery, proof.js) are always the last two columns: the earlier ones keep their order
+  const CSV_HEADER = ['date', 'driver', 'type', 'item', 'from', 'to', 'collected time', 'done time', 'status', 'reason', 'urgent', 'late', 'receiver', 'proof'];
   const SUFFIX_RE = /[\s,]+(?:sdn\.?\s*bhd\.?|s\/b\.?|bhd\.?)\s*$/i; // same display rule as the app's dName()
   const pad2 = (n) => (n < 10 ? '0' : '') + n;
   const clean = (n) => { const s = String(n == null ? '' : n); const t = s.replace(SUFFIX_RE, '').trim(); return t || s; };
@@ -188,10 +189,20 @@
   function recordBreakStart(day, info) { day.breakStartedAt = info.nowIso; day.breakEndedAt = null; day.timeSplitV = TIME_SPLIT_V; }
   function recordBreakEnd(day, info) { if (day.breakStartedAt) day.breakEndedAt = info.nowIso; }
   // A pickup's event also carries collectedAt (the time the item was collected: the CSV "collected time"); older records have none.
-  function recordDone(day, info) { // info: {nowIso, stopId, actions:[{jobId,kind,item}], places{}, reachedAt?, reachedSource?, dwellMin?}
+  // A delivery completed with a proof of delivery carries proofId + the proof's summary {id, photos, noPhotoReason, receiver}
+  // (info.proof; info.proofJobIds = the deliveries it covers, all of them when absent). The photos stay in IndexedDB (proof.js).
+  function recordDone(day, info) { // info: {nowIso, stopId, actions:[{jobId,kind,item}], places{}, reachedAt?, reachedSource?, dwellMin?, proof?, proofJobIds?}
     snapPlace(day, info.places, info.stopId);
+    const pj = info.proofJobIds && info.proofJobIds.length ? info.proofJobIds : null;
+    const proofOf = (a) => (info.proof && a.kind === 'deliver' && (!pj || pj.indexOf(a.jobId) >= 0) ? { proofId: info.proof.id, proof: Object.assign({}, info.proof) } : {});
     return info.actions.map((a) => appendEvent(day, Object.assign({ t: info.nowIso, type: 'done', jobId: a.jobId || null, stopId: info.stopId, kind: a.kind, item: a.item || '' },
-      a.kind === 'pickup' ? { collectedAt: info.nowIso } : {}, reachedFields(info))));
+      a.kind === 'pickup' ? { collectedAt: info.nowIso } : {}, proofOf(a), reachedFields(info))));
+  }
+  // the CSV "proof" cell: "<n> photos" / "no photo: <reason>" ('' without a proof)
+  function proofCell(p) {
+    if (!p) return '';
+    if (p.photos > 0) return p.photos + (p.photos === 1 ? ' photo' : ' photos');
+    return 'no photo: ' + String(p.noPhotoReason || '').trim();
   }
   // The fuel stop: recorded as a stop with its done time (kind 'fuel', no job). It is never a job: job counts ignore it and
   // closeDay never carries it forward. info: {nowIso, stopId, name, places{}}
@@ -380,6 +391,7 @@
         urgent: live ? !!live.urgent : !!base.urgent, late, reason: dec.reason || '', carry,
         status: complete ? 'done' : withYou ? 'collected, not delivered' : 'not done',
         notes: (live && live.notes) || base.notes || '',
+        proof: dl.length && dl[dl.length - 1].proof ? dl[dl.length - 1].proof : null, // the last active delivery's proof summary
       };
     };
     const rows = ids.map(rowOf);
@@ -742,7 +754,9 @@
     const tm = (v) => (v != null ? fmtTime(v) : '');
     sum.rows.concat(sum.cancelledRows || []).forEach((r) => {
       const status = r.cancelled ? CANCELLED : r.complete ? 'done' : r.status + (r.carry ? ' - carried' : ' - dropped');
-      lines.push([fmtDate(sum.date), sum.driverId, r.type, r.item, r.from, r.to, tm(r.collectedMs), tm(r.doneMs), status, r.reason, r.urgent ? 'yes' : 'no', r.late ? 'yes' : 'no'].map(csvCell).join(','));
+      const pf = !r.cancelled && r.type !== 'errand' && r.type !== 'collect' && r.complete ? r.proof : null; // empty for non-deliveries
+      lines.push([fmtDate(sum.date), sum.driverId, r.type, r.item, r.from, r.to, tm(r.collectedMs), tm(r.doneMs), status, r.reason, r.urgent ? 'yes' : 'no', r.late ? 'yes' : 'no',
+        pf ? pf.receiver || '' : '', proofCell(pf)].map(csvCell).join(','));
     });
     return lines.join('\r\n') + '\r\n';
   }

@@ -158,6 +158,8 @@ async function main() {
     await send('Page.enable'); await send('Runtime.enable');
     await send('Page.addScriptToEvaluateOnNewDocument', { source: INIT });
     const ev = async (expr) => { const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }); if (r.exceptionDetails) throw new Error('page error: ' + (r.exceptionDetails.exception && r.exceptionDetails.exception.description || r.exceptionDetails.text)); return r.result.value; };
+    // a delivery stop's 📷 PROOF opens the proof sheet: finish it through the real sheet (No photo, then the first reason chip)
+    const viaProof = () => ev('(async () => { const w = async (f) => { for (let k = 0; k < 150; k++) { const e = f(); if (e) return e; await new Promise((r) => setTimeout(r, 20)); } return null; }; const np = await w(() => document.getElementById("proofNoPhoto")); if (!np) return false; np.click(); const c = await w(() => document.querySelector("#proofSheet .proof-reason")); if (!c) return false; c.click(); return true; })()');
     const waitFor = async (expr, what, ms) => { const end = Date.now() + (ms || 8000); while (Date.now() < end) { if (await ev('!!(' + expr + ')')) return true; await sleep(100); } const bn = await ev('(document.getElementById("banner") || {}).textContent || ""').catch(() => ''); throw new Error('timeout waiting for ' + what + (bn ? ' [banner: ' + bn + ']' : '') + (page.logs.length ? ' [page: ' + page.logs.join(' | ') + ']' : '')); };
     const click = (sel) => ev('(() => { const e = document.querySelector(' + JSON.stringify(sel) + '); if (!e) throw new Error("no " + ' + JSON.stringify(sel) + '); e.click(); return true; })()');
     const text = (sel) => ev('(() => { const e = document.querySelector(' + JSON.stringify(sel) + '); return e ? e.textContent : null; })()');
@@ -255,7 +257,7 @@ async function main() {
     await ev(first + '.click()');
     await waitFor('WaypointDebug.S.plan.result.plans[0].stops[0].reachedAt', 'stop 1 reached');
     await advanceMin(20);
-    await ev(first + '.click()');
+    if ((await ev('(() => { const b = ' + first + '; b.click(); return b.textContent; })()')) === '📷 PROOF') await viaProof();
     await waitFor('WaypointDebug.S.plan.result.plans[0].stops[0].status === "done"', 'stop 1 done');
     await click('#routeEndDay');
     await waitFor('document.querySelector("#sumSplitLine")', 'the summary split line');

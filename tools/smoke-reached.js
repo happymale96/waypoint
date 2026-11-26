@@ -166,6 +166,8 @@ async function main() {
     await send('Page.enable'); await send('Runtime.enable');
     await send('Page.addScriptToEvaluateOnNewDocument', { source: INIT });
     const ev = async (expr) => { const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }); if (r.exceptionDetails) throw new Error('page error: ' + (r.exceptionDetails.exception && r.exceptionDetails.exception.description || r.exceptionDetails.text)); return r.result.value; };
+    // a delivery stop's 📷 PROOF opens the proof sheet: finish it through the real sheet (No photo, then the first reason chip)
+    const viaProof = () => ev('(async () => { const w = async (f) => { for (let k = 0; k < 150; k++) { const e = f(); if (e) return e; await new Promise((r) => setTimeout(r, 20)); } return null; }; const np = await w(() => document.getElementById("proofNoPhoto")); if (!np) return false; np.click(); const c = await w(() => document.querySelector("#proofSheet .proof-reason")); if (!c) return false; c.click(); return true; })()');
     const waitFor = async (expr, what, ms) => { const end = Date.now() + (ms || 8000); while (Date.now() < end) { if (await ev('!!(' + expr + ')')) return true; await sleep(100); } const bn = await ev('(document.getElementById("banner") || {}).textContent || ""').catch(() => ''); throw new Error('timeout waiting for ' + what + (bn ? ' [banner: ' + bn + ']' : '') + (page.logs.length ? ' [page: ' + page.logs.join(' | ') + ']' : '')); };
     const click = (sel) => ev('(() => { const e = document.querySelector(' + JSON.stringify(sel) + '); if (!e) throw new Error("no " + ' + JSON.stringify(sel) + '); e.click(); return true; })()');
     const text = (sel) => ev('(() => { const e = document.querySelector(' + JSON.stringify(sel) + '); return e ? e.textContent : null; })()');
@@ -174,7 +176,7 @@ async function main() {
     // the n-th (0-based) stop card on the Route tab, its primary button, and the plan stop behind it
     const card = (n) => 'document.querySelectorAll(".timeline .card.stop")[' + n + ']';
     const primaries = (n) => ev('[...' + card(n) + '.querySelectorAll(".stop-btns button.ok")].map((b) => b.textContent)');
-    const clickPrimary = (n) => ev('(() => { const b = ' + card(n) + '.querySelector(".stop-btns button.ok"); b.click(); return b.textContent; })()');
+    const clickPrimary = async (n) => { const t = await ev('(() => { const b = ' + card(n) + '.querySelector(".stop-btns button.ok"); b.click(); return b.textContent; })()'); if (t === '📷 PROOF') await viaProof(); return t; };
     const planStop = (id) => 'WaypointDebug.S.plan.result.plans[0].stops.find((s) => s.placeId === ' + JSON.stringify(id) + ')';
     const gpsNear = (pid, m) => ev('(() => { const p = WaypointDebug.S.places[' + JSON.stringify(pid) + ']; window.__gps = { lat: p.lat + ' + m + ' / 111190, lng: p.lng, accuracy: 20 }; return true; })()');
     const visible = () => ev('document.dispatchEvent(new Event("visibilitychange"))');
@@ -216,9 +218,9 @@ async function main() {
     await gpsNear(ids[0], 60);
     const a1 = await ev('(() => { const s = ' + planStop(ids[0]) + '; return { src: s.reachedSource, at: s.reachedAt, line: ' + card(0) + '.querySelector(".reached-line").textContent, btns: [...' + card(0) + '.querySelectorAll(".stop-btns button.ok")].map((b) => b.textContent), toast: document.getElementById("toast").hidden ? "" : document.getElementById("toast").textContent, status: document.getElementById("timesFrom").textContent }; })()');
     check(a1.src === 'auto' && /^Reached \d\d:\d\d · auto\s*Undo$/.test(a1.line), 'stop 1 shows "Reached hh:mm · auto" with a small Undo', a1.line);
-    check(a1.btns.length === 1 && a1.btns[0] === '✓ DONE', 'its one primary button now reads ✓ DONE', a1.btns);
+    check(a1.btns.length === 1 && a1.btns[0] === '📷 PROOF', 'its one primary button now reads 📷 PROOF (a delivery: the DONE spot asks for the proof)', a1.btns);
     const col1 = await btnColours();
-    check(col1.act === 'done' && col1.btn.bg !== col0.btn.bg && col1.btn.bg === 'rgb(27, 127, 59)', '✓ DONE is the solid green (no longer the REACHED blue-grey)', col1);
+    check(col1.act === 'proof' && col1.btn.bg !== col0.btn.bg && col1.btn.bg === 'rgb(245, 166, 35)', '📷 PROOF is the solid amber (no longer the REACHED blue-grey)', col1);
     check(/^Reached .+ \d\d:\d\d \(auto\) · Undo$/.test(a1.toast), 'toast: "Reached <name> hh:mm (auto) · Undo"', a1.toast);
     check(/^On site at .+ since \d\d:\d\d$/.test(a1.status), 'status line: "On site at <name> since hh:mm"', a1.status);
     check(a1.status.includes('Alpha') || a1.status.includes('Beta') || a1.status.includes('Gamma'), 'the status line names the stop', a1.status);
@@ -269,9 +271,9 @@ async function main() {
 
     console.log('4. tap REACHED, then a second tap 100 ms later (500 ms guard)');
     const guard = await ev(`(async () => { const b = () => ${card(0)}.querySelector(".stop-btns button.ok"); b().click(); await new Promise((r) => setTimeout(r, 100)); const mid = b().textContent; b().click();
-      await new Promise((r) => setTimeout(r, 50)); const s = ${planStop(ids[0])}; return { mid, status: s.status || null, src: s.reachedSource, after: b().textContent }; })()`);
-    check(guard.mid === '✓ DONE' && guard.src === 'tap', 'the first tap turned REACHED into ✓ DONE (source "tap")', guard);
-    check(guard.status === null && guard.after === '✓ DONE', 'the second tap 100 ms later did not complete the stop', guard);
+      await new Promise((r) => setTimeout(r, 50)); const s = ${planStop(ids[0])}; return { mid, status: s.status || null, src: s.reachedSource, after: b().textContent, sheet: !!document.getElementById('proofSheet') }; })()`);
+    check(guard.mid === '📷 PROOF' && guard.src === 'tap', 'the first tap turned REACHED into 📷 PROOF (source "tap")', guard);
+    check(guard.status === null && guard.after === '📷 PROOF' && !guard.sheet, 'the second tap 100 ms later did not complete the stop (no proof sheet either)', guard);
     check(/^Reached \d\d:\d\d\s*Undo$/.test(await text('.timeline .card.stop .reached-line')), 'a manual tap shows "Reached hh:mm" (no "auto")', await text('.timeline .card.stop .reached-line'));
     await ev('(() => { window.__gps = ' + JSON.stringify(GPS_FAR) + '; return true; })()');
     const eta2Before = await ev(planStop(ids[1]) + '.arriveAt');

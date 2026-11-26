@@ -302,7 +302,7 @@ console.log('export');
   const csv = DL.toCSV(s);
   const lines = csv.trim().split('\r\n');
   ok(lines.length === 1 + s.rows.length && s.rows.length === 4, 'CSV: header + one row per job (4 jobs)', lines.length);
-  ok(lines[0] === 'date,driver,type,item,from,to,collected time,done time,status,reason,urgent,late', 'CSV header columns ("collected time" before "done time")');
+  ok(lines[0] === 'date,driver,type,item,from,to,collected time,done time,status,reason,urgent,late,receiver,proof', 'CSV header columns ("collected time" before "done time")');
   ok(lines[1].startsWith('20 Nov 2026,Calvin,delivery,"Sensor, 2 pcs",Acme Supplies,Beta Customer,09:20,10:30,done,,yes,'), 'CSV: comma in item name is quoted; dd Mmm yyyy; 24-hour time; collected 09:20', lines[1]);
   ok(csv.includes('"Gasket, ""big"" 10mm"'), 'CSV: embedded quotes doubled, field quoted');
   ok(lines[2].includes('not done - dropped') && lines[2].includes('Item not ready'), 'CSV: dropped job shows status and reason', lines[2]);

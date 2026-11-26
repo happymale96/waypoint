@@ -148,7 +148,7 @@ console.log('6. End day with a loose item -> STILL WITH YOU lists it; the store 
   ok(s.stillWithYou.length === 1 && s.stillWithYou[0].item === 'printer ribbon' && s.stillWithYou[0].from === 'Carrier International Sdn Bhd' && s.stillWithYou[0].loose === true, 'STILL WITH YOU lists the printer ribbon, with where it came from', s.stillWithYou);
   ok(s.jobsDone === 1 && s.jobsTotal === 1 && s.notDone.length === 0, 'job counts do not change');
   ok(DL.toWhatsApp(s).indexOf('- printer ribbon (from Carrier International Sdn Bhd)') > 0, 'the WhatsApp summary lists it too');
-  ok(DL.toCSV(s).split('\r\n')[0] === DL.CSV_HEADER.join(',') && DL.CSV_HEADER.length === 12, 'the CSV columns are unchanged (12 with "collected time")');
+  ok(DL.toCSV(s).split('\r\n')[0] === DL.CSV_HEADER.join(',') && DL.CSV_HEADER.length === 14 && DL.CSV_HEADER.slice(12).join() === 'receiver,proof', 'the CSV columns are unchanged (12 with "collected time", then receiver, proof)');
   // the next day
   ok(loose.length === 1 && loose[0].status === 'with-me', 'End day does not touch the store: the item is still there next day');
   ok(OB.onBoard(state(jobs, loose), at(24, 8, 0)).length === 1, 'and still on the bar next morning');

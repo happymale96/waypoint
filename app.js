@@ -3,7 +3,7 @@
   'use strict';
 
   const APP_VERSION = '1.0.0';
-  const BUILD_STAMP = '8d548b72'; // written by tools/stamp-sw.js (content hash of the app shell)
+  const BUILD_STAMP = '8a5e223d'; // written by tools/stamp-sw.js (content hash of the app shell)
   const TYPES = ['factory', 'supplier', 'office', 'home', 'other'];
   const DEFAULT_DWELL = { factory: 30, supplier: 10, other: 10, office: 10, home: 0 };
 
@@ -1461,7 +1461,7 @@
     const tos = plan.stops.filter((s) => !s.status && !s.fuel).map((s) => c(s.placeId)).concat([{ lat: m.end.lat, lng: m.end.lng }]);
     return Object.assign({}, prev, DL.legsFrom(m.matrices, pts, from, tos, Date.now()));
   }
-  function logDone(stop, nowIso) {
+  function logDone(stop, nowIso, proof) {
     try {
       const nowMs = Date.parse(nowIso), day = dayFor(nowMs, true);
       const groups = DL.doneGroups(day), lastG = groups[groups.length - 1];
@@ -1473,7 +1473,8 @@
         dwellMin: dsec != null ? dsec / 60 : ((coordPlace(stop.placeId) || {}).dwellMin != null ? coordPlace(stop.placeId).dwellMin : null) };
       const evs = stop.fuel // the fuel stop is logged as a stop (kind 'fuel'), never as a job action
         ? [DL.recordFuel(day, Object.assign({ nowIso, stopId: stop.placeId, name: (coordPlace(stop.placeId) || {}).name || '', places: Object.assign({}, S.plan && S.plan.ctx.places, S.places) }, rch))]
-        : DL.recordDone(day, Object.assign({ nowIso, stopId: stop.placeId, actions: stop.actions, places: Object.assign({}, S.plan && S.plan.ctx.places, S.places) }, rch));
+        : DL.recordDone(day, Object.assign({ nowIso, stopId: stop.placeId, actions: stop.actions, places: Object.assign({}, S.plan && S.plan.ctx.places, S.places),
+          proof: proof ? Proof.summaryOf(proof) : null, proofJobIds: proof ? proof.jobIds || [] : [] }, rch));
       if (plan && prev && to) holdDriven(day, plan, prev, to, coord, nowMs); // keep the leg just driven (zero requests)
       bgSaveDay(day);
       attachFix(evs, day);
@@ -1508,10 +1509,13 @@
         if (j.status === 'done') { j.status = 'pending'; j.doneAt = null; }
         if (OnBoard.isCollectOnly(j)) await setLoose(OnBoard.removeForJob(S.loose, j.id)); // the DONE is undone: it was never collected
       } else { j.status = 'pending'; j.doneAt = null; }
+      if (stop.proofId && j.proofId === stop.proofId) delete j.proofId;
       await saveJob(j);
     }
     if (day) { DL.recordUndo(day, { nowIso: new Date().toISOString(), stopId: stop.placeId }); bgSaveDay(day); }
+    if (stop.proofId) voidProof(stop.proofId); // its photos stay; no SEND any more; a later PROOF makes a new one
     cur.stops[li] = Reached.undoDone(stop); // pending again; reachedAt / reachedSource stay (the stop is back to "reached")
+    delete cur.stops[li].proofId;
     if (stop.leftOpen) { cur.stops[li].actions = stop.actions.concat(stop.leftOpen); delete cur.stops[li].leftOpen; } // the deliveries left open are back on the card
     S.loc.origin = null;
     P.prompt = null;
@@ -1990,12 +1994,14 @@
         h('span', { class: 'chip' }, 'Skipped'),
         h('button', { class: 'small undo', 'aria-label': 'Undo skip', onclick: () => undoSkip(stop, i) }, 'Undo skip')));
     }
-    if (st === 'done') { // done stops collapse to one line: tick, name, actual done time
+    if (st === 'done') { // done stops collapse to one line: tick, name, actual done time (+ SEND TO GROUP / SENT ✓ on a proof)
       const undoable = i === lastDoneIdx(curPlan());
-      return h('div', { class: 'card stop done compact' }, h('div', { class: 'row spread' },
+      const send = sendButton(stop);
+      return h('div', { class: 'card stop done compact' + (send ? ' has-send' : '') }, h('div', { class: 'row spread' + (send ? ' send-row' : '') },
         h('div', { class: 'title' }, '✓ ' + (i + 1) + '. ' + tag + dName(place.name)),
         h('div', { class: 'muted times' }, 'done ' + fmt(Date.parse(stop.doneAt))),
-        undoable ? h('button', { class: 'small undo', 'aria-label': 'Undo done', onclick: () => undoDone(stop, i) }, 'Undo') : null));
+        undoable ? h('button', { class: 'small undo', 'aria-label': 'Undo done', onclick: () => undoDone(stop, i) }, 'Undo') : null,
+        send));
     }
     if (stop.fuel) return fuelCard(stop, i, place);
     const hasDelivery = stop.actions.some((a) => a.kind === 'deliver');
@@ -2143,7 +2149,13 @@
   }
 
   // ---------- REACHED before DONE ----------
-  const primaryBtn =(stop, i) => h('button', { class: 'small ok', 'data-act': Reached.isReached(stop) ? 'done' : 'reached', onclick: () => primaryTap(stop, i) }, Reached.buttonLabel(stop));
+  // Reached on a proof stop (the DONE tap would complete a delivery whose item is collected: Proof.isProofStop over the same
+  // OnBoard.doneSplit markDone uses): "📷 PROOF" (amber) in the DONE spot; every other stop keeps "✓ DONE".
+  const isProofStopNow = (stop) => !stop.fuel && Proof.isProofStop(stop, OnBoard.doneSplit(stop, S.jobs, placeNameOf));
+  const primaryBtn = (stop, i) => {
+    const reached = Reached.isReached(stop), proof = reached && isProofStopNow(stop);
+    return h('button', { class: 'small ok', 'data-act': proof ? 'proof' : reached ? 'done' : 'reached', onclick: () => primaryTap(stop, i) }, proof ? '📷 PROOF' : Reached.buttonLabel(stop));
+  };
   function reachedInline(stop, i) { // text + a small Undo, or null while the stop is not reached
     return Reached.isReached(stop)
       ? [Reached.reachedText(stop, fmt), ' ', h('button', { class: 'link-undo', type: 'button', 'aria-label': 'Undo reached', onclick: () => undoReachedTap(stop, i) }, 'Undo')]
@@ -2182,6 +2194,7 @@
     if (!ls) return;
     if (!Reached.isReached(ls.stop)) return markReached(stop0, i0);
     if (Reached.tapIgnored(ls.stop, Date.now())) return;
+    if (isProofStopNow(ls.stop)) return openProofSheet(stop0, i0); // the proof sheet completes it (markDone with the proof)
     return markDone(stop0, i0);
   }
   function toastUndo(msg, fn) {
@@ -2380,17 +2393,23 @@
     return ci < 0 ? null : { stop: cur.stops[ci], i: ci };
   }
 
-  async function markDone(stop0, i0) {
+  // opts.proof: the saved proof of delivery (the proof sheet's Save & done / No photo). A proof stop is never completed without one:
+  // without it the tap opens the proof sheet instead.
+  async function markDone(stop0, i0, opts) {
     const P = S.plan;
     const ls = liveStop(stop0, i0);
     if (!ls) return;
     const stop = ls.stop, i = ls.i;
-    const nowIso = new Date().toISOString();
+    const proof = (opts && opts.proof) || null;
+    const nowIso = (proof && proof.doneAt) || new Date().toISOString();
     // a delivery whose item is not collected yet is never completed: it stays open on its job (OnBoard.doneSplit); a card holding
     // nothing else completes nothing and stays as it is. Either way the notice names the item and where it is collected.
     const split = stop.fuel ? { apply: stop.actions || [], held: [], notice: null } : OnBoard.doneSplit(stop, S.jobs, placeNameOf);
     if (split.held.length && !split.apply.length) { banner(split.notice, 'info'); return; }
+    if (!proof && Proof.isProofStop(stop, split)) { openProofSheet(stop0, i0); return; }
     if (split.held.length) { stop.leftOpen = split.held; stop.actions = split.apply; } // Undo of this DONE puts them back on the card
+    const proofJobs = new Set(proof ? proof.jobIds || [] : []);
+    if (proof) stop.proofId = proof.id; // the done card's SEND TO GROUP; Undo voids it
     for (const a of stop.actions) {
       const j = S.jobs.find((x) => x.id === a.jobId);
       if (!j) continue;
@@ -2400,6 +2419,7 @@
         if (p) { p.done = true; p.doneAt = nowIso; } // when it was collected (the "With you" bar shows it)
         if (!j.deliveryPlaceId && !j.errandPlaceId && j.pickups.every((q) => q.done)) { j.status = 'done'; j.doneAt = nowIso; }
       } else { j.status = 'done'; j.doneAt = nowIso; }
+      if (a.kind === 'deliver' && proofJobs.has(j.id)) j.proofId = proof.id; // history / export find the proof from the job
       await saveJob(j);
       // a collect-only job marked DONE leaves a loose item with the driver (not a job: job counts never change)
       if (a.kind === 'pickup' && OnBoard.isCollectOnly(j) && j.status === 'done') await setLoose(OnBoard.addForJob(S.loose, j, { nameOf: placeNameOf, at: Date.parse(nowIso) }));
@@ -2407,7 +2427,7 @@
     stop.status = 'done';
     stop.doneAt = nowIso;
     S.loc.origin = null;
-    logDone(stop, nowIso); // synchronous, in memory: never delays DONE (save + geolocation fix happen in the background)
+    logDone(stop, nowIso, proof); // synchronous, in memory: never delays DONE (save + geolocation fix happen in the background)
     P.alt = null;
     P.result.plans = [P.result.plans[P.idx]]; P.idx = 0; // alternatives pre-date this DONE: drop them
     // live re-timing: from this stop, at the DONE time, order unchanged - shown at once, never waiting for the network
@@ -2428,6 +2448,212 @@
     render();
     if (split.notice) banner(split.notice, 'info'); else dayCompleteBanner();
     afterStop('done'); // after DONE: the live look-ahead (Part F) or one next-stop re-time; never blocks
+  }
+
+  // ---------- PROOF OF DELIVERY (proof.js) ----------
+  // PROOF on a reached proof stop opens a full-screen sheet: photos (camera, one shot per tap, at most 6, each saved to IndexedDB
+  // under a draft the moment it comes back), "Received by", Save & done (stamps every photo, then markDone with the proof), No photo
+  // (a reason chip, then markDone), Cancel (deletes the draft). A done card with an unsent proof shows SEND TO GROUP.
+  const PF = { meta: new Map(), files: new Map(), sheet: null }; // meta: proofId -> record (no blobs); files: proofId -> [File] (today's unsent)
+  const WA_GLYPH = 'whatsapp-glyph.svg'; // copied byte-for-byte from the brand pack (README); never drawn by the app
+  const proofDayKey = () => DL.dateKey(Date.now());
+  const stopItems = (split) => Proof.proofDeliveries(split).map((a) => deliverItem(a) || 'Item');
+  function voidProof(id) {
+    const m = PF.meta.get(id);
+    if (m) m.state = 'void';
+    PF.files.delete(id);
+    Proof.getProof(id).then((p) => { if (p) { p.state = 'void'; return Proof.putProof(p); } }).catch(() => {});
+  }
+  function sendButton(stop) {
+    const m = stop.proofId && PF.meta.get(stop.proofId);
+    if (!m || m.state !== 'done') return null;
+    const sent = !!m.sentAt;
+    return h('button', { class: 'small send-group' + (sent ? ' sent' : ''), type: 'button', 'data-act': 'send', 'data-proof': m.id, 'aria-label': sent ? 'Sent to group, send again' : 'Send to group', onclick: () => sendTap(m.id) },
+      sent ? null : h('img', { class: 'wa-glyph', src: WA_GLYPH, alt: '', 'aria-hidden': 'true' }), sent ? 'SENT ✓' : 'SEND TO GROUP');
+  }
+  const fileOf = (proof, ph, n) => new File([ph.blob], Proof.fileName(proof, n), { type: 'image/jpeg', lastModified: ph.takenAt || Date.now() });
+  async function proofFiles(proof) {
+    if (PF.files.has(proof.id)) return PF.files.get(proof.id);
+    const phs = await Proof.photosOf(proof.id), order = proof.photoIds || [];
+    phs.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+    const files = phs.map((ph, k) => fileOf(proof, ph, k + 1));
+    if (!proof.sentAt && proof.dayKey === proofDayKey()) PF.files.set(proof.id, files);
+    return files;
+  }
+  // SEND TO GROUP: the caption to the clipboard, then navigator.share({files, text}) once canShare says yes. Resolved: sentAt set,
+  // the button reads SENT ✓ (tap = send again). Rejected (backed out): nothing changes. canShare no: a notice, nothing changes.
+  function sendTap(id) {
+    const m = PF.meta.get(id);
+    if (!m) return;
+    const text = Proof.caption(m);
+    const cached = PF.files.get(id);
+    const go = (files) => {
+      copyText(text).then((ok) => { if (ok) toast('Caption copied - paste it if WhatsApp shows none'); });
+      const data = files.length ? { files, text } : { text };
+      if (!navigator.share || (navigator.canShare && !navigator.canShare(data)) || (files.length && !navigator.canShare)) { banner('This browser cannot share photos', 'info'); return; }
+      navigator.share(data).then(async () => {
+        const p = (await Proof.getProof(id).catch(() => null)) || m;
+        p.sentAt = new Date().toISOString();
+        m.sentAt = p.sentAt;
+        await Proof.putProof(p).catch(() => {});
+        PF.files.delete(id);
+        if (S.tab === 'route') render();
+      }).catch(() => { /* backed out: nothing changes */ });
+    };
+    if (cached || !(m.photoIds || []).length) { go(cached || []); return; } // inside the tap: share() runs before any await
+    proofFiles(m).then(go).catch(() => banner('Could not read the photos on this phone', 'error'));
+  }
+  // the fix for a photo: the last GPS fix when it is at most 2 minutes old at capture, else null ("GPS not available")
+  function proofFix(at) {
+    const f = S.loc.lastFix;
+    return f && f.ok && f.at != null && Math.abs(at - f.at) <= Proof.GPS_MAX_AGE_MS ? { lat: f.lat, lon: f.lng, acc: f.accuracy, at: f.at } : null;
+  }
+  function newDraft(stop, split) {
+    const place = placeOfStop(stop) || {}, saved = S.places[baseId(stop.placeId)] || place;
+    const dels = Proof.proofDeliveries(split);
+    return { id: uid('pf'), state: 'draft', dayKey: proofDayKey(), stopKey: stop.placeId, doneAt: null, placeId: baseId(stop.placeId), placeName: dName(saved.name || place.name || ''),
+      address: saved.address || place.address || '', jobIds: dels.map((a) => a.jobId), items: stopItems(split), receiver: '', noPhotoReason: '', gps: null, photoIds: [], sentAt: null, driveAt: null };
+  }
+  async function findDraft(stopKey) {
+    const all = await Proof.listProofs();
+    return all.filter((p) => p.state === 'draft' && p.stopKey === stopKey && p.dayKey === proofDayKey()).sort((a, b) => (b.photoIds || []).length - (a.photoIds || []).length)[0] || null;
+  }
+  async function openProofSheet(stop0, i0, draft0) {
+    stopTapped();
+    const ls = liveStop(stop0, i0);
+    if (!ls || PF.sheet) return;
+    const stop = ls.stop, split = OnBoard.doneSplit(stop, S.jobs, placeNameOf);
+    if (!Proof.isProofStop(stop, split)) return;
+    let draft = draft0 || null;
+    if (!draft) { try { draft = await findDraft(stop.placeId); } catch (e) { draft = null; } }
+    if (PF.sheet) return;
+    const proof = draft || newDraft(stop, split);
+    proof.items = stopItems(split); proof.jobIds = Proof.proofDeliveries(split).map((a) => a.jobId);
+    let photos = [];
+    if (draft) { try { photos = (await Proof.photosOf(draft.id)).sort((a, b) => (a.takenAt || 0) - (b.takenAt || 0)); } catch (e) { photos = []; } }
+    const urls = [];
+    let busy = false;
+    const sh = openSheet(proof.placeName || dName((placeOfStop(stop) || {}).name || ''), () => { urls.forEach((u) => URL.revokeObjectURL(u)); PF.sheet = null; });
+    PF.sheet = sh;
+    sh.sheet.id = 'proofSheet'; sh.sheet.classList.add('proof-sheet'); sh.back.classList.add('proof-back'); // full screen: Cancel / Save / No photo close it
+    const close = () => sh.close();
+    const fileIn = h('input', { type: 'file', id: 'proofFile', accept: 'image/*', capture: 'environment', hidden: true });
+    const takeBtn = h('button', { class: 'primary', id: 'proofTake', type: 'button', onclick: () => { fileIn.value = ''; fileIn.click(); } }, 'Take photo');
+    const thumbs = h('div', { class: 'proof-thumbs', id: 'proofThumbs' });
+    const rcv = h('input', { id: 'proofReceiver', maxlength: String(Proof.RECEIVER_MAX), autocomplete: 'off', value: proof.receiver || '', placeholder: 'Name (optional)' });
+    const saveBtn = h('button', { class: 'ok', id: 'proofSave', type: 'button' }, 'Save & done');
+    const status = h('div', { class: 'muted', id: 'proofStatus', role: 'status' });
+    const reasons = h('div', { class: 'proof-reasons', id: 'proofReasons', hidden: true },
+      h('div', { class: 'muted' }, 'Why is there no photo?'),
+      Proof.REASONS.map((r) => h('button', { class: 'chip-btn-r proof-reason', type: 'button', 'data-reason': r, onclick: () => finish(r) }, r)));
+    const noPhoto = h('button', { class: 'link-undo proof-nophoto', id: 'proofNoPhoto', type: 'button', onclick: () => { reasons.hidden = !reasons.hidden; } }, 'No photo');
+    const cancelBtn = h('button', { id: 'proofCancel', type: 'button', onclick: async () => { if (busy) return; close(); try { if (draft || photos.length) await Proof.deleteProof(proof.id); } catch (e) { /* ignore */ } } }, 'Cancel');
+    function paint() {
+      urls.splice(0).forEach((u) => URL.revokeObjectURL(u));
+      thumbs.replaceChildren(...photos.map((ph) => {
+        const u = URL.createObjectURL(ph.blob); urls.push(u);
+        return h('div', { class: 'proof-thumb' }, h('img', { src: u, alt: 'Photo ' + fmt(ph.takenAt) }),
+          h('button', { class: 'proof-del', type: 'button', 'aria-label': 'Remove photo', onclick: () => removePhoto(ph.id) }, '×'));
+      }));
+      takeBtn.disabled = busy || photos.length >= Proof.MAX_PHOTOS;
+      takeBtn.textContent = photos.length >= Proof.MAX_PHOTOS ? 'Take photo (6 max)' : 'Take photo';
+      saveBtn.disabled = busy || !photos.length;
+    }
+    async function saveDraft() {
+      proof.photoIds = photos.map((p) => p.id);
+      proof.receiver = rcv.value.trim().slice(0, Proof.RECEIVER_MAX);
+      await Proof.putProof(proof);
+      draft = proof;
+    }
+    async function removePhoto(id) {
+      if (busy) return;
+      photos = photos.filter((p) => p.id !== id);
+      paint();
+      try { await Proof.deletePhoto(id); await saveDraft(); } catch (e) { /* ignore */ }
+    }
+    fileIn.addEventListener('change', async () => {
+      const f = fileIn.files && fileIn.files[0];
+      if (!f || photos.length >= Proof.MAX_PHOTOS) return;
+      const at = Date.now();
+      const ph = { id: uid('ph'), proofId: proof.id, blob: f, bytes: f.size, takenAt: at, gps: proofFix(at) };
+      if (ph.gps) proof.gps = ph.gps;
+      photos.push(ph);
+      paint();
+      try { await Proof.putPhoto(ph); await saveDraft(); status.textContent = ''; } catch (e) { status.textContent = 'Could not save the photo on this phone'; }
+    });
+    rcv.addEventListener('change', () => { if (draft) saveDraft().catch(() => {}); });
+    saveBtn.onclick = () => finish(null);
+    // Save & done (reason null) or No photo (a reason): the stamped photos replace the raw ones, state "done", then the stop is
+    // completed through markDone, the one path the DONE tap uses.
+    async function finish(reason) {
+      if (busy) return;
+      if (reason == null && !photos.length) return;
+      busy = true; paint();
+      status.textContent = reason == null ? 'Stamping photos…' : 'Saving…';
+      try {
+        proof.receiver = rcv.value.trim().slice(0, Proof.RECEIVER_MAX);
+        proof.doneAt = new Date().toISOString();
+        const ls2 = liveStop(stop0, i0), split2 = ls2 && OnBoard.doneSplit(ls2.stop, S.jobs, placeNameOf);
+        if (split2) { proof.items = stopItems(split2); proof.jobIds = Proof.proofDeliveries(split2).map((a) => a.jobId); }
+        let stamped = [];
+        if (reason == null) {
+          for (const ph of photos) {
+            let blob;
+            try { blob = await Proof.compose(ph.blob, proof, { takenAt: ph.takenAt, gps: ph.gps || null }); } catch (e) { blob = ph.blob; } // undecodable: kept as taken
+            stamped.push({ id: ph.id, proofId: proof.id, blob, bytes: blob.size, takenAt: ph.takenAt, gps: ph.gps || null });
+          }
+          proof.noPhotoReason = '';
+        } else {
+          for (const ph of photos) await Proof.deletePhoto(ph.id).catch(() => {});
+          proof.noPhotoReason = reason;
+        }
+        proof.photoIds = stamped.map((p) => p.id);
+        proof.state = 'done'; proof.sentAt = null; proof.driveAt = null;
+        await Proof.saveStamped(proof, stamped);
+        Proof.persistOnce(); // asked once, on the first saved proof; never awaited
+        PF.meta.set(proof.id, Object.assign({}, proof));
+        PF.files.set(proof.id, stamped.map((ph, k) => fileOf(proof, ph, k + 1)));
+      } catch (e) {
+        busy = false; paint();
+        status.textContent = 'Could not save the proof on this phone - try again';
+        return;
+      }
+      close();
+      await markDone(stop0, i0, { proof });
+    }
+    sh.body.replaceChildren(
+      h('div', { class: 'proof-items', id: 'proofItems' }, proof.items.map((t) => h('div', { class: 'act deliver' }, t))),
+      takeBtn, fileIn, thumbs,
+      h('label', { class: 'field', for: 'proofReceiver' }, 'Received by'), rcv,
+      status, reasons,
+      h('div', { class: 'proof-foot' }, noPhoto),
+      h('div', { class: 'sticky-actions' }, cancelBtn, saveBtn));
+    paint();
+  }
+  // After load: proofs of today's plan into memory (the SEND buttons), today's unsent photos as Files, a draft for a stop still
+  // pending reopens its sheet; retention once per load. Never blocks the launch.
+  async function proofsOnLoad() {
+    try {
+      const all = await Proof.listProofs(), plan = curPlan();
+      all.forEach((p) => { if (p.state !== 'draft') PF.meta.set(p.id, p); });
+      const today = proofDayKey();
+      for (const p of all) if (p.state === 'done' && !p.sentAt && p.dayKey === today && (p.photoIds || []).length) await proofFiles(p).catch(() => {});
+      if (plan && plan.stops.some((s) => s.proofId) && S.tab === 'route' && !document.querySelector('.backdrop')) render();
+      const draft = plan && all.filter((p) => p.state === 'draft' && p.dayKey === today && (p.photoIds || []).length).find((p) => plan.stops.some((s) => s.placeId === p.stopKey && !s.status));
+      if (draft) {
+        const i = plan.stops.findIndex((s) => s.placeId === draft.stopKey && !s.status);
+        if (S.tab !== 'route') { S.tab = 'route'; render(); }
+        await openProofSheet(plan.stops[i], i, draft);
+      }
+    } catch (e) { /* no IndexedDB: proof capture still opens; nothing to restore */ }
+    try { await Proof.runRetention(Date.now()); } catch (e) { /* ignore */ }
+  }
+  function proofSettingsCard() {
+    const line = h('div', { class: 'muted', id: 'proofLine' }, 'Checking…');
+    Promise.all([Proof.usage().catch(() => ({ count: 0, bytes: 0 })), Proof.persisted()]).then(([u, prot]) => {
+      line.textContent = u.count + (u.count === 1 ? ' delivery' : ' deliveries') + ' · ' + (u.bytes / 1048576).toFixed(1) + ' MB on this phone · kept 2 years · storage: ' + (prot ? 'protected' : 'not protected');
+    });
+    return h('div', { class: 'card', id: 'proofCard' }, h('h2', { style: 'margin-top:0' }, 'Proof of delivery'), line);
   }
 
   // ---------- SKIP: "Skip for today" or "Cancel job" ----------
@@ -3149,6 +3375,7 @@
         h('div', { class: 'muted', id: 'wakeState' }, wakeText())),
       lunchSettingsCard(s, field),
       fuelSettingsCard(s, field),
+      proofSettingsCard(),
       h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Data'),
         h('div', { class: 'row' }, h('button', { class: 'grow', onclick: exportJson }, 'Export JSON'), h('button', { class: 'grow', onclick: () => fileIn.click() }, 'Import JSON'), fileIn)),
       h('div', { class: 'muted', id: 'lastPlan', style: 'text-align:center;font-size:12px' }, lastPlanText()),
@@ -3221,11 +3448,14 @@
     } catch (e) { return 'Service worker: active'; }
   }
 
-  function exportJson() {
+  async function exportJson() {
     const settings = Object.assign({}, S.settings); delete settings.googleKey; delete settings.tomtomKey;
+    let proofs = [];
+    try { proofs = (await Proof.listProofs()).filter((p) => p.state !== 'draft'); } catch (e) { proofs = []; } // the records only: photos stay on the phone
     const data = Object.assign({ app: 'waypoint', version: APP_VERSION, exportedAt: new Date().toISOString(), dwellMigrated: true, pinMigrated: true, learnedCleared: true, places: Object.values(S.places), jobs: S.jobs, settings, fuelStations: S.fuelStations, travelTimes: S.mem },
       OnBoard.exportLoose(S.loose), // looseItems: the items still with you
-      DL.exportPayload(S.days, S.jobs, S.places)); // + dayLog (records) and dayHistory (per-day totals); keys never included
+      DL.exportPayload(S.days, S.jobs, S.places), // + dayLog (records) and dayHistory (per-day totals); keys never included
+      { proofs });
     const a = h('a', { href: URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })), download: 'waypoint-' + new Date().toISOString().slice(0, 10) + '.json' });
     document.body.append(a); a.click(); a.remove();
   }
@@ -3356,6 +3586,7 @@
     if (S.tab === 'route' && S.plan) refreshFromLocation({ trigger: 'visible' }); // launch = the page becoming visible
     watchLocationPermission();
     setupServiceWorker();
+    proofsOnLoad(); // SEND buttons, a draft proof's sheet, retention (once per load); never blocks
   }).catch((e) => banner('Startup failed: ' + e.message, 'error'));
 
   window.WaypointDebug = { S, doPlan, render, minuteTick, wake };

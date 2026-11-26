@@ -13,9 +13,9 @@ const path = require('path');
 const crypto = require('crypto');
 
 const ROOT = path.resolve(__dirname, '..');
-const SHELL = ['index.html', 'styles.css', 'app.js', 'solver.js', 'reached.js', 'lunchbreak.js', 'budget.js', 'traveltimes.js', 'providers.js', 'storage.js', 'messages.js', 'daylog.js', 'geo.js', 'fuel.js', 'onboard.js', 'jobedit.js', 'wakelock.js',
+const SHELL = ['index.html', 'styles.css', 'app.js', 'solver.js', 'reached.js', 'lunchbreak.js', 'budget.js', 'traveltimes.js', 'providers.js', 'storage.js', 'messages.js', 'daylog.js', 'geo.js', 'fuel.js', 'onboard.js', 'jobedit.js', 'wakelock.js', 'proof.js',
   'manifest.json', 'icon-192.png', 'icon-512.png', 'maskable-192.png', 'icon-512-maskable.png', 'apple-touch-icon-180.png', 'favicon-48.png', 'favicon-32.png', 'favicon.svg',
-  'symbol-on-light.svg', 'symbol-on-dark.svg', 'symbol-header-onlight.svg', 'sw.js'];
+  'symbol-on-light.svg', 'symbol-on-dark.svg', 'symbol-header-onlight.svg', 'logo-horizontal-on-dark.svg', 'whatsapp-glyph.svg', 'sw.js'];
 const SW_RE = /const BUILD = '[^']*';/;
 const APP_RE = /const BUILD_STAMP = '[^']*';/;
 const TEXT = /\.(html|css|js|json)$/;
